@@ -78,29 +78,6 @@ const ATTENDANCE_STATUSES = [
 
 const DEFAULT_TECHNOLOGIES = ['Big Herdsman', 'Big Dutchman', 'Vidulma'];
 
-// Limpieza controlada (una sola vez) de cualquier dato de prueba anterior en localStorage
-if (typeof window !== 'undefined') {
-  try {
-    const alreadyCleaned = localStorage.getItem('calera_clean_slate_initialized_v1');
-    if (!alreadyCleaned) {
-      const oldDemoKeys = [
-        'calera_sectors_v4',
-        'calera_advances_v4',
-        'calera_master_workforce_v4',
-        'calera_attendance_v4',
-        'calera_sectors_v6',
-        'calera_advances_v6',
-        'calera_master_workforce_v6',
-        'calera_attendance_v6',
-        'calera_materials_v6',
-        'calera_master_catalog_v6'
-      ];
-      oldDemoKeys.forEach((k) => localStorage.removeItem(k));
-      localStorage.setItem('calera_clean_slate_initialized_v1', 'true');
-    }
-  } catch {}
-}
-
 // Construye las 6 áreas de un galpón filtrando el Catálogo Maestro por la plantilla/proveedor elegido
 function buildAreasFromCatalog(
   catalog: any[],
@@ -109,7 +86,7 @@ function buildAreasFromCatalog(
 ) {
   const baseDate = startDateStr ? new Date(startDateStr) : new Date();
   const techItems = catalog.filter(
-    (item) => (item.technology || 'Big Herdsman') === technology
+    (item) => item.technology === technology
   );
 
   return ALL_AREAS.map((areaName, aIdx) => {
@@ -305,6 +282,37 @@ export default function App() {
   const [attendanceSpecialtyFilter, setAttendanceSpecialtyFilter] =
     useState<string>('Todas');
 
+  // Historial de Movimientos de Usuarios (Bitácora de Registros, Modificaciones y Eliminaciones)
+  const [auditLogs, setAuditLogs] = useState<
+    {
+      id: string;
+      timestamp: string;
+      user: string;
+      action: 'REGISTRO' | 'MODIFICACIÓN' | 'ELIMINACIÓN';
+      module: string;
+      description: string;
+    }[]
+  >(() => {
+    try {
+      const s = localStorage.getItem('calera_audit_logs_clean');
+      return s ? JSON.parse(s) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const [activeUserName, setActiveUserName] = useState<string>(() => {
+    try {
+      return localStorage.getItem('calera_active_user_clean') || 'Administrador';
+    } catch {
+      return 'Administrador';
+    }
+  });
+
+  const [filterLogAction, setFilterLogAction] = useState<string>('Todas');
+  const [filterLogModule, setFilterLogModule] = useState<string>('Todos');
+  const [searchLogText, setSearchLogText] = useState<string>('');
+
   // Filtros
   const [dashSistemaLocFilter, setDashSistemaLocFilter] = useState<
     'Todos' | 'Interno' | 'Externo'
@@ -317,6 +325,7 @@ export default function App() {
   const [searchActText, setSearchActText] = useState<string>('');
   const [searchWorkerText, setSearchWorkerText] = useState<string>('');
   const [selectedCatalogTech, setSelectedCatalogTech] = useState<string>('Todas');
+  const [filterMaterialGalpon, setFilterMaterialGalpon] = useState<string>('Todos');
   const [filterMaterialTech, setFilterMaterialTech] = useState<string>('Todas');
   const [filterMaterialArea, setFilterMaterialArea] = useState<string>('Todas');
   const [searchMaterialText, setSearchMaterialText] = useState<string>('');
@@ -327,6 +336,7 @@ export default function App() {
   const [modalNewGalpon, setModalNewGalpon] = useState(false);
   const [modalEditGalpon, setModalEditGalpon] = useState(false);
   const [modalNewAdvance, setModalNewAdvance] = useState(false);
+  const [editingAdvanceId, setEditingAdvanceId] = useState<string | null>(null);
   const [modalNewWorker, setModalNewWorker] = useState(false);
   const [modalNewActivity, setModalNewActivity] = useState(false);
   const [modalEditGalponActivity, setModalEditGalponActivity] = useState<any | null>(
@@ -342,7 +352,7 @@ export default function App() {
   >(null);
   const [bulkCsvText, setBulkCsvText] = useState<string>('');
 
-  // Estados de Formularios
+  // Estados de Formularios (Sin valores predeterminados forzados)
   const [formProject, setFormProject] = useState({
     id: '',
     code: '',
@@ -358,9 +368,9 @@ export default function App() {
     name: '',
     description: '',
     supervisorsStr: '',
-    startDate: getSystemToday(),
-    endDate: getSystemToday(),
-    technology: 'Big Herdsman'
+    startDate: '',
+    endDate: '',
+    technology: ''
   });
 
   const [formAdvance, setFormAdvance] = useState({
@@ -369,7 +379,7 @@ export default function App() {
     sistemaName: '',
     structureName: '',
     activityCode: '',
-    date: getSystemToday(),
+    date: '',
     quantityToday: '',
     hoursWorked: '',
     supervisor: '',
@@ -382,52 +392,60 @@ export default function App() {
 
   const [formActivity, setFormActivity] = useState({
     useCatalog: true,
+    targetGalponId: '',
     catalogItemId: '',
     code: '',
     name: '',
-    areaName: 'Sistema de Jaulas',
-    locationType: 'Interno',
+    areaName: '',
+    locationType: '',
     sistemaName: '',
     customSistemaName: '',
     structureName: '',
     customStructureName: '',
     targetUnits: '',
-    unit: 'Und',
-    weight: '1.0',
-    plannedHH: '40',
-    startDate: getSystemToday(),
-    dueDate: getSystemToday(),
+    unit: '',
+    weight: '',
+    plannedHH: '',
+    startDate: '',
+    dueDate: '',
     sharedWithGalponId: ''
   });
 
   const [formCatalogItem, setFormCatalogItem] = useState({
-    technology: 'Big Herdsman',
+    technology: '',
     code: '',
-    areaName: 'Sistema de Jaulas',
-    locationType: 'Interno',
+    areaName: '',
+    locationType: '',
     sistemaName: '',
     customSistemaName: '',
     structureName: '',
     customStructureName: '',
     name: '',
     targetUnits: '',
-    unit: 'Und',
-    weight: '1.0',
-    plannedHH: '40',
-    durationDays: '5'
+    unit: '',
+    weight: '',
+    plannedHH: '',
+    durationDays: ''
   });
 
   const [formMaterial, setFormMaterial] = useState({
-    technology: 'Big Herdsman',
+    sectorId: '',
+    galponId: '',
+    technology: '',
     code: '',
     name: '',
-    areaName: 'Sistema de Jaulas',
+    areaId: '',
+    areaName: '',
+    locationType: '',
+    sistemaId: '',
     sistemaName: '',
+    customSistemaName: '',
+    structureId: '',
     structureName: '',
     customStructureName: '',
     totalQty: '',
     usedQty: 0,
-    unit: 'Und'
+    unit: ''
   });
 
   const [formWorker, setFormWorker] = useState({
@@ -435,7 +453,7 @@ export default function App() {
     workerCode: '',
     dni: '',
     name: '',
-    workArea: 'Jaulas',
+    workArea: '',
     role: '',
     sectorId: '',
     galponId: ''
@@ -481,6 +499,38 @@ export default function App() {
     localStorage.setItem('calera_attendance_clean', JSON.stringify(attendanceRecords));
   }, [attendanceRecords]);
 
+  useEffect(() => {
+    localStorage.setItem('calera_audit_logs_clean', JSON.stringify(auditLogs));
+  }, [auditLogs]);
+
+  useEffect(() => {
+    localStorage.setItem('calera_active_user_clean', activeUserName);
+  }, [activeUserName]);
+
+  const recordUserMovement = (
+    action: 'REGISTRO' | 'MODIFICACIÓN' | 'ELIMINACIÓN',
+    module: string,
+    description: string,
+    customUser?: string
+  ) => {
+    const now = new Date();
+    const timestamp = `${getSystemToday()} ${String(now.getHours()).padStart(
+      2,
+      '0'
+    )}:${String(now.getMinutes()).padStart(2, '0')}:${String(
+      now.getSeconds()
+    ).padStart(2, '0')}`;
+    const entry = {
+      id: generateId('log'),
+      timestamp,
+      user: (customUser || activeUserName || 'Administrador').trim(),
+      action,
+      module,
+      description
+    };
+    setAuditLogs((prev) => [entry, ...prev]);
+  };
+
   // ==========================================================================
   // SELECTORES Y CÁLCULOS PRINCIPALES
   // ==========================================================================
@@ -507,6 +557,35 @@ export default function App() {
       setSelectedGalponId('');
     }
   };
+
+  // Lista plana de todos los galpones con referencia a su sector
+  const allGalponesList = useMemo(() => {
+    const list: {
+      id: string;
+      code: string;
+      name: string;
+      technology: string;
+      sectorId: string;
+      sectorCode: string;
+      sectorName: string;
+      areas: any[];
+    }[] = [];
+    sectors.forEach((sec) => {
+      (sec.galpones || []).forEach((g: any) => {
+        list.push({
+          id: g.id,
+          code: g.code,
+          name: g.name,
+          technology: g.technology || '',
+          sectorId: sec.id,
+          sectorCode: sec.code || '',
+          sectorName: sec.name || '',
+          areas: g.areas || []
+        });
+      });
+    });
+    return list;
+  }, [sectors]);
 
   // Estructuras disponibles (del Catálogo Maestro + Galpones + Materiales)
   const allKnownStructures = useMemo(() => {
@@ -536,6 +615,158 @@ export default function App() {
     });
     return Array.from(setStr);
   }, [masterCatalog, sectors, materials]);
+
+  // Sistemas disponibles para el formulario de Materiales (según Galpón y Área elegidos + Catálogo)
+  const availableMaterialSystems = useMemo(() => {
+    const mapSis = new Map<string, { id: string; name: string; locationType: string }>();
+    const targetGalpon = allGalponesList.find((g) => g.id === formMaterial.galponId);
+
+    if (targetGalpon && formMaterial.areaName) {
+      const areaObj = targetGalpon.areas?.find((a: any) => a.name === formMaterial.areaName);
+      if (areaObj?.hasSistemas && areaObj.sistemas) {
+        areaObj.sistemas.forEach((sis: any) => {
+          if (!sis.name) return;
+          if (
+            formMaterial.locationType &&
+            (sis.locationType || 'Interno') !== formMaterial.locationType
+          ) {
+            return;
+          }
+          const key = `${sis.locationType || 'Interno'}__${sis.name.toLowerCase()}`;
+          if (!mapSis.has(key)) {
+            mapSis.set(key, {
+              id: sis.id || '',
+              name: sis.name,
+              locationType: sis.locationType || 'Interno'
+            });
+          }
+        });
+      }
+    }
+
+    masterCatalog.forEach((item) => {
+      if (formMaterial.areaName && item.areaName !== formMaterial.areaName) return;
+      if (
+        formMaterial.technology &&
+        item.technology &&
+        item.technology !== formMaterial.technology
+      )
+        return;
+      if (
+        formMaterial.locationType &&
+        item.locationType &&
+        item.locationType !== formMaterial.locationType
+      )
+        return;
+      if (item.sistemaName) {
+        const key = `${item.locationType || 'Interno'}__${item.sistemaName.toLowerCase()}`;
+        if (!mapSis.has(key)) {
+          mapSis.set(key, {
+            id: '',
+            name: item.sistemaName,
+            locationType: item.locationType || 'Interno'
+          });
+        }
+      }
+    });
+
+    materials.forEach((m) => {
+      if (formMaterial.areaName && m.areaName !== formMaterial.areaName) return;
+      if (m.sistemaName) {
+        const key = `${m.locationType || 'Interno'}__${m.sistemaName.toLowerCase()}`;
+        if (!mapSis.has(key)) {
+          mapSis.set(key, {
+            id: m.sistemaId || '',
+            name: m.sistemaName,
+            locationType: m.locationType || 'Interno'
+          });
+        }
+      }
+    });
+
+    return Array.from(mapSis.values());
+  }, [
+    allGalponesList,
+    formMaterial.galponId,
+    formMaterial.areaName,
+    formMaterial.technology,
+    formMaterial.locationType,
+    masterCatalog,
+    materials
+  ]);
+
+  // Estructuras disponibles para el formulario de Materiales (según Galpón, Área y Sistema + Catálogo)
+  const availableMaterialStructures = useMemo(() => {
+    const mapStr = new Map<string, { id: string; name: string }>();
+    const targetGalpon = allGalponesList.find((g) => g.id === formMaterial.galponId);
+
+    if (targetGalpon && formMaterial.areaName) {
+      const areaObj = targetGalpon.areas?.find((a: any) => a.name === formMaterial.areaName);
+      if (areaObj) {
+        if (areaObj.hasSistemas && areaObj.sistemas) {
+          areaObj.sistemas.forEach((sis: any) => {
+            if (
+              formMaterial.sistemaName &&
+              formMaterial.sistemaName !== '__NEW__' &&
+              sis.name.toLowerCase() !== formMaterial.sistemaName.toLowerCase()
+            ) {
+              return;
+            }
+            (sis.structures || []).forEach((st: any) => {
+              if (st.name && !mapStr.has(st.name.toLowerCase())) {
+                mapStr.set(st.name.toLowerCase(), { id: st.id || '', name: st.name });
+              }
+            });
+          });
+        } else if (areaObj.structures) {
+          areaObj.structures.forEach((st: any) => {
+            if (st.name && !mapStr.has(st.name.toLowerCase())) {
+              mapStr.set(st.name.toLowerCase(), { id: st.id || '', name: st.name });
+            }
+          });
+        }
+      }
+    }
+
+    masterCatalog.forEach((item) => {
+      if (formMaterial.areaName && item.areaName !== formMaterial.areaName) return;
+      if (
+        formMaterial.technology &&
+        item.technology &&
+        item.technology !== formMaterial.technology
+      )
+        return;
+      if (
+        formMaterial.sistemaName &&
+        formMaterial.sistemaName !== '__NEW__' &&
+        item.sistemaName &&
+        item.sistemaName.toLowerCase() !== formMaterial.sistemaName.toLowerCase()
+      )
+        return;
+      if (item.structureName && !mapStr.has(item.structureName.toLowerCase())) {
+        mapStr.set(item.structureName.toLowerCase(), {
+          id: '',
+          name: item.structureName
+        });
+      }
+    });
+
+    allKnownStructures.forEach((stName) => {
+      if (stName && !mapStr.has(stName.toLowerCase())) {
+        mapStr.set(stName.toLowerCase(), { id: '', name: stName });
+      }
+    });
+
+    return Array.from(mapStr.values());
+  }, [
+    allGalponesList,
+    formMaterial.galponId,
+    formMaterial.areaName,
+    formMaterial.technology,
+    formMaterial.sistemaName,
+    masterCatalog,
+    allKnownStructures
+  ]);
 
   // Actividades evaluadas del galpón activo
   const evaluatedActivities = useMemo(() => {
@@ -577,14 +808,29 @@ export default function App() {
               else if (progressPercent > 0) computedStatus = 'En proceso';
               else if (shouldHaveStarted) computedStatus = 'No iniciada (Alerta)';
 
-              const linkedMaterials = materials.filter(
-                (m) =>
-                  m.structureName &&
-                  str.name &&
-                  m.structureName.toLowerCase() === str.name.toLowerCase() &&
-                  (!m.technology ||
-                    m.technology === (currentGalpon.technology || 'Big Herdsman'))
-              );
+              // Asociación inequívoca: Galpón + Área + Sistema + Estructura (por ID único cuando está disponible)
+              const linkedMaterials = materials.filter((m) => {
+                if (!m.galponId || m.galponId !== currentGalpon.id) return false;
+                if (m.structureId && str.id) {
+                  if (m.structureId !== str.id) return false;
+                  if (m.sistemaId && sis.id && m.sistemaId !== sis.id) return false;
+                  if (m.areaId && area.id && m.areaId !== area.id) return false;
+                  return true;
+                }
+                const sameArea =
+                  Boolean(m.areaName) &&
+                  Boolean(area.name) &&
+                  m.areaName.toLowerCase() === area.name.toLowerCase();
+                const sameSistema =
+                  Boolean(m.sistemaName) &&
+                  Boolean(sis.name) &&
+                  m.sistemaName.toLowerCase() === sis.name.toLowerCase();
+                const sameStructure =
+                  Boolean(m.structureName) &&
+                  Boolean(str.name) &&
+                  m.structureName.toLowerCase() === str.name.toLowerCase();
+                return sameArea && sameSistema && sameStructure;
+              });
 
               list.push({
                 ...act,
@@ -640,14 +886,24 @@ export default function App() {
             else if (progressPercent > 0) computedStatus = 'En proceso';
             else if (shouldHaveStarted) computedStatus = 'No iniciada (Alerta)';
 
-            const linkedMaterials = materials.filter(
-              (m) =>
-                m.structureName &&
-                str.name &&
-                m.structureName.toLowerCase() === str.name.toLowerCase() &&
-                (!m.technology ||
-                  m.technology === (currentGalpon.technology || 'Big Herdsman'))
-            );
+            // Asociación inequívoca: Galpón + Área + Estructura (por ID único cuando está disponible)
+            const linkedMaterials = materials.filter((m) => {
+              if (!m.galponId || m.galponId !== currentGalpon.id) return false;
+              if (m.structureId && str.id) {
+                if (m.structureId !== str.id) return false;
+                if (m.areaId && area.id && m.areaId !== area.id) return false;
+                return true;
+              }
+              const sameArea =
+                Boolean(m.areaName) &&
+                Boolean(area.name) &&
+                m.areaName.toLowerCase() === area.name.toLowerCase();
+              const sameStructure =
+                Boolean(m.structureName) &&
+                Boolean(str.name) &&
+                m.structureName.toLowerCase() === str.name.toLowerCase();
+              return sameArea && sameStructure;
+            });
 
             list.push({
               ...act,
@@ -833,6 +1089,11 @@ export default function App() {
     const clean = newTemplateName.trim();
     if (!clean || technologies.includes(clean)) return;
     setTechnologies((prev) => [...prev, clean]);
+    recordUserMovement(
+      'REGISTRO',
+      'Catálogo Maestro',
+      `Registró plantilla/proveedor "${clean}"`
+    );
     setNewTemplateName('');
   };
 
@@ -858,6 +1119,11 @@ export default function App() {
         )
       }))
     );
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Catálogo Maestro',
+      `Renombró plantilla/proveedor de "${oldName}" a "${newName}"`
+    );
     setEditingTemplateIndex(null);
     setEditingTemplateValue('');
   };
@@ -865,28 +1131,30 @@ export default function App() {
   const handleDeleteTemplateProvider = (techName: string) => {
     setTechnologies((prev) => prev.filter((t) => t !== techName));
     setMasterCatalog((prev) => prev.filter((item) => item.technology !== techName));
+    recordUserMovement(
+      'ELIMINACIÓN',
+      'Catálogo Maestro',
+      `Eliminó plantilla/proveedor "${techName}"`
+    );
   };
 
   const openNewCatalogModal = () => {
     setEditingCatalogId(null);
     setFormCatalogItem({
-      technology:
-        selectedCatalogTech !== 'Todas'
-          ? selectedCatalogTech
-          : technologies[0] || 'Big Herdsman',
+      technology: '',
       code: '',
-      areaName: 'Sistema de Jaulas',
-      locationType: 'Interno',
+      areaName: '',
+      locationType: '',
       sistemaName: '',
       customSistemaName: '',
       structureName: '',
       customStructureName: '',
       name: '',
       targetUnits: '',
-      unit: 'Und',
-      weight: '1.0',
-      plannedHH: '40',
-      durationDays: '5'
+      unit: '',
+      weight: '',
+      plannedHH: '',
+      durationDays: ''
     });
     setModalNewCatalogItem(true);
   };
@@ -894,27 +1162,33 @@ export default function App() {
   const openEditCatalogModal = (item: any) => {
     setEditingCatalogId(item.id);
     setFormCatalogItem({
-      technology: item.technology || technologies[0] || 'Big Herdsman',
+      technology: item.technology || '',
       code: item.code || '',
-      areaName: item.areaName || 'Sistema de Jaulas',
-      locationType: item.locationType || 'Interno',
+      areaName: item.areaName || '',
+      locationType: item.locationType || '',
       sistemaName: item.sistemaName || '',
       customSistemaName: '',
       structureName: item.structureName || '',
       customStructureName: '',
       name: item.name || '',
       targetUnits: String(item.targetUnits ?? ''),
-      unit: item.unit || 'Und',
-      weight: String(item.weight ?? '1.0'),
-      plannedHH: String(item.plannedHH ?? '40'),
-      durationDays: String(item.durationDays ?? '5')
+      unit: item.unit || '',
+      weight: String(item.weight ?? ''),
+      plannedHH: String(item.plannedHH ?? ''),
+      durationDays: String(item.durationDays ?? '')
     });
     setModalNewCatalogItem(true);
   };
 
   const handleSaveCatalogItem = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formCatalogItem.code || !formCatalogItem.name) return;
+    if (
+      !formCatalogItem.technology ||
+      !formCatalogItem.code ||
+      !formCatalogItem.areaName ||
+      !formCatalogItem.name
+    )
+      return;
 
     const finalSistema =
       formCatalogItem.sistemaName === '__NEW__'
@@ -926,32 +1200,44 @@ export default function App() {
         ? formCatalogItem.customStructureName.trim()
         : formCatalogItem.structureName.trim();
 
+    if (!finalStructure) return;
+
     const payload = {
       id: editingCatalogId || generateId('cat'),
-      technology: formCatalogItem.technology || 'Big Herdsman',
+      technology: formCatalogItem.technology.trim(),
       code: formCatalogItem.code.trim().toUpperCase(),
       areaName: formCatalogItem.areaName,
       locationType: AREAS_WITH_SISTEMAS.includes(formCatalogItem.areaName)
-        ? formCatalogItem.locationType
+        ? formCatalogItem.locationType || 'Interno'
         : 'Interno',
       sistemaName: AREAS_WITH_SISTEMAS.includes(formCatalogItem.areaName)
-        ? finalSistema || 'Sistema General'
+        ? finalSistema || null
         : null,
-      structureName: finalStructure || 'Estructura Principal',
+      structureName: finalStructure,
       name: formCatalogItem.name.trim(),
-      targetUnits: Number(formCatalogItem.targetUnits) || 100,
-      unit: formCatalogItem.unit || 'Und',
+      targetUnits: Number(formCatalogItem.targetUnits) || 0,
+      unit: formCatalogItem.unit.trim(),
       weight: Number(formCatalogItem.weight) || 1.0,
-      plannedHH: Number(formCatalogItem.plannedHH) || 40,
-      durationDays: Number(formCatalogItem.durationDays) || 5
+      plannedHH: Number(formCatalogItem.plannedHH) || 0,
+      durationDays: Number(formCatalogItem.durationDays) || 1
     };
 
     if (editingCatalogId) {
       setMasterCatalog((prev) =>
         prev.map((c) => (c.id === editingCatalogId ? payload : c))
       );
+      recordUserMovement(
+        'MODIFICACIÓN',
+        'Catálogo Maestro',
+        `Modificó actividad maestra [${payload.code}] ${payload.name} (${payload.technology} • ${payload.areaName} • ${payload.structureName})`
+      );
     } else {
       setMasterCatalog((prev) => [...prev, payload]);
+      recordUserMovement(
+        'REGISTRO',
+        'Catálogo Maestro',
+        `Registró actividad maestra [${payload.code}] ${payload.name} (${payload.technology} • ${payload.areaName} • ${payload.structureName})`
+      );
     }
 
     setModalNewCatalogItem(false);
@@ -959,7 +1245,13 @@ export default function App() {
   };
 
   const handleDeleteCatalogItem = (id: string) => {
+    const targetItem = masterCatalog.find((c) => c.id === id);
     setMasterCatalog((prev) => prev.filter((c) => c.id !== id));
+    recordUserMovement(
+      'ELIMINACIÓN',
+      'Catálogo Maestro',
+      `Eliminó actividad maestra [${targetItem?.code || id}] ${targetItem?.name || ''}`
+    );
   };
 
   // ==========================================================================
@@ -979,6 +1271,11 @@ export default function App() {
     };
 
     setSectors((prev) => [...prev, newSecObj]);
+    recordUserMovement(
+      'REGISTRO',
+      'Sectores y Galpones',
+      `Registró nuevo sector [${newSecObj.code}] ${newSecObj.name}`
+    );
     setSelectedSectorId(newSecObj.id);
     setSelectedGalponId('');
     setModalNewProject(false);
@@ -989,32 +1286,47 @@ export default function App() {
     e.preventDefault();
     if (!formProject.id || !formProject.name) return;
 
+    const updatedCode = formProject.code.trim().toUpperCase();
+    const updatedName = formProject.name.trim().toUpperCase();
+
     setSectors((prev) =>
       prev.map((s) =>
         s.id === formProject.id
           ? {
               ...s,
-              code: formProject.code.trim().toUpperCase(),
-              name: formProject.name.trim().toUpperCase(),
+              code: updatedCode,
+              name: updatedName,
               location: formProject.location.trim(),
               client: formProject.client.trim()
             }
           : s
       )
     );
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Sectores y Galpones',
+      `Modificó sector [${updatedCode}] ${updatedName}`
+    );
     setModalEditProject(false);
   };
 
   const handleDeleteSector = (secId: string) => {
+    const targetSec = sectors.find((s) => s.id === secId);
     setSectors((prev) => prev.filter((s) => s.id !== secId));
+    recordUserMovement(
+      'ELIMINACIÓN',
+      'Sectores y Galpones',
+      `Eliminó sector [${targetSec?.code || secId}] ${targetSec?.name || ''}`
+    );
   };
 
   const handleSaveNewGalpon = (e: React.FormEvent) => {
     e.preventDefault();
     const targetSecId = formGalpon.sectorId || currentSector?.id;
-    if (!formGalpon.code || !formGalpon.name || !targetSecId) return;
+    if (!formGalpon.code || !formGalpon.name || !targetSecId || !formGalpon.technology)
+      return;
 
-    const chosenTech = formGalpon.technology || technologies[0] || 'Big Herdsman';
+    const chosenTech = formGalpon.technology.trim();
     const generatedAreas = buildAreasFromCatalog(
       masterCatalog,
       chosenTech,
@@ -1042,12 +1354,18 @@ export default function App() {
       areas: generatedAreas
     };
 
+    const targetSecObj = sectors.find((s) => s.id === targetSecId);
     setSectors((prev) =>
       prev.map((s) =>
         s.id === targetSecId
           ? { ...s, galpones: [...(s.galpones || []), newGalponObj] }
           : s
       )
+    );
+    recordUserMovement(
+      'REGISTRO',
+      'Sectores y Galpones',
+      `Registró nuevo galpón [${newGalponObj.code}] ${newGalponObj.name} en sector ${targetSecObj?.name || ''} (Proveedor: ${chosenTech})`
     );
     setSelectedSectorId(targetSecId);
     setSelectedGalponId(newGalponObj.id);
@@ -1064,6 +1382,9 @@ export default function App() {
           .map((s) => s.trim())
           .filter(Boolean)
       : [];
+
+    const updatedCode = formGalpon.code.trim().toUpperCase();
+    const updatedName = formGalpon.name.trim().toUpperCase();
 
     setSectors((prev) =>
       prev.map((s) => ({
@@ -1083,8 +1404,8 @@ export default function App() {
 
           return {
             ...g,
-            code: formGalpon.code.trim().toUpperCase(),
-            name: formGalpon.name.trim().toUpperCase(),
+            code: updatedCode,
+            name: updatedName,
             technology: formGalpon.technology,
             description: formGalpon.description.trim(),
             supervisors: supList,
@@ -1103,16 +1424,27 @@ export default function App() {
       }))
     );
 
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Sectores y Galpones',
+      `Modificó galpón [${updatedCode}] ${updatedName} (Proveedor: ${formGalpon.technology})`
+    );
     setModalEditGalpon(false);
   };
 
   const handleDeleteGalpon = (secId: string, galId: string) => {
+    const targetGal = allGalponesList.find((g) => g.id === galId);
     setSectors((prev) =>
       prev.map((s) =>
         s.id === secId
           ? { ...s, galpones: (s.galpones || []).filter((g: any) => g.id !== galId) }
           : s
       )
+    );
+    recordUserMovement(
+      'ELIMINACIÓN',
+      'Sectores y Galpones',
+      `Eliminó galpón [${targetGal?.code || galId}] ${targetGal?.name || ''} del sector ${targetGal?.sectorName || ''}`
     );
   };
 
@@ -1134,15 +1466,21 @@ export default function App() {
           : s
       )
     );
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Sectores y Galpones',
+      `Sincronizó actividades del galpón [${galponObj.code}] desde el Catálogo Maestro (${galponObj.technology})`
+    );
   };
 
   // ==========================================================================
-  // HANDLERS: GESTIÓN DE ACTIVIDADES EN EL GALPÓN
+  // HANDLERS: GESTIÓN DE ACTIVIDADES EN EL GALPÓN (CUALQUIER SECTOR Y GALPÓN)
   // ==========================================================================
   const handleSaveNewActivity = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentGalpon || !currentSector) return;
-    if (!formActivity.code || !formActivity.name) return;
+    const primaryGalponId = formActivity.targetGalponId || currentGalpon?.id || '';
+    if (!primaryGalponId) return;
+    if (!formActivity.code || !formActivity.name || !formActivity.areaName) return;
 
     const finalSistema =
       formActivity.sistemaName === '__NEW__'
@@ -1154,37 +1492,47 @@ export default function App() {
         ? formActivity.customStructureName.trim()
         : formActivity.structureName.trim();
 
+    if (!finalStructure) return;
+
     const newActObj = {
       id: generateId('act'),
       code: formActivity.code.trim().toUpperCase(),
       name: formActivity.name.trim(),
       locationType: AREAS_WITH_SISTEMAS.includes(formActivity.areaName)
-        ? formActivity.locationType
+        ? formActivity.locationType || 'Interno'
         : 'Interno',
       sistemaName: AREAS_WITH_SISTEMAS.includes(formActivity.areaName)
-        ? finalSistema || 'Sistema General'
+        ? finalSistema || null
         : null,
-      structureName: finalStructure || 'Estructura Principal',
-      targetUnits: Number(formActivity.targetUnits) || 100,
-      unit: formActivity.unit || 'Und',
+      structureName: finalStructure,
+      targetUnits: Number(formActivity.targetUnits) || 0,
+      unit: formActivity.unit.trim() || 'Und',
       weight: Number(formActivity.weight) || 1.0,
-      plannedHH: Number(formActivity.plannedHH) || 40,
+      plannedHH: Number(formActivity.plannedHH) || 0,
       startDate: formActivity.startDate || getSystemToday(),
       dueDate: formActivity.dueDate || getSystemToday(),
       status: 'Pendiente'
     };
 
-    const targetGalponIds = [currentGalpon.id];
-    if (formActivity.sharedWithGalponId) {
+    const targetGalponIds = [primaryGalponId];
+    if (
+      formActivity.sharedWithGalponId &&
+      !targetGalponIds.includes(formActivity.sharedWithGalponId)
+    ) {
       targetGalponIds.push(formActivity.sharedWithGalponId);
     }
 
+    // Actualizar galpones en TODOS los sectores donde se encuentre cualquiera de los galpones destino
     setSectors((prev) =>
       prev.map((s) => {
-        if (s.id !== currentSector.id) return s;
+        const hasTargetInSector = (s.galpones || []).some((g: any) =>
+          targetGalponIds.includes(g.id)
+        );
+        if (!hasTargetInSector) return s;
+
         return {
           ...s,
-          galpones: s.galpones.map((g: any) => {
+          galpones: (s.galpones || []).map((g: any) => {
             if (!targetGalponIds.includes(g.id)) return g;
             const currentAreas =
               g.areas && g.areas.length > 0
@@ -1202,50 +1550,74 @@ export default function App() {
 
               if (AREAS_WITH_SISTEMAS.includes(area.name)) {
                 const sisList = [...(area.sistemas || [])];
+                const targetSisName = newActObj.sistemaName || 'General';
                 let sisObj = sisList.find(
                   (sis) =>
-                    sis.name.toLowerCase() ===
-                      (newActObj.sistemaName || '').toLowerCase() &&
+                    (sis.name || '').toLowerCase() === targetSisName.toLowerCase() &&
                     (sis.locationType || 'Interno') === newActObj.locationType
                 );
                 if (!sisObj) {
                   sisObj = {
                     id: generateId('sis'),
-                    name: newActObj.sistemaName || 'Sistema General',
+                    name: targetSisName,
                     locationType: newActObj.locationType,
                     structures: []
                   };
                   sisList.push(sisObj);
                 }
-                let strObj = sisObj.structures.find(
+                const strList = [...(sisObj.structures || [])];
+                let strObj = strList.find(
                   (st: any) =>
-                    st.name.toLowerCase() === newActObj.structureName.toLowerCase()
+                    (st.name || '').toLowerCase() ===
+                    newActObj.structureName.toLowerCase()
                 );
                 if (!strObj) {
                   strObj = {
                     id: generateId('str'),
                     name: newActObj.structureName,
-                    activities: []
+                    activities: [
+                      { ...newActObj, id: generateId('act'), sistemaName: targetSisName }
+                    ]
                   };
-                  sisObj.structures.push(strObj);
+                  strList.push(strObj);
+                } else {
+                  strObj = {
+                    ...strObj,
+                    activities: [
+                      ...(strObj.activities || []),
+                      { ...newActObj, id: generateId('act'), sistemaName: targetSisName }
+                    ]
+                  };
+                  const strIdx = strList.findIndex((st: any) => st.id === strObj.id);
+                  if (strIdx >= 0) strList[strIdx] = strObj;
                 }
-                strObj.activities.push({ ...newActObj, id: generateId('act') });
+                sisObj.structures = strList;
                 return { ...area, hasSistemas: true, sistemas: sisList };
               } else {
                 const strList = [...(area.structures || [])];
                 let strObj = strList.find(
                   (st: any) =>
-                    st.name.toLowerCase() === newActObj.structureName.toLowerCase()
+                    (st.name || '').toLowerCase() ===
+                    newActObj.structureName.toLowerCase()
                 );
                 if (!strObj) {
                   strObj = {
                     id: generateId('str'),
                     name: newActObj.structureName,
-                    activities: []
+                    activities: [{ ...newActObj, id: generateId('act') }]
                   };
                   strList.push(strObj);
+                } else {
+                  strObj = {
+                    ...strObj,
+                    activities: [
+                      ...(strObj.activities || []),
+                      { ...newActObj, id: generateId('act') }
+                    ]
+                  };
+                  const strIdx = strList.findIndex((st: any) => st.id === strObj.id);
+                  if (strIdx >= 0) strList[strIdx] = strObj;
                 }
-                strObj.activities.push({ ...newActObj, id: generateId('act') });
                 return { ...area, hasSistemas: false, structures: strList };
               }
             });
@@ -1255,6 +1627,37 @@ export default function App() {
         };
       })
     );
+
+    // Si el usuario eligió otro galpón destino en el modal, cambiamos a ese galpón y sector para que vea su actividad de inmediato
+    const targetGalInfo = allGalponesList.find((g) => g.id === primaryGalponId);
+    if (targetGalInfo) {
+      setSelectedSectorId(targetGalInfo.sectorId);
+      setSelectedGalponId(targetGalInfo.id);
+    }
+
+    const targetGalLabels = targetGalponIds
+      .map((gid) => {
+        const gObj = allGalponesList.find((g) => g.id === gid);
+        return gObj ? `${gObj.sectorName} • ${gObj.code}` : gid;
+      })
+      .join(', ');
+
+    recordUserMovement(
+      'REGISTRO',
+      'Actividades',
+      `Registró actividad [${newActObj.code}] ${newActObj.name} (${formActivity.areaName} • ${newActObj.structureName}) en ${targetGalLabels}`
+    );
+
+    // Sincronizar filtros de la tabla de actividades para que siempre sea visible inmediatamente
+    if (filterActArea !== 'Todas' && filterActArea !== formActivity.areaName) {
+      setFilterActArea('Todas');
+    }
+    if (filterActLocation !== 'Todos' && filterActLocation !== newActObj.locationType) {
+      setFilterActLocation('Todos');
+    }
+    if (searchActText.trim()) {
+      setSearchActText('');
+    }
 
     setModalNewActivity(false);
   };
@@ -1330,11 +1733,17 @@ export default function App() {
       })
     );
 
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Actividades',
+      `Modificó actividad [${modalEditGalponActivity.code.trim().toUpperCase()}] ${modalEditGalponActivity.name.trim()} en galpón ${currentGalpon.code}`
+    );
     setModalEditGalponActivity(null);
   };
 
   const handleDeleteGalponActivity = (actId: string) => {
     if (!currentGalpon || !currentSector) return;
+    const targetAct = evaluatedActivities.find((a) => a.id === actId);
     setSectors((prev) =>
       prev.map((s) => {
         if (s.id !== currentSector.id) return s;
@@ -1372,6 +1781,11 @@ export default function App() {
         };
       })
     );
+    recordUserMovement(
+      'ELIMINACIÓN',
+      'Actividades',
+      `Eliminó actividad [${targetAct?.code || actId}] ${targetAct?.name || ''} del galpón ${currentGalpon.code}`
+    );
   };
 
   const handleGanttDateChange = (
@@ -1380,6 +1794,7 @@ export default function App() {
     value: string
   ) => {
     if (!currentGalpon || !currentSector) return;
+    const targetAct = evaluatedActivities.find((a) => a.id === actId);
     setSectors((prev) =>
       prev.map((s) => {
         if (s.id !== currentSector.id) return s;
@@ -1419,24 +1834,36 @@ export default function App() {
         };
       })
     );
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Actividades',
+      `Actualizó fecha de ${field === 'startDate' ? 'Inicio' : 'Fin'} (${value}) en actividad [${targetAct?.code || actId}] del galpón ${currentGalpon.code}`
+    );
   };
 
   // ==========================================================================
-  // HANDLERS: MATERIALES (ASIGNAR A ESTRUCTURA, EDITAR, ELIMINAR)
+  // HANDLERS: MATERIALES (ASIGNAR A GALPÓN / ÁREA / SISTEMA / ESTRUCTURA)
   // ==========================================================================
   const openNewMaterialModal = () => {
     setEditingMaterialId(null);
     setFormMaterial({
-      technology: currentGalpon?.technology || technologies[0] || 'Big Herdsman',
+      sectorId: '',
+      galponId: '',
+      technology: '',
       code: '',
       name: '',
-      areaName: 'Sistema de Jaulas',
+      areaId: '',
+      areaName: '',
+      locationType: '',
+      sistemaId: '',
       sistemaName: '',
+      customSistemaName: '',
+      structureId: '',
       structureName: '',
       customStructureName: '',
       totalQty: '',
       usedQty: 0,
-      unit: 'Und'
+      unit: ''
     });
     setModalNewMaterial(true);
   };
@@ -1444,48 +1871,267 @@ export default function App() {
   const openEditMaterialModal = (mat: any) => {
     setEditingMaterialId(mat.id);
     setFormMaterial({
-      technology: mat.technology || technologies[0] || 'Big Herdsman',
+      sectorId: mat.sectorId || '',
+      galponId: mat.galponId || '',
+      technology: mat.technology || '',
       code: mat.code || '',
       name: mat.name || '',
-      areaName: mat.areaName || 'Sistema de Jaulas',
+      areaId: mat.areaId || '',
+      areaName: mat.areaName || '',
+      locationType: mat.locationType || '',
+      sistemaId: mat.sistemaId || '',
       sistemaName: mat.sistemaName || '',
+      customSistemaName: '',
+      structureId: mat.structureId || '',
       structureName: mat.structureName || '',
       customStructureName: '',
       totalQty: String(mat.totalQty ?? ''),
       usedQty: Number(mat.usedQty || 0),
-      unit: mat.unit || 'Und'
+      unit: mat.unit || ''
     });
     setModalNewMaterial(true);
   };
 
   const handleSaveMaterial = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formMaterial.code || !formMaterial.name) return;
+    const cleanCode = formMaterial.code.trim().toUpperCase();
+    const cleanName = formMaterial.name.trim();
+    const cleanTech = formMaterial.technology.trim();
+    const cleanArea = formMaterial.areaName.trim();
+    const cleanUnit = formMaterial.unit.trim();
+
+    const hasSistemas = AREAS_WITH_SISTEMAS.includes(cleanArea);
+    const finalSistema = hasSistemas
+      ? formMaterial.sistemaName === '__NEW__'
+        ? formMaterial.customSistemaName.trim()
+        : formMaterial.sistemaName.trim()
+      : '';
 
     const finalStructure =
       formMaterial.structureName === '__NEW__'
         ? formMaterial.customStructureName.trim()
         : formMaterial.structureName.trim();
 
+    if (!cleanCode || !cleanName || !cleanTech || !cleanArea || !finalStructure || !cleanUnit) {
+      return;
+    }
+    if (hasSistemas && !finalSistema) {
+      return;
+    }
+
+    let resolvedSectorId = formMaterial.sectorId || '';
+    const resolvedGalponId = formMaterial.galponId || '';
+    let resolvedAreaId = formMaterial.areaId || '';
+    let resolvedSistemaId = hasSistemas ? formMaterial.sistemaId || '' : '';
+    let resolvedStructureId = formMaterial.structureId || '';
+    const resolvedLocType = hasSistemas ? formMaterial.locationType || 'Interno' : '';
+
+    if (resolvedGalponId) {
+      const galInfo = allGalponesList.find((g) => g.id === resolvedGalponId);
+      if (galInfo) {
+        resolvedSectorId = galInfo.sectorId;
+        const areaObj = galInfo.areas?.find((a: any) => a.name === cleanArea);
+        if (areaObj) {
+          resolvedAreaId = areaObj.id || resolvedAreaId;
+          if (hasSistemas) {
+            const sisObj = (areaObj.sistemas || []).find(
+              (s: any) =>
+                (s.name || '').toLowerCase() === finalSistema.toLowerCase() &&
+                (!formMaterial.locationType ||
+                  (s.locationType || 'Interno') === formMaterial.locationType)
+            );
+            if (sisObj) {
+              resolvedSistemaId = sisObj.id || resolvedSistemaId;
+              const strObj = (sisObj.structures || []).find(
+                (st: any) =>
+                  (st.name || '').toLowerCase() === finalStructure.toLowerCase()
+              );
+              if (strObj) {
+                resolvedStructureId = strObj.id || resolvedStructureId;
+              }
+            }
+          } else {
+            const strObj = (areaObj.structures || []).find(
+              (st: any) =>
+                (st.name || '').toLowerCase() === finalStructure.toLowerCase()
+            );
+            if (strObj) {
+              resolvedStructureId = strObj.id || resolvedStructureId;
+            }
+          }
+        }
+      }
+
+      // Si el área/sistema/estructura aún no tenía nodo en el galpón, lo garantizamos con IDs únicos
+      if (!resolvedAreaId) resolvedAreaId = generateId('area');
+      if (hasSistemas && !resolvedSistemaId) resolvedSistemaId = generateId('sis');
+      if (!resolvedStructureId) resolvedStructureId = generateId('str');
+
+      setSectors((prev) =>
+        prev.map((sec) => {
+          if (sec.id !== resolvedSectorId) return sec;
+          return {
+            ...sec,
+            galpones: (sec.galpones || []).map((g: any) => {
+              if (g.id !== resolvedGalponId) return g;
+              const baseAreas =
+                g.areas && g.areas.length > 0
+                  ? g.areas
+                  : ALL_AREAS.map((aName, idx) => ({
+                      id: aName === cleanArea ? resolvedAreaId : generateId(`area_${idx}`),
+                      name: aName,
+                      hasSistemas: AREAS_WITH_SISTEMAS.includes(aName),
+                      sistemas: [],
+                      structures: []
+                    }));
+
+              const updatedAreas = baseAreas.map((area: any) => {
+                if (area.name !== cleanArea) return area;
+                const finalAreaObjId = area.id || resolvedAreaId;
+                if (hasSistemas) {
+                  const sisList = [...(area.sistemas || [])];
+                  let sisObj = sisList.find(
+                    (s: any) =>
+                      s.id === resolvedSistemaId ||
+                      ((s.name || '').toLowerCase() === finalSistema.toLowerCase() &&
+                        (s.locationType || 'Interno') === resolvedLocType)
+                  );
+                  if (!sisObj) {
+                    sisObj = {
+                      id: resolvedSistemaId,
+                      name: finalSistema,
+                      locationType: resolvedLocType,
+                      structures: []
+                    };
+                    sisList.push(sisObj);
+                  } else {
+                    resolvedSistemaId = sisObj.id;
+                  }
+                  const strList = [...(sisObj.structures || [])];
+                  let strObj = strList.find(
+                    (st: any) =>
+                      st.id === resolvedStructureId ||
+                      (st.name || '').toLowerCase() === finalStructure.toLowerCase()
+                  );
+                  if (!strObj) {
+                    strObj = {
+                      id: resolvedStructureId,
+                      name: finalStructure,
+                      activities: []
+                    };
+                    strList.push(strObj);
+                  } else {
+                    resolvedStructureId = strObj.id;
+                  }
+                  sisObj.structures = strList;
+                  return {
+                    ...area,
+                    id: finalAreaObjId,
+                    hasSistemas: true,
+                    sistemas: sisList
+                  };
+                } else {
+                  const strList = [...(area.structures || [])];
+                  let strObj = strList.find(
+                    (st: any) =>
+                      st.id === resolvedStructureId ||
+                      (st.name || '').toLowerCase() === finalStructure.toLowerCase()
+                  );
+                  if (!strObj) {
+                    strObj = {
+                      id: resolvedStructureId,
+                      name: finalStructure,
+                      activities: []
+                    };
+                    strList.push(strObj);
+                  } else {
+                    resolvedStructureId = strObj.id;
+                  }
+                  return {
+                    ...area,
+                    id: finalAreaObjId,
+                    hasSistemas: false,
+                    structures: strList
+                  };
+                }
+              });
+
+              return { ...g, areas: updatedAreas };
+            })
+          };
+        })
+      );
+    }
+
     const newMatPayload = {
       id: editingMaterialId || generateId('mat'),
-      technology: formMaterial.technology || 'Big Herdsman',
-      code: formMaterial.code.trim().toUpperCase(),
-      name: formMaterial.name.trim(),
-      areaName: formMaterial.areaName,
-      sistemaName: formMaterial.sistemaName.trim() || null,
-      structureName: finalStructure || 'Estructura Principal',
+      sectorId: resolvedSectorId,
+      galponId: resolvedGalponId,
+      technology: cleanTech,
+      code: cleanCode,
+      name: cleanName,
+      areaId: resolvedAreaId,
+      areaName: cleanArea,
+      locationType: hasSistemas ? resolvedLocType : '',
+      sistemaId: hasSistemas ? resolvedSistemaId : '',
+      sistemaName: hasSistemas ? finalSistema : null,
+      structureId: resolvedStructureId,
+      structureName: finalStructure,
       totalQty: Number(formMaterial.totalQty) || 0,
       usedQty: Number(formMaterial.usedQty) || 0,
-      unit: formMaterial.unit || 'Und'
+      unit: cleanUnit
     };
+
+    const assignedGalForLog = allGalponesList.find(
+      (g) => g.id === newMatPayload.galponId
+    );
+    const galLabelForLog = assignedGalForLog
+      ? `${assignedGalForLog.sectorName} • ${assignedGalForLog.code}`
+      : 'Sin galpón asignado';
 
     if (editingMaterialId) {
       setMaterials((prev) =>
         prev.map((m) => (m.id === editingMaterialId ? newMatPayload : m))
       );
+      recordUserMovement(
+        'MODIFICACIÓN',
+        'Materiales',
+        `Modificó material [${newMatPayload.code}] ${newMatPayload.name} (${newMatPayload.totalQty} ${newMatPayload.unit} • Proveedor: ${newMatPayload.technology}) en ${galLabelForLog} / ${newMatPayload.structureName}`
+      );
     } else {
       setMaterials((prev) => [...prev, newMatPayload]);
+      recordUserMovement(
+        'REGISTRO',
+        'Materiales',
+        `Registró material [${newMatPayload.code}] ${newMatPayload.name} (${newMatPayload.totalQty} ${newMatPayload.unit} • Proveedor: ${newMatPayload.technology}) en ${galLabelForLog} / ${newMatPayload.structureName}`
+      );
+    }
+
+    // Sincronizar filtros para que el material recién guardado siempre quede visible inmediatamente
+    if (filterMaterialGalpon !== 'Todos') {
+      const matchesGalponFilter =
+        (filterMaterialGalpon === '__UNASSIGNED__' && !newMatPayload.galponId) ||
+        filterMaterialGalpon === newMatPayload.galponId;
+      if (!matchesGalponFilter) {
+        setFilterMaterialGalpon('Todos');
+      }
+    }
+    if (filterMaterialTech !== 'Todas' && filterMaterialTech !== newMatPayload.technology) {
+      setFilterMaterialTech('Todas');
+    }
+    if (filterMaterialArea !== 'Todas' && filterMaterialArea !== newMatPayload.areaName) {
+      setFilterMaterialArea('Todas');
+    }
+    if (searchMaterialText.trim()) {
+      const q = searchMaterialText.toLowerCase().trim();
+      const matchesSearch =
+        newMatPayload.code.toLowerCase().includes(q) ||
+        newMatPayload.name.toLowerCase().includes(q) ||
+        (newMatPayload.structureName || '').toLowerCase().includes(q) ||
+        (newMatPayload.sistemaName || '').toLowerCase().includes(q);
+      if (!matchesSearch) {
+        setSearchMaterialText('');
+      }
     }
 
     setModalNewMaterial(false);
@@ -1493,99 +2139,27 @@ export default function App() {
   };
 
   const handleDeleteMaterial = (id: string) => {
+    const targetMat = materials.find((m) => m.id === id);
     setMaterials((prev) => prev.filter((m) => m.id !== id));
+    recordUserMovement(
+      'ELIMINACIÓN',
+      'Materiales',
+      `Eliminó material [${targetMat?.code || id}] ${targetMat?.name || ''}`
+    );
   };
 
   // ==========================================================================
-  // HANDLERS: AVANCE DIARIO EN CASCADA + CONSUMO MANUAL DE MATERIALES
+  // HANDLERS: AVANCE DIARIO EN CASCADA + CONSUMO MANUAL DE MATERIALES POR ID
   // ==========================================================================
-  const handleSaveAdvance = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!formAdvance.activityCode || !formAdvance.quantityToday || !currentGalpon)
-      return;
-
-    const rawQty = Number(formAdvance.quantityToday) || 0;
-    const rawHH = Number(formAdvance.hoursWorked) || 0;
-    const isShared =
-      formAdvance.sharedAcrossTwoGalpones && Boolean(formAdvance.secondGalponId);
-    const factor = isShared && formAdvance.splitMode === '50_50' ? 0.5 : 1;
-
-    const qtyPerGalpon = Math.round(rawQty * factor * 100) / 100;
-    const hhPerGalpon = Math.round(rawHH * factor * 100) / 100;
-
-    const selectedAct = evaluatedActivities.find(
-      (a) => a.code === formAdvance.activityCode
-    );
-    const usedMatsList: { code: string; name: string; qty: number; unit: string }[] = [];
-
-    if (selectedAct && selectedAct.linkedMaterials?.length > 0) {
-      selectedAct.linkedMaterials.forEach((mat: any) => {
-        const manualVal = formAdvance.manualMaterialInputs[mat.code];
-        const qtyUsed =
-          manualVal !== undefined && manualVal !== '' ? Number(manualVal) : 0;
-        if (qtyUsed > 0) {
-          usedMatsList.push({
-            code: mat.code,
-            name: mat.name,
-            qty: qtyUsed,
-            unit: mat.unit
-          });
-        }
-      });
-    }
-
-    if (usedMatsList.length > 0) {
-      setMaterials((prev) =>
-        prev.map((m) => {
-          const found = usedMatsList.find((u) => u.code === m.code);
-          if (!found) return m;
-          return {
-            ...m,
-            usedQty: Math.round((Number(m.usedQty || 0) + found.qty) * 10) / 10
-          };
-        })
-      );
-    }
-
-    const newLogs: any[] = [
-      {
-        id: generateId('adv'),
-        galponId: currentGalpon.id,
-        activityCode: formAdvance.activityCode,
-        date: formAdvance.date,
-        quantityToday: qtyPerGalpon,
-        hoursWorked: hhPerGalpon,
-        supervisor:
-          formAdvance.supervisor || currentGalpon.supervisors?.[0] || 'Supervisor',
-        note: isShared ? `[Trabajo Biproyecto] ${formAdvance.note}` : formAdvance.note,
-        materialsUsedToday: usedMatsList
-      }
-    ];
-
-    if (isShared) {
-      newLogs.push({
-        id: generateId('adv'),
-        galponId: formAdvance.secondGalponId,
-        activityCode: formAdvance.activityCode,
-        date: formAdvance.date,
-        quantityToday: qtyPerGalpon,
-        hoursWorked: hhPerGalpon,
-        supervisor:
-          formAdvance.supervisor || currentGalpon.supervisors?.[0] || 'Supervisor',
-        note: `[Trabajo Biproyecto con ${currentGalpon.code}] ${formAdvance.note}`,
-        materialsUsedToday: usedMatsList
-      });
-    }
-
-    setDailyAdvances((prev) => [...newLogs, ...prev]);
-    setModalNewAdvance(false);
+  const openNewAdvanceModal = (prefill?: Partial<typeof formAdvance>) => {
+    setEditingAdvanceId(null);
     setFormAdvance({
-      areaName: '',
-      locationType: 'Todos',
-      sistemaName: '',
-      structureName: '',
-      activityCode: '',
-      date: getSystemToday(),
+      areaName: prefill?.areaName || '',
+      locationType: prefill?.locationType || 'Todos',
+      sistemaName: prefill?.sistemaName || '',
+      structureName: prefill?.structureName || '',
+      activityCode: prefill?.activityCode || '',
+      date: '',
       quantityToday: '',
       hoursWorked: '',
       supervisor: '',
@@ -1595,6 +2169,281 @@ export default function App() {
       splitMode: '100_both',
       manualMaterialInputs: {}
     });
+    setModalNewAdvance(true);
+  };
+
+  const openEditAdvanceModal = (adv: any) => {
+    setEditingAdvanceId(adv.id);
+    const act = evaluatedActivities.find((a) => a.code === adv.activityCode);
+    const manualInputs: Record<string, string> = {};
+
+    if (adv.materialsUsedToday?.length > 0) {
+      adv.materialsUsedToday.forEach((u: any) => {
+        if (u.materialId) {
+          manualInputs[u.materialId] = String(u.qty ?? '');
+        } else {
+          // Compatibilidad con registros antiguos sin materialId
+          const matchedMat =
+            act?.linkedMaterials?.find((m: any) => m.code === u.code) ||
+            materials.find(
+              (m) =>
+                m.code === u.code &&
+                (!m.galponId || m.galponId === adv.galponId)
+            );
+          if (matchedMat) {
+            manualInputs[matchedMat.id] = String(u.qty ?? '');
+          }
+        }
+      });
+    }
+
+    setFormAdvance({
+      areaName: act?.areaName || '',
+      locationType: act?.locationType || 'Todos',
+      sistemaName: act?.sistemaName || '',
+      structureName: act?.structureName || '',
+      activityCode: adv.activityCode || '',
+      date: adv.date || '',
+      quantityToday: String(adv.quantityToday ?? ''),
+      hoursWorked: String(adv.hoursWorked ?? ''),
+      supervisor: adv.supervisor || '',
+      note: adv.note || '',
+      sharedAcrossTwoGalpones: false,
+      secondGalponId: '',
+      splitMode: '100_both',
+      manualMaterialInputs: manualInputs
+    });
+    setModalNewAdvance(true);
+  };
+
+  const handleSaveAdvance = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!formAdvance.activityCode || !formAdvance.quantityToday || !currentGalpon)
+      return;
+
+    const rawQty = Number(formAdvance.quantityToday) || 0;
+    const rawHH = Number(formAdvance.hoursWorked) || 0;
+    const isShared =
+      !editingAdvanceId &&
+      formAdvance.sharedAcrossTwoGalpones &&
+      Boolean(formAdvance.secondGalponId);
+    const factor = isShared && formAdvance.splitMode === '50_50' ? 0.5 : 1;
+
+    const qtyPerGalpon = Math.round(rawQty * factor * 100) / 100;
+    const hhPerGalpon = Math.round(rawHH * factor * 100) / 100;
+
+    const selectedAct = evaluatedActivities.find(
+      (a) => a.code === formAdvance.activityCode
+    );
+    const usedMatsList: {
+      materialId: string;
+      code: string;
+      name: string;
+      qty: number;
+      unit: string;
+    }[] = [];
+
+    if (selectedAct && selectedAct.linkedMaterials?.length > 0) {
+      selectedAct.linkedMaterials.forEach((mat: any) => {
+        const manualVal = formAdvance.manualMaterialInputs[mat.id];
+        const qtyUsed =
+          manualVal !== undefined && manualVal !== '' ? Number(manualVal) : 0;
+        if (qtyUsed > 0) {
+          usedMatsList.push({
+            materialId: mat.id,
+            code: mat.code,
+            name: mat.name,
+            qty: qtyUsed,
+            unit: mat.unit
+          });
+        }
+      });
+    }
+
+    const finalSupervisor =
+      formAdvance.supervisor.trim() ||
+      currentGalpon.supervisors?.[0] ||
+      activeUserName ||
+      'Supervisor';
+
+    if (editingAdvanceId) {
+      const oldAdv = dailyAdvances.find((a) => a.id === editingAdvanceId);
+
+      // Revertir consumo anterior y recalcular el nuevo consumo por ID único sin duplicaciones
+      setMaterials((prev) =>
+        prev.map((m) => {
+          let updatedUsed = Number(m.usedQty || 0);
+
+          if (oldAdv && oldAdv.materialsUsedToday?.length > 0) {
+            oldAdv.materialsUsedToday.forEach((oldU: any) => {
+              const matchesOld = oldU.materialId
+                ? m.id === oldU.materialId
+                : m.code === oldU.code &&
+                  (!m.galponId || m.galponId === oldAdv.galponId);
+              if (matchesOld) {
+                updatedUsed -= Number(oldU.qty || 0);
+              }
+            });
+          }
+
+          const newUsage = usedMatsList.find((u) => u.materialId === m.id);
+          if (newUsage) {
+            updatedUsed += Number(newUsage.qty || 0);
+          }
+
+          return {
+            ...m,
+            usedQty: Math.max(0, Math.round(updatedUsed * 10) / 10)
+          };
+        })
+      );
+
+      const updatedAdvObj = {
+        ...(oldAdv || {}),
+        id: editingAdvanceId,
+        galponId: oldAdv?.galponId || currentGalpon.id,
+        activityCode: formAdvance.activityCode,
+        date: formAdvance.date || getSystemToday(),
+        quantityToday: rawQty,
+        hoursWorked: rawHH,
+        supervisor: finalSupervisor,
+        note: formAdvance.note,
+        materialsUsedToday: usedMatsList
+      };
+
+      setDailyAdvances((prev) =>
+        prev.map((a) => (a.id === editingAdvanceId ? updatedAdvObj : a))
+      );
+
+      const matsSummary =
+        usedMatsList.length > 0
+          ? ` | Materiales: ${usedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
+          : '';
+
+      recordUserMovement(
+        'MODIFICACIÓN',
+        'Avance Diario',
+        `Modificó parte diario de [${formAdvance.activityCode}] ${selectedAct?.name || ''} en galpón ${currentGalpon.code}: +${rawQty} ${selectedAct?.unit || 'Und'}, ${rawHH} HH (Fecha: ${updatedAdvObj.date})${matsSummary}`,
+        finalSupervisor
+      );
+    } else {
+      if (usedMatsList.length > 0) {
+        setMaterials((prev) =>
+          prev.map((m) => {
+            const found = usedMatsList.find((u) => u.materialId === m.id);
+            if (!found) return m;
+            return {
+              ...m,
+              usedQty: Math.round((Number(m.usedQty || 0) + found.qty) * 10) / 10
+            };
+          })
+        );
+      }
+
+      const newLogs: any[] = [
+        {
+          id: generateId('adv'),
+          galponId: currentGalpon.id,
+          activityCode: formAdvance.activityCode,
+          date: formAdvance.date || getSystemToday(),
+          quantityToday: qtyPerGalpon,
+          hoursWorked: hhPerGalpon,
+          supervisor: finalSupervisor,
+          note: isShared ? `[Trabajo Biproyecto] ${formAdvance.note}` : formAdvance.note,
+          materialsUsedToday: usedMatsList
+        }
+      ];
+
+      if (isShared) {
+        newLogs.push({
+          id: generateId('adv'),
+          galponId: formAdvance.secondGalponId,
+          activityCode: formAdvance.activityCode,
+          date: formAdvance.date || getSystemToday(),
+          quantityToday: qtyPerGalpon,
+          hoursWorked: hhPerGalpon,
+          supervisor: finalSupervisor,
+          note: `[Trabajo Biproyecto con ${currentGalpon.code}] ${formAdvance.note}`,
+          materialsUsedToday: usedMatsList
+        });
+      }
+
+      setDailyAdvances((prev) => [...newLogs, ...prev]);
+
+      const matsSummary =
+        usedMatsList.length > 0
+          ? ` | Materiales: ${usedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
+          : '';
+
+      recordUserMovement(
+        'REGISTRO',
+        'Avance Diario',
+        `Registró parte diario de [${formAdvance.activityCode}] ${selectedAct?.name || ''} en galpón ${currentGalpon.code}: +${qtyPerGalpon} ${selectedAct?.unit || 'Und'}, ${hhPerGalpon} HH (Fecha: ${newLogs[0].date})${matsSummary}`,
+        finalSupervisor
+      );
+    }
+
+    setModalNewAdvance(false);
+    setEditingAdvanceId(null);
+    setFormAdvance({
+      areaName: '',
+      locationType: 'Todos',
+      sistemaName: '',
+      structureName: '',
+      activityCode: '',
+      date: '',
+      quantityToday: '',
+      hoursWorked: '',
+      supervisor: '',
+      note: '',
+      sharedAcrossTwoGalpones: false,
+      secondGalponId: '',
+      splitMode: '100_both',
+      manualMaterialInputs: {}
+    });
+  };
+
+  const handleDeleteAdvance = (advId: string) => {
+    const targetAdv = dailyAdvances.find((a) => a.id === advId);
+    if (!targetAdv) return;
+
+    // Revertir consumo de materiales vinculado por ID único
+    if (targetAdv.materialsUsedToday?.length > 0) {
+      setMaterials((prev) =>
+        prev.map((m) => {
+          let revertedQty = Number(m.usedQty || 0);
+          targetAdv.materialsUsedToday.forEach((u: any) => {
+            const matchesMat = u.materialId
+              ? m.id === u.materialId
+              : m.code === u.code &&
+                (!m.galponId || m.galponId === targetAdv.galponId);
+            if (matchesMat) {
+              revertedQty -= Number(u.qty || 0);
+            }
+          });
+          return {
+            ...m,
+            usedQty: Math.max(0, Math.round(revertedQty * 10) / 10)
+          };
+        })
+      );
+    }
+
+    setDailyAdvances((prev) => prev.filter((a) => a.id !== advId));
+
+    const actObj = evaluatedActivities.find((a) => a.code === targetAdv.activityCode);
+    const revertedMatsText =
+      targetAdv.materialsUsedToday?.length > 0
+        ? ` (Stock revertido: ${targetAdv.materialsUsedToday
+            .map((u: any) => `${u.name} +${u.qty} ${u.unit}`)
+            .join(', ')})`
+        : '';
+
+    recordUserMovement(
+      'ELIMINACIÓN',
+      'Avance Diario',
+      `Eliminó parte diario de [${targetAdv.activityCode}] ${actObj?.name || ''} (${targetAdv.date} • Cantidad: ${targetAdv.quantityToday})${revertedMatsText}`
+    );
   };
 
   // ==========================================================================
@@ -1620,20 +2469,37 @@ export default function App() {
       setMasterWorkforce((prev) =>
         prev.map((w) => (w.id === formWorker.id ? payload : w))
       );
+      recordUserMovement(
+        'MODIFICACIÓN',
+        'Personal y Asistencia',
+        `Modificó operario [${payload.workerCode}] ${payload.name} (${payload.workArea})`
+      );
     } else {
       setMasterWorkforce((prev) => [...prev, payload]);
+      recordUserMovement(
+        'REGISTRO',
+        'Personal y Asistencia',
+        `Registró operario [${payload.workerCode}] ${payload.name} (${payload.workArea} • ${payload.role})`
+      );
     }
 
     setModalNewWorker(false);
   };
 
   const handleWorkerFieldChange = (workerId: string, field: string, value: any) => {
+    const targetW = masterWorkforce.find((w) => w.id === workerId);
     setMasterWorkforce((prev) =>
       prev.map((w) => (w.id === workerId ? { ...w, [field]: value } : w))
+    );
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Personal y Asistencia',
+      `Actualizó ${field} de operario [${targetW?.workerCode || workerId}] ${targetW?.name || ''}`
     );
   };
 
   const handleWorkerSectorChange = (workerId: string, newSectorId: string) => {
+    const targetW = masterWorkforce.find((w) => w.id === workerId);
     const targetSector = sectors.find((s) => s.id === newSectorId);
     const defaultGalponId =
       targetSector && targetSector.galpones?.length > 0
@@ -1647,13 +2513,25 @@ export default function App() {
           : w
       )
     );
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Personal y Asistencia',
+      `Reasignó sector de operario [${targetW?.workerCode || workerId}] ${targetW?.name || ''} a ${targetSector?.name || 'Sin Sector'}`
+    );
   };
 
   const handleDeleteWorker = (workerId: string) => {
+    const targetW = masterWorkforce.find((w) => w.id === workerId);
     setMasterWorkforce((prev) => prev.filter((w) => w.id !== workerId));
+    recordUserMovement(
+      'ELIMINACIÓN',
+      'Personal y Asistencia',
+      `Eliminó operario [${targetW?.workerCode || workerId}] ${targetW?.name || ''}`
+    );
   };
 
   const handleSetWorkerAttendance = (workerId: string, status: string) => {
+    const targetW = masterWorkforce.find((w) => w.id === workerId);
     setAttendanceRecords((prev) => {
       const dayMap = prev[attendanceDate] || {};
       return {
@@ -1664,6 +2542,11 @@ export default function App() {
         }
       };
     });
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Personal y Asistencia',
+      `Marcó asistencia "${status}" para [${targetW?.workerCode || workerId}] ${targetW?.name || ''} (${attendanceDate})`
+    );
   };
 
   const handleMarkAllAttended = () => {
@@ -1674,6 +2557,11 @@ export default function App() {
       });
       return { ...prev, [attendanceDate]: dayMap };
     });
+    recordUserMovement(
+      'MODIFICACIÓN',
+      'Personal y Asistencia',
+      `Marcó "Asistió" a ${filteredAttendanceWorkers.length} operarios en fecha ${attendanceDate}`
+    );
   };
 
   // ==========================================================================
@@ -1726,27 +2614,52 @@ export default function App() {
       });
       setTechnologies(Array.from(newTechs));
       setMasterCatalog((prev) => [...prev, ...newItems]);
+      recordUserMovement(
+        'REGISTRO',
+        'Carga Masiva',
+        `Importó ${newItems.length} actividades al Catálogo Maestro`
+      );
     } else if (modalBulkUpload === 'materiales') {
       const newMats: any[] = [];
+      const newTechs = new Set(technologies);
       lines.forEach((line) => {
         const cols = line.split(/[,;\t]/).map((c) => c.trim());
         if (cols.length < 3 || cols[0].toLowerCase() === 'proveedor') return;
-        const [tech, code, name, areaName, sistemaName, structureName, totalQty, unit] =
+        const [tech, code, name, areaName, sistemaName, structureName, totalQty, unit, galponCode] =
           cols;
+        const cleanTech = tech || '';
+        if (cleanTech) newTechs.add(cleanTech);
+        const matchedGalpon = galponCode
+          ? allGalponesList.find(
+              (g) => g.code.toLowerCase() === galponCode.toLowerCase()
+            )
+          : null;
         newMats.push({
           id: generateId('mat'),
-          technology: tech || 'Big Herdsman',
+          sectorId: matchedGalpon ? matchedGalpon.sectorId : '',
+          galponId: matchedGalpon ? matchedGalpon.id : '',
+          technology: cleanTech,
           code: (code || `MAT-${newMats.length + 1}`).toUpperCase(),
           name: name || 'Material importado',
-          areaName: areaName || 'Sistema de Jaulas',
+          areaId: '',
+          areaName: areaName || '',
+          locationType: '',
+          sistemaId: '',
           sistemaName: sistemaName || null,
-          structureName: structureName || 'Estructura Principal',
-          totalQty: Number(totalQty) || 100,
+          structureId: '',
+          structureName: structureName || '',
+          totalQty: Number(totalQty) || 0,
           usedQty: 0,
-          unit: unit || 'Und'
+          unit: unit || ''
         });
       });
+      setTechnologies(Array.from(newTechs));
       setMaterials((prev) => [...prev, ...newMats]);
+      recordUserMovement(
+        'REGISTRO',
+        'Carga Masiva',
+        `Importó ${newMats.length} materiales en Control de Materiales`
+      );
     } else if (modalBulkUpload === 'personal') {
       const newWorkers: any[] = [];
       lines.forEach((line) => {
@@ -1766,6 +2679,11 @@ export default function App() {
         });
       });
       setMasterWorkforce((prev) => [...prev, ...newWorkers]);
+      recordUserMovement(
+        'REGISTRO',
+        'Carga Masiva',
+        `Importó ${newWorkers.length} operarios a la Planilla de Personal`
+      );
     }
 
     setBulkCsvText('');
@@ -2032,6 +2950,26 @@ export default function App() {
               </span>
             </div>
           </button>
+
+          <button
+            onClick={() => {
+              setCurrentTab('movimientos');
+              setSidebarOpen(false);
+            }}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition ${
+              currentTab === 'movimientos'
+                ? 'bg-emerald-50 text-[#0f6b38] font-bold border border-emerald-200'
+                : 'text-slate-700 hover:bg-slate-100'
+            }`}
+          >
+            <ClipboardList className="w-4 h-4 text-[#0f6b38]" />
+            <div className="text-left">
+              <span className="block font-bold">Historial de Movimientos</span>
+              <span className="text-[10px] text-slate-500 font-normal">
+                Registros, modificaciones y eliminaciones ({auditLogs.length})
+              </span>
+            </div>
+          </button>
         </div>
 
         <div className="p-3 bg-slate-50 border-t border-slate-200 text-[11px] text-slate-500 flex items-center justify-between">
@@ -2088,6 +3026,14 @@ export default function App() {
               >
                 <Package className="w-3.5 h-3.5" />
                 <span className="hidden sm:inline">Materiales</span>
+              </button>
+
+              <button
+                onClick={() => setCurrentTab('movimientos')}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-emerald-800/80 text-white hover:bg-emerald-700 transition border border-emerald-600/40"
+              >
+                <ClipboardList className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Movimientos</span>
               </button>
             </div>
           </div>
@@ -2160,9 +3106,9 @@ export default function App() {
                       name: '',
                       description: '',
                       supervisorsStr: '',
-                      startDate: getSystemToday(),
-                      endDate: getSystemToday(),
-                      technology: technologies[0] || 'Big Herdsman'
+                      startDate: '',
+                      endDate: '',
+                      technology: ''
                     });
                     setModalNewGalpon(true);
                   }}
@@ -2229,7 +3175,7 @@ export default function App() {
 
             <button
               disabled={!currentGalpon}
-              onClick={() => setModalNewAdvance(true)}
+              onClick={() => openNewAdvanceModal()}
               className="px-3 py-1.5 rounded-lg bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold text-xs shadow-xs transition flex items-center gap-1.5"
             >
               <Plus className="w-3.5 h-3.5" />
@@ -2538,17 +3484,15 @@ export default function App() {
                               {act.progressPercent}%
                             </span>
                             <button
-                              onClick={() => {
-                                setFormAdvance({
-                                  ...formAdvance,
+                              onClick={() =>
+                                openNewAdvanceModal({
                                   areaName: act.areaName,
                                   locationType: act.locationType || 'Todos',
                                   sistemaName: act.sistemaName || '',
                                   structureName: act.structureName || '',
                                   activityCode: act.code
-                                });
-                                setModalNewAdvance(true);
-                              }}
+                                })
+                              }
                               className="px-2.5 py-1 rounded-lg bg-[#0f6b38] text-white font-bold text-[11px]"
                             >
                               + Avance
@@ -2689,13 +3633,13 @@ export default function App() {
                   Control de Avance Diario de Obra
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Registro guiado en cascada con horas hombre y consumo manual de
-                  materiales
+                  Registro guiado en cascada con horas hombre, consumo manual de
+                  materiales, edición y eliminación con recálculo automático de stock
                 </p>
               </div>
               <button
                 disabled={!currentGalpon}
-                onClick={() => setModalNewAdvance(true)}
+                onClick={() => openNewAdvanceModal()}
                 className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold text-xs flex items-center gap-1.5"
               >
                 <Plus className="w-4 h-4" />
@@ -2743,7 +3687,8 @@ export default function App() {
                           </div>
                           <p className="text-xs text-slate-500 mt-1">
                             Fecha: <strong>{adv.date}</strong> • Supervisor:{' '}
-                            <strong>{adv.supervisor}</strong>
+                            <strong>{adv.supervisor || 'Sin especificar'}</strong>
+                            {adv.note ? ` • Nota: ${adv.note}` : ''}
                           </p>
                           {adv.materialsUsedToday?.length > 0 && (
                             <div className="mt-1.5 flex flex-wrap gap-1.5">
@@ -2759,13 +3704,34 @@ export default function App() {
                           )}
                         </div>
 
-                        <div className="text-right shrink-0">
-                          <span className="text-xs text-slate-500 block">
-                            Acumulado: {act?.accumulatedQty || 0} / {act?.targetUnits || 0}
-                          </span>
-                          <span className="text-sm font-black text-[#0f6b38] font-mono">
-                            {act?.progressPercent || 0}%
-                          </span>
+                        <div className="flex items-center justify-between sm:justify-end gap-4 shrink-0">
+                          <div className="text-right">
+                            <span className="text-xs text-slate-500 block">
+                              Acumulado: {act?.accumulatedQty || 0} /{' '}
+                              {act?.targetUnits || 0}
+                            </span>
+                            <span className="text-sm font-black text-[#0f6b38] font-mono">
+                              {act?.progressPercent || 0}%
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1 border-l border-slate-200 pl-3">
+                            <button
+                              type="button"
+                              onClick={() => openEditAdvanceModal(adv)}
+                              className="p-2 rounded-lg text-slate-600 hover:bg-slate-100 transition"
+                              title="Modificar Avance Diario"
+                            >
+                              <Edit2 className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteAdvance(adv.id)}
+                              className="p-2 rounded-lg text-rose-600 hover:bg-rose-50 transition"
+                              title="Eliminar Avance Diario (Revierte consumo de materiales)"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
                         </div>
                       </div>
                     );
@@ -3012,14 +3978,14 @@ export default function App() {
                   onClick={() => {
                     setFormGalpon({
                       id: '',
-                      sectorId: currentSector?.id || sectors[0]?.id || '',
+                      sectorId: '',
                       code: '',
                       name: '',
                       description: '',
                       supervisorsStr: '',
-                      startDate: getSystemToday(),
-                      endDate: getSystemToday(),
-                      technology: technologies[0] || 'Big Herdsman'
+                      startDate: '',
+                      endDate: '',
+                      technology: ''
                     });
                     setModalNewGalpon(true);
                   }}
@@ -3095,9 +4061,9 @@ export default function App() {
                               name: '',
                               description: '',
                               supervisorsStr: '',
-                              startDate: getSystemToday(),
-                              endDate: getSystemToday(),
-                              technology: technologies[0] || 'Big Herdsman'
+                              startDate: '',
+                              endDate: '',
+                              technology: ''
                             });
                             setModalNewGalpon(true);
                           }}
@@ -3365,8 +4331,30 @@ export default function App() {
                 </p>
               </div>
               <button
-                disabled={!currentGalpon}
-                onClick={() => setModalNewActivity(true)}
+                disabled={allGalponesList.length === 0}
+                onClick={() => {
+                  setFormActivity({
+                    useCatalog: true,
+                    targetGalponId: currentGalpon?.id || '',
+                    catalogItemId: '',
+                    code: '',
+                    name: '',
+                    areaName: '',
+                    locationType: '',
+                    sistemaName: '',
+                    customSistemaName: '',
+                    structureName: '',
+                    customStructureName: '',
+                    targetUnits: '',
+                    unit: '',
+                    weight: '',
+                    plannedHH: '',
+                    startDate: '',
+                    dueDate: '',
+                    sharedWithGalponId: ''
+                  });
+                  setModalNewActivity(true);
+                }}
                 className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white text-xs font-bold flex items-center gap-1.5"
               >
                 <Plus className="w-4 h-4" />
@@ -3513,18 +4501,18 @@ export default function App() {
         )}
 
         {/* ================================================================== */}
-        {/* VISTA 8: CONTROL DE MATERIALES (VINCULADO A ESTRUCTURAS)           */}
+        {/* VISTA 8: CONTROL DE MATERIALES (VINCULADO A GALPÓN Y ESTRUCTURA)   */}
         {/* ================================================================== */}
         {currentTab === 'materiales' && (
           <div className="space-y-4">
             <div className="bg-white p-4 rounded-2xl border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
                 <h2 className="text-base font-extrabold text-slate-900">
-                  Catálogo y Control de Materiales por Estructura
+                  Catálogo y Control de Materiales por Galpón y Estructura
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Asigna tantos materiales como necesites a cada estructura creada en el
-                  Catálogo Maestro
+                  Cada material queda vinculado a su Galpón, Proveedor, Área, Sistema y
+                  Estructura correspondientes
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -3548,18 +4536,36 @@ export default function App() {
             <div className="bg-white p-3 rounded-2xl border border-slate-200 flex flex-wrap items-center gap-3 text-xs">
               <input
                 type="text"
-                placeholder="Buscar material o estructura..."
+                placeholder="Buscar por código, material, sistema o estructura..."
                 value={searchMaterialText}
                 onChange={(e) => setSearchMaterialText(e.target.value)}
                 className="flex-1 min-w-[200px] px-3 py-1.5 border border-slate-300 rounded-xl bg-slate-50"
               />
+              <select
+                value={filterMaterialGalpon}
+                onChange={(e) => setFilterMaterialGalpon(e.target.value)}
+                className="px-3 py-1.5 border border-slate-300 rounded-xl font-bold bg-slate-50"
+              >
+                <option value="Todos">Todos los Galpones</option>
+                <option value="__UNASSIGNED__">Sin galpón asignado</option>
+                {allGalponesList.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.sectorName} • {g.code} - {g.name}
+                  </option>
+                ))}
+              </select>
               <select
                 value={filterMaterialTech}
                 onChange={(e) => setFilterMaterialTech(e.target.value)}
                 className="px-3 py-1.5 border border-slate-300 rounded-xl font-bold bg-slate-50"
               >
                 <option value="Todas">Todos los Proveedores</option>
-                {technologies.map((t) => (
+                {Array.from(
+                  new Set([
+                    ...technologies,
+                    ...materials.map((m) => m.technology).filter(Boolean)
+                  ])
+                ).map((t) => (
                   <option key={t} value={t}>
                     {t}
                   </option>
@@ -3577,6 +4583,23 @@ export default function App() {
                   </option>
                 ))}
               </select>
+              {(filterMaterialGalpon !== 'Todos' ||
+                filterMaterialTech !== 'Todas' ||
+                filterMaterialArea !== 'Todas' ||
+                searchMaterialText.trim() !== '') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFilterMaterialGalpon('Todos');
+                    setFilterMaterialTech('Todas');
+                    setFilterMaterialArea('Todas');
+                    setSearchMaterialText('');
+                  }}
+                  className="px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold"
+                >
+                  Mostrar Todos ({materials.length})
+                </button>
+              )}
             </div>
 
             <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
@@ -3584,10 +4607,12 @@ export default function App() {
                 <table className="w-full text-left text-xs">
                   <thead className="bg-[#0f6b38] text-white font-bold uppercase text-[11px]">
                     <tr>
+                      <th className="py-3 px-3">Galpón</th>
                       <th className="py-3 px-3">Proveedor</th>
                       <th className="py-3 px-3">Código</th>
                       <th className="py-3 px-3">Material</th>
                       <th className="py-3 px-3">Área</th>
+                      <th className="py-3 px-3">Sistema</th>
                       <th className="py-3 px-3">Estructura Vinculada</th>
                       <th className="py-3 px-2 text-right">Total Presup.</th>
                       <th className="py-3 px-2 text-right">Consumido</th>
@@ -3597,6 +4622,13 @@ export default function App() {
                   </thead>
                   <tbody className="divide-y divide-slate-200 font-medium">
                     {materials.filter((m) => {
+                      if (filterMaterialGalpon !== 'Todos') {
+                        if (filterMaterialGalpon === '__UNASSIGNED__') {
+                          if (m.galponId) return false;
+                        } else if (m.galponId !== filterMaterialGalpon) {
+                          return false;
+                        }
+                      }
                       if (
                         filterMaterialTech !== 'Todas' &&
                         m.technology !== filterMaterialTech
@@ -3607,27 +4639,41 @@ export default function App() {
                         m.areaName !== filterMaterialArea
                       )
                         return false;
-                      if (
-                        searchMaterialText &&
-                        !m.name
-                          .toLowerCase()
-                          .includes(searchMaterialText.toLowerCase()) &&
-                        !(m.structureName || '')
-                          .toLowerCase()
-                          .includes(searchMaterialText.toLowerCase())
-                      )
-                        return false;
+                      if (searchMaterialText.trim()) {
+                        const q = searchMaterialText.toLowerCase().trim();
+                        const galObj = allGalponesList.find((g) => g.id === m.galponId);
+                        const galLabel = galObj
+                          ? `${galObj.code} ${galObj.name} ${galObj.sectorName}`.toLowerCase()
+                          : 'sin galpón asignado';
+                        const matches =
+                          (m.code || '').toLowerCase().includes(q) ||
+                          (m.name || '').toLowerCase().includes(q) ||
+                          (m.structureName || '').toLowerCase().includes(q) ||
+                          (m.sistemaName || '').toLowerCase().includes(q) ||
+                          (m.areaName || '').toLowerCase().includes(q) ||
+                          (m.technology || '').toLowerCase().includes(q) ||
+                          galLabel.includes(q);
+                        if (!matches) return false;
+                      }
                       return true;
                     }).length === 0 ? (
                       <tr>
-                        <td colSpan={9} className="py-8 text-center text-slate-400">
-                          No hay materiales registrados. Usa el botón "+ Asignar / Agregar
-                          Material" para vincular materiales a tus estructuras.
+                        <td colSpan={11} className="py-8 text-center text-slate-400">
+                          No hay materiales registrados para este filtro. Usa el botón "+
+                          Asignar / Agregar Material" para vincular materiales a tus
+                          galpones y estructuras.
                         </td>
                       </tr>
                     ) : (
                       materials
                         .filter((m) => {
+                          if (filterMaterialGalpon !== 'Todos') {
+                            if (filterMaterialGalpon === '__UNASSIGNED__') {
+                              if (m.galponId) return false;
+                            } else if (m.galponId !== filterMaterialGalpon) {
+                              return false;
+                            }
+                          }
                           if (
                             filterMaterialTech !== 'Todas' &&
                             m.technology !== filterMaterialTech
@@ -3638,25 +4684,52 @@ export default function App() {
                             m.areaName !== filterMaterialArea
                           )
                             return false;
-                          if (
-                            searchMaterialText &&
-                            !m.name
-                              .toLowerCase()
-                              .includes(searchMaterialText.toLowerCase()) &&
-                            !(m.structureName || '')
-                              .toLowerCase()
-                              .includes(searchMaterialText.toLowerCase())
-                          )
-                            return false;
+                          if (searchMaterialText.trim()) {
+                            const q = searchMaterialText.toLowerCase().trim();
+                            const galObj = allGalponesList.find(
+                              (g) => g.id === m.galponId
+                            );
+                            const galLabel = galObj
+                              ? `${galObj.code} ${galObj.name} ${galObj.sectorName}`.toLowerCase()
+                              : 'sin galpón asignado';
+                            const matches =
+                              (m.code || '').toLowerCase().includes(q) ||
+                              (m.name || '').toLowerCase().includes(q) ||
+                              (m.structureName || '').toLowerCase().includes(q) ||
+                              (m.sistemaName || '').toLowerCase().includes(q) ||
+                              (m.areaName || '').toLowerCase().includes(q) ||
+                              (m.technology || '').toLowerCase().includes(q) ||
+                              galLabel.includes(q);
+                            if (!matches) return false;
+                          }
                           return true;
                         })
                         .map((mat) => {
                           const balance =
                             Number(mat.totalQty || 0) - Number(mat.usedQty || 0);
+                          const assignedGalpon = mat.galponId
+                            ? allGalponesList.find((g) => g.id === mat.galponId)
+                            : null;
                           return (
                             <tr key={mat.id} className="hover:bg-slate-50">
+                              <td className="py-2.5 px-3">
+                                {assignedGalpon ? (
+                                  <div>
+                                    <span className="font-bold text-slate-900 block">
+                                      {assignedGalpon.code} - {assignedGalpon.name}
+                                    </span>
+                                    <span className="text-[10px] text-slate-500">
+                                      {assignedGalpon.sectorName}
+                                    </span>
+                                  </div>
+                                ) : (
+                                  <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 text-[10px] font-bold">
+                                    Sin galpón asignado
+                                  </span>
+                                )}
+                              </td>
                               <td className="py-2.5 px-3 font-bold text-[#0f6b38]">
-                                {mat.technology}
+                                {mat.technology || '-'}
                               </td>
                               <td className="py-2.5 px-3 font-mono font-bold">
                                 {mat.code}
@@ -3664,9 +4737,14 @@ export default function App() {
                               <td className="py-2.5 px-3 font-bold text-slate-900">
                                 {mat.name}
                               </td>
-                              <td className="py-2.5 px-3">{mat.areaName}</td>
+                              <td className="py-2.5 px-3">{mat.areaName || '-'}</td>
+                              <td className="py-2.5 px-3">
+                                {mat.sistemaName
+                                  ? `${mat.locationType ? `${mat.locationType} • ` : ''}${mat.sistemaName}`
+                                  : '-'}
+                              </td>
                               <td className="py-2.5 px-3 font-bold text-slate-700">
-                                {mat.structureName}
+                                {mat.structureName || '-'}
                               </td>
                               <td className="py-2.5 px-2 text-right font-mono font-bold">
                                 {mat.totalQty} {mat.unit}
@@ -3736,10 +4814,10 @@ export default function App() {
                       workerCode: '',
                       dni: '',
                       name: '',
-                      workArea: 'Jaulas',
+                      workArea: '',
                       role: '',
-                      sectorId: currentSector?.id || '',
-                      galponId: currentGalpon?.id || ''
+                      sectorId: '',
+                      galponId: ''
                     });
                     setModalNewWorker(true);
                   }}
@@ -3912,6 +4990,208 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {/* ================================================================== */}
+        {/* VISTA 11: HISTORIAL DE MOVIMIENTOS DE USUARIOS (BITÁCORA)          */}
+        {/* ================================================================== */}
+        {currentTab === 'movimientos' && (
+          <div className="space-y-4">
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+              <div>
+                <h2 className="text-base font-extrabold text-slate-900">
+                  Historial de Movimientos de Usuarios (Bitácora de Auditoría)
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Registro automático de todos los registros (altas), modificaciones y
+                  eliminaciones realizados en el sistema
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 text-xs">
+                <div className="flex items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-300">
+                  <span className="font-bold text-slate-600">Usuario Activo:</span>
+                  <input
+                    type="text"
+                    value={activeUserName}
+                    onChange={(e) => setActiveUserName(e.target.value)}
+                    placeholder="Nombre del usuario..."
+                    className="bg-white px-2.5 py-1 rounded-lg border border-slate-300 font-bold text-[#0f6b38] w-40"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Resumen de Contadores de Movimientos */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="bg-white p-4 rounded-2xl border border-slate-200">
+                <span className="text-[11px] font-bold uppercase text-slate-400 block">
+                  Total Movimientos
+                </span>
+                <span className="text-2xl font-black text-slate-900 font-mono">
+                  {auditLogs.length}
+                </span>
+              </div>
+              <div className="bg-white p-4 rounded-2xl border border-emerald-200 bg-emerald-50/40">
+                <span className="text-[11px] font-bold uppercase text-[#0f6b38] block">
+                  Registros (Altas)
+                </span>
+                <span className="text-2xl font-black text-[#0f6b38] font-mono">
+                  {auditLogs.filter((l) => l.action === 'REGISTRO').length}
+                </span>
+              </div>
+              <div className="bg-white p-4 rounded-2xl border border-amber-200 bg-amber-50/40">
+                <span className="text-[11px] font-bold uppercase text-amber-700 block">
+                  Modificaciones
+                </span>
+                <span className="text-2xl font-black text-amber-700 font-mono">
+                  {auditLogs.filter((l) => l.action === 'MODIFICACIÓN').length}
+                </span>
+              </div>
+              <div className="bg-white p-4 rounded-2xl border border-rose-200 bg-rose-50/40">
+                <span className="text-[11px] font-bold uppercase text-rose-700 block">
+                  Eliminaciones
+                </span>
+                <span className="text-2xl font-black text-rose-700 font-mono">
+                  {auditLogs.filter((l) => l.action === 'ELIMINACIÓN').length}
+                </span>
+              </div>
+            </div>
+
+            {/* Filtros de Movimientos */}
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 flex flex-wrap items-center gap-3 text-xs">
+              <select
+                value={filterLogAction}
+                onChange={(e) => setFilterLogAction(e.target.value)}
+                className="px-3 py-2 border border-slate-300 rounded-xl font-bold bg-slate-50"
+              >
+                <option value="Todas">Todas las Acciones</option>
+                <option value="REGISTRO">Solo REGISTROS</option>
+                <option value="MODIFICACIÓN">Solo MODIFICACIONES</option>
+                <option value="ELIMINACIÓN">Solo ELIMINACIONES</option>
+              </select>
+
+              <select
+                value={filterLogModule}
+                onChange={(e) => setFilterLogModule(e.target.value)}
+                className="px-3 py-2 border border-slate-300 rounded-xl font-bold bg-slate-50"
+              >
+                <option value="Todos">Todos los Módulos</option>
+                <option value="Sectores y Galpones">Sectores y Galpones</option>
+                <option value="Catálogo Maestro">Catálogo Maestro</option>
+                <option value="Actividades">Actividades</option>
+                <option value="Materiales">Materiales</option>
+                <option value="Avance Diario">Avance Diario</option>
+                <option value="Personal y Asistencia">Personal y Asistencia</option>
+                <option value="Carga Masiva">Carga Masiva</option>
+              </select>
+
+              <div className="relative flex-1 min-w-[200px]">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  placeholder="Buscar por detalle, código, galpón o usuario..."
+                  value={searchLogText}
+                  onChange={(e) => setSearchLogText(e.target.value)}
+                  className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-xl bg-slate-50"
+                />
+              </div>
+            </div>
+
+            {/* Tabla de Bitácora */}
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-[#0f6b38] text-white font-bold uppercase text-[11px]">
+                    <tr>
+                      <th className="py-3 px-3">Fecha y Hora</th>
+                      <th className="py-3 px-3">Usuario</th>
+                      <th className="py-3 px-3">Tipo de Movimiento</th>
+                      <th className="py-3 px-3">Módulo</th>
+                      <th className="py-3 px-3">Detalle del Movimiento</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200 font-medium">
+                    {auditLogs.filter((log) => {
+                      if (filterLogAction !== 'Todas' && log.action !== filterLogAction)
+                        return false;
+                      if (filterLogModule !== 'Todos' && log.module !== filterLogModule)
+                        return false;
+                      if (searchLogText.trim()) {
+                        const q = searchLogText.toLowerCase().trim();
+                        const match =
+                          log.description.toLowerCase().includes(q) ||
+                          log.user.toLowerCase().includes(q) ||
+                          log.module.toLowerCase().includes(q) ||
+                          log.action.toLowerCase().includes(q);
+                        if (!match) return false;
+                      }
+                      return true;
+                    }).length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="py-8 text-center text-slate-400">
+                          No hay movimientos registrados que coincidan con el filtro.
+                        </td>
+                      </tr>
+                    ) : (
+                      auditLogs
+                        .filter((log) => {
+                          if (
+                            filterLogAction !== 'Todas' &&
+                            log.action !== filterLogAction
+                          )
+                            return false;
+                          if (
+                            filterLogModule !== 'Todos' &&
+                            log.module !== filterLogModule
+                          )
+                            return false;
+                          if (searchLogText.trim()) {
+                            const q = searchLogText.toLowerCase().trim();
+                            const match =
+                              log.description.toLowerCase().includes(q) ||
+                              log.user.toLowerCase().includes(q) ||
+                              log.module.toLowerCase().includes(q) ||
+                              log.action.toLowerCase().includes(q);
+                            if (!match) return false;
+                          }
+                          return true;
+                        })
+                        .map((log) => (
+                          <tr key={log.id} className="hover:bg-slate-50">
+                            <td className="py-2.5 px-3 font-mono text-[11px] text-slate-600 whitespace-nowrap">
+                              {log.timestamp}
+                            </td>
+                            <td className="py-2.5 px-3 font-bold text-slate-800 whitespace-nowrap">
+                              {log.user}
+                            </td>
+                            <td className="py-2.5 px-3 whitespace-nowrap">
+                              <span
+                                className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                                  log.action === 'REGISTRO'
+                                    ? 'bg-emerald-100 text-[#0f6b38] border border-emerald-300'
+                                    : log.action === 'MODIFICACIÓN'
+                                      ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                                      : 'bg-rose-100 text-rose-700 border border-rose-300'
+                                }`}
+                              >
+                                {log.action}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3 font-bold text-slate-700 whitespace-nowrap">
+                              {log.module}
+                            </td>
+                            <td className="py-2.5 px-3 text-slate-800">
+                              {log.description}
+                            </td>
+                          </tr>
+                        ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
 
       {/* ==================================================================== */}
@@ -4074,6 +5354,7 @@ export default function App() {
                     Plantilla / Proveedor: *
                   </label>
                   <select
+                    required
                     value={formCatalogItem.technology}
                     onChange={(e) =>
                       setFormCatalogItem({
@@ -4083,6 +5364,7 @@ export default function App() {
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold text-[#0f6b38]"
                   >
+                    <option value="">-- Seleccionar Proveedor --</option>
                     {technologies.map((t) => (
                       <option key={t} value={t}>
                         {t}
@@ -4109,12 +5391,19 @@ export default function App() {
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">Área: *</label>
                   <select
+                    required
                     value={formCatalogItem.areaName}
                     onChange={(e) =>
-                      setFormCatalogItem({ ...formCatalogItem, areaName: e.target.value })
+                      setFormCatalogItem({
+                        ...formCatalogItem,
+                        areaName: e.target.value,
+                        sistemaName: '',
+                        structureName: ''
+                      })
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                   >
+                    <option value="">-- Seleccionar Área --</option>
                     {ALL_AREAS.map((a) => (
                       <option key={a} value={a}>
                         {a}
@@ -4128,6 +5417,7 @@ export default function App() {
                       Ubicación: *
                     </label>
                     <select
+                      required
                       value={formCatalogItem.locationType}
                       onChange={(e) =>
                         setFormCatalogItem({
@@ -4137,6 +5427,7 @@ export default function App() {
                       }
                       className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                     >
+                      <option value="">-- Seleccionar Ubicación --</option>
                       <option value="Interno">Interno</option>
                       <option value="Externo">Externo</option>
                     </select>
@@ -4194,6 +5485,7 @@ export default function App() {
                   Estructura: *
                 </label>
                 <select
+                  required
                   value={formCatalogItem.structureName}
                   onChange={(e) =>
                     setFormCatalogItem({
@@ -4318,33 +5610,76 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: ASIGNAR / EDITAR MATERIAL POR ESTRUCTURA */}
+      {/* MODAL: ASIGNAR / EDITAR MATERIAL POR GALPÓN, ÁREA, SISTEMA Y ESTRUCTURA */}
       {modalNewMaterial && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-md border border-slate-200 shadow-2xl">
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl my-8">
             <h3 className="text-base font-black text-slate-900 mb-1">
               {editingMaterialId
                 ? 'Editar Material'
-                : 'Asignar Material a una Estructura'}
+                : 'Asignar Material a Galpón y Estructura'}
             </h3>
             <p className="text-xs text-slate-500 mb-3">
-              Puedes asignar múltiples materiales a una misma estructura del Catálogo
-              Maestro
+              Selecciona el Galpón, Proveedor, Área, Sistema y Estructura a los que
+              pertenece este material
             </p>
             <form onSubmit={handleSaveMaterial} className="space-y-3 text-xs">
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">
+                  Galpón Destino: {allGalponesList.length > 0 && !editingMaterialId ? '*' : ''}
+                </label>
+                <select
+                  required={allGalponesList.length > 0 && !editingMaterialId}
+                  value={formMaterial.galponId}
+                  onChange={(e) => {
+                    const gId = e.target.value;
+                    const galObj = allGalponesList.find((g) => g.id === gId);
+                    setFormMaterial({
+                      ...formMaterial,
+                      galponId: gId,
+                      sectorId: galObj ? galObj.sectorId : '',
+                      areaId: '',
+                      sistemaId: '',
+                      structureId: ''
+                    });
+                  }}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
+                >
+                  <option value="">
+                    {editingMaterialId && !formMaterial.galponId
+                      ? '-- Sin galpón asignado (Seleccionar para asignar) --'
+                      : '-- Seleccionar Galpón --'}
+                  </option>
+                  {allGalponesList.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.sectorName} • {g.code} - {g.name} ({g.technology || 'Sin proveedor'})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">
-                    Proveedor / Plantilla:
+                    Proveedor / Plantilla: *
                   </label>
                   <select
+                    required
                     value={formMaterial.technology}
                     onChange={(e) =>
                       setFormMaterial({ ...formMaterial, technology: e.target.value })
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold text-[#0f6b38]"
                   >
-                    {technologies.map((t) => (
+                    <option value="">-- Seleccionar Proveedor --</option>
+                    {Array.from(
+                      new Set(
+                        [
+                          ...technologies,
+                          formMaterial.technology
+                        ].filter(Boolean)
+                      )
+                    ).map((t) => (
                       <option key={t} value={t}>
                         {t}
                       </option>
@@ -4352,14 +5687,34 @@ export default function App() {
                   </select>
                 </div>
                 <div>
-                  <label className="block font-bold text-slate-700 mb-1">Área:</label>
+                  <label className="block font-bold text-slate-700 mb-1">Área: *</label>
                   <select
+                    required
                     value={formMaterial.areaName}
-                    onChange={(e) =>
-                      setFormMaterial({ ...formMaterial, areaName: e.target.value })
-                    }
+                    onChange={(e) => {
+                      const nextArea = e.target.value;
+                      const galObj = allGalponesList.find(
+                        (g) => g.id === formMaterial.galponId
+                      );
+                      const matchedArea = galObj?.areas?.find(
+                        (a: any) => a.name === nextArea
+                      );
+                      setFormMaterial({
+                        ...formMaterial,
+                        areaId: matchedArea?.id || '',
+                        areaName: nextArea,
+                        locationType: '',
+                        sistemaId: '',
+                        sistemaName: '',
+                        customSistemaName: '',
+                        structureId: '',
+                        structureName: '',
+                        customStructureName: ''
+                      });
+                    }}
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                   >
+                    <option value="">-- Seleccionar Área --</option>
                     {ALL_AREAS.map((a) => (
                       <option key={a} value={a}>
                         {a}
@@ -4369,21 +5724,109 @@ export default function App() {
                 </div>
               </div>
 
+              {AREAS_WITH_SISTEMAS.includes(formMaterial.areaName) && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block font-bold text-slate-700 mb-1">
+                      Ubicación: *
+                    </label>
+                    <select
+                      required
+                      value={formMaterial.locationType}
+                      onChange={(e) =>
+                        setFormMaterial({
+                          ...formMaterial,
+                          locationType: e.target.value
+                        })
+                      }
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
+                    >
+                      <option value="">-- Seleccionar Ubicación --</option>
+                      <option value="Interno">Interno</option>
+                      <option value="Externo">Externo</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block font-bold text-slate-700 mb-1">
+                      Sistema: *
+                    </label>
+                    <select
+                      required
+                      value={formMaterial.sistemaName}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        const foundSis = availableMaterialSystems.find(
+                          (s) => s.name === val
+                        );
+                        setFormMaterial({
+                          ...formMaterial,
+                          sistemaId: foundSis?.id || '',
+                          sistemaName: val,
+                          structureId: '',
+                          structureName: ''
+                        });
+                      }}
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
+                    >
+                      <option value="">-- Seleccionar Sistema --</option>
+                      {availableMaterialSystems.map((sis) => (
+                        <option key={`${sis.locationType}__${sis.name}`} value={sis.name}>
+                          {sis.name} ({sis.locationType})
+                        </option>
+                      ))}
+                      <option value="__NEW__">+ Escribir nuevo sistema...</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+
+              {AREAS_WITH_SISTEMAS.includes(formMaterial.areaName) &&
+                formMaterial.sistemaName === '__NEW__' && (
+                  <div>
+                    <label className="block font-bold text-slate-700 mb-1">
+                      Nombre del Nuevo Sistema: *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="Nombre del sistema..."
+                      value={formMaterial.customSistemaName}
+                      onChange={(e) =>
+                        setFormMaterial({
+                          ...formMaterial,
+                          customSistemaName: e.target.value
+                        })
+                      }
+                      className="w-full px-3 py-2 rounded-xl border border-emerald-400 bg-emerald-50/40 font-bold"
+                    />
+                  </div>
+                )}
+
               <div>
                 <label className="block font-bold text-slate-700 mb-1">
-                  Estructura Vinculada (del Catálogo Maestro): *
+                  Estructura Vinculada: *
                 </label>
                 <select
+                  required
                   value={formMaterial.structureName}
-                  onChange={(e) =>
-                    setFormMaterial({ ...formMaterial, structureName: e.target.value })
-                  }
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    const foundStr = availableMaterialStructures.find(
+                      (st) => st.name === val
+                    );
+                    setFormMaterial({
+                      ...formMaterial,
+                      structureId: foundStr?.id || '',
+                      structureName: val
+                    });
+                  }}
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold mb-1.5"
                 >
                   <option value="">-- Seleccionar Estructura existente --</option>
-                  {allKnownStructures.map((st) => (
-                    <option key={st} value={st}>
-                      {st}
+                  {availableMaterialStructures.map((st) => (
+                    <option key={st.name} value={st.name}>
+                      {st.name}
                     </option>
                   ))}
                   <option value="__NEW__">+ Escribir nueva estructura...</option>
@@ -4391,6 +5834,7 @@ export default function App() {
                 {formMaterial.structureName === '__NEW__' && (
                   <input
                     type="text"
+                    required
                     placeholder="Nombre de la estructura..."
                     value={formMaterial.customStructureName}
                     onChange={(e) =>
@@ -4423,12 +5867,14 @@ export default function App() {
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">Unidad: *</label>
                   <select
+                    required
                     value={formMaterial.unit}
                     onChange={(e) =>
                       setFormMaterial({ ...formMaterial, unit: e.target.value })
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                   >
+                    <option value="">-- Seleccionar Unidad --</option>
                     <option value="Und">Und</option>
                     <option value="Bolsas">Bolsas</option>
                     <option value="Metros">Metros</option>
@@ -4666,6 +6112,7 @@ export default function App() {
                   }
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                 >
+                  <option value="">-- Seleccionar Sector --</option>
                   {sectors.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name}
@@ -4706,12 +6153,14 @@ export default function App() {
                   Plantilla de Proveedor / Tecnología: *
                 </label>
                 <select
+                  required
                   value={formGalpon.technology}
                   onChange={(e) =>
                     setFormGalpon({ ...formGalpon, technology: e.target.value })
                   }
                   className="w-full px-3 py-2 rounded-xl border border-emerald-400 bg-emerald-50 font-bold text-[#0f6b38]"
                 >
+                  <option value="">-- Seleccionar Proveedor --</option>
                   {technologies.map((t) => (
                     <option key={t} value={t}>
                       {t}
@@ -4823,12 +6272,14 @@ export default function App() {
                   Plantilla de Proveedor / Tecnología: *
                 </label>
                 <select
+                  required
                   value={formGalpon.technology}
                   onChange={(e) =>
                     setFormGalpon({ ...formGalpon, technology: e.target.value })
                   }
                   className="w-full px-3 py-2 rounded-xl border border-emerald-400 bg-emerald-50 font-bold text-[#0f6b38]"
                 >
+                  <option value="">-- Seleccionar Proveedor --</option>
                   {technologies.map((t) => (
                     <option key={t} value={t}>
                       {t}
@@ -4900,18 +6351,73 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: AGREGAR ACTIVIDAD AL GALPÓN */}
+      {/* MODAL: AGREGAR ACTIVIDAD AL GALPÓN (CUALQUIER SECTOR Y GALPÓN) */}
       {modalNewActivity && (
         <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
           <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl my-8">
             <h3 className="text-base font-black text-slate-900 mb-1">
-              Agregar Actividad a {currentGalpon?.code}
+              Agregar Actividad a Galpón
             </h3>
+            <p className="text-xs text-slate-500">
+              Selecciona cualquier actividad del Catálogo Maestro y asígnala al galpón y
+              sector que desees
+            </p>
             <form onSubmit={handleSaveNewActivity} className="space-y-3 text-xs mt-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Galpón Destino (Sector • Galpón): *
+                  </label>
+                  <select
+                    required
+                    value={formActivity.targetGalponId}
+                    onChange={(e) =>
+                      setFormActivity({
+                        ...formActivity,
+                        targetGalponId: e.target.value
+                      })
+                    }
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold text-[#0f6b38]"
+                  >
+                    <option value="">-- Seleccionar Galpón --</option>
+                    {allGalponesList.map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.sectorName} • {g.code} - {g.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Agregar también a otro Galpón (Opcional):
+                  </label>
+                  <select
+                    value={formActivity.sharedWithGalponId}
+                    onChange={(e) =>
+                      setFormActivity({
+                        ...formActivity,
+                        sharedWithGalponId: e.target.value
+                      })
+                    }
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
+                  >
+                    <option value="">-- Ninguno (Solo al galpón destino) --</option>
+                    {allGalponesList
+                      .filter((g) => g.id !== formActivity.targetGalponId)
+                      .map((g) => (
+                        <option key={g.id} value={g.id}>
+                          {g.sectorName} • {g.code} - {g.name}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              </div>
+
               {masterCatalog.length > 0 && (
                 <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200">
                   <label className="block font-bold text-[#0f6b38] mb-1">
-                    Cargar desde Catálogo Maestro ({currentGalpon?.technology}):
+                    Cargar desde Catálogo Maestro (Todas las Actividades Maestras):
                   </label>
                   <select
                     value={formActivity.catalogItemId}
@@ -4928,10 +6434,10 @@ export default function App() {
                           locationType: found.locationType || 'Interno',
                           sistemaName: found.sistemaName || '',
                           structureName: found.structureName || '',
-                          targetUnits: String(found.targetUnits),
-                          unit: found.unit,
-                          weight: String(found.weight),
-                          plannedHH: String(found.plannedHH || 40)
+                          targetUnits: String(found.targetUnits ?? ''),
+                          unit: found.unit || '',
+                          weight: String(found.weight ?? ''),
+                          plannedHH: String(found.plannedHH ?? '')
                         });
                       } else {
                         setFormActivity({ ...formActivity, catalogItemId: '' });
@@ -4942,17 +6448,12 @@ export default function App() {
                     <option value="">
                       -- Seleccionar del catálogo o llenar manualmente --
                     </option>
-                    {masterCatalog
-                      .filter(
-                        (c) =>
-                          !currentGalpon?.technology ||
-                          c.technology === currentGalpon.technology
-                      )
-                      .map((c) => (
-                        <option key={c.id} value={c.id}>
-                          [{c.code}] {c.areaName} • {c.structureName} → {c.name}
-                        </option>
-                      ))}
+                    {masterCatalog.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        [{c.code}] {c.name} ({c.technology ? `${c.technology} • ` : ''}
+                        {c.areaName} • {c.structureName})
+                      </option>
+                    ))}
                   </select>
                 </div>
               )}
@@ -4973,12 +6474,14 @@ export default function App() {
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">Área: *</label>
                   <select
+                    required
                     value={formActivity.areaName}
                     onChange={(e) =>
                       setFormActivity({ ...formActivity, areaName: e.target.value })
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                   >
+                    <option value="">-- Seleccionar Área --</option>
                     {ALL_AREAS.map((a) => (
                       <option key={a} value={a}>
                         {a}
@@ -5004,6 +6507,7 @@ export default function App() {
                       }
                       className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                     >
+                      <option value="">-- Seleccionar Ubicación --</option>
                       <option value="Interno">Interno</option>
                       <option value="Externo">Externo</option>
                     </select>
@@ -5223,12 +6727,14 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: REGISTRAR AVANCE DIARIO EN CASCADA + CONSUMO MANUAL DE MATERIALES */}
+      {/* MODAL: REGISTRAR / MODIFICAR AVANCE DIARIO EN CASCADA + CONSUMO MANUAL DE MATERIALES POR ID */}
       {modalNewAdvance && (
         <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
           <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl my-8">
             <h3 className="text-base font-black text-slate-900 mb-1">
-              Registrar Avance Diario ({currentGalpon?.code})
+              {editingAdvanceId
+                ? `Modificar Avance Diario (${currentGalpon?.code})`
+                : `Registrar Avance Diario (${currentGalpon?.code})`}
             </h3>
             <form onSubmit={handleSaveAdvance} className="space-y-3 text-xs mt-3">
               <div className="grid grid-cols-2 gap-3">
@@ -5359,7 +6865,38 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Consumo Manual Guiado de Materiales Vinculados a la Estructura */}
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Supervisor Responsable:
+                  </label>
+                  <input
+                    type="text"
+                    placeholder={currentGalpon?.supervisors?.[0] || activeUserName}
+                    value={formAdvance.supervisor}
+                    onChange={(e) =>
+                      setFormAdvance({ ...formAdvance, supervisor: e.target.value })
+                    }
+                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Nota / Observación:
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Observación opcional..."
+                    value={formAdvance.note}
+                    onChange={(e) =>
+                      setFormAdvance({ ...formAdvance, note: e.target.value })
+                    }
+                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50"
+                  />
+                </div>
+              </div>
+
+              {/* Consumo Manual Guiado de Materiales Vinculados por ID Único */}
               {selectedAdvanceActivityObj &&
                 selectedAdvanceActivityObj.linkedMaterials?.length > 0 && (
                   <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 space-y-2">
@@ -5383,7 +6920,7 @@ export default function App() {
                         >
                           <div>
                             <span className="font-bold text-slate-800 block">
-                              {mat.name} ({mat.unit})
+                              [{mat.code}] {mat.name} ({mat.unit})
                             </span>
                             <span className="text-[10px] text-slate-500">
                               Sugerido según avance hoy: ~{suggested} {mat.unit}
@@ -5393,13 +6930,13 @@ export default function App() {
                             type="number"
                             step="any"
                             placeholder={`Ej. ${suggested}`}
-                            value={formAdvance.manualMaterialInputs[mat.code] || ''}
+                            value={formAdvance.manualMaterialInputs[mat.id] || ''}
                             onChange={(e) =>
                               setFormAdvance({
                                 ...formAdvance,
                                 manualMaterialInputs: {
                                   ...formAdvance.manualMaterialInputs,
-                                  [mat.code]: e.target.value
+                                  [mat.id]: e.target.value
                                 }
                               })
                             }
@@ -5414,7 +6951,10 @@ export default function App() {
               <div className="pt-3 flex justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => setModalNewAdvance(false)}
+                  onClick={() => {
+                    setModalNewAdvance(false);
+                    setEditingAdvanceId(null);
+                  }}
                   className="px-4 py-2 font-bold text-slate-500"
                 >
                   Cancelar
@@ -5423,7 +6963,7 @@ export default function App() {
                   type="submit"
                   className="px-5 py-2 rounded-xl bg-[#0f6b38] text-white font-bold"
                 >
-                  Guardar Avance
+                  {editingAdvanceId ? 'Guardar Cambios' : 'Guardar Avance'}
                 </button>
               </div>
             </form>
@@ -5484,15 +7024,17 @@ export default function App() {
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">
-                    Especialidad / Área:
+                    Especialidad / Área: *
                   </label>
                   <select
+                    required
                     value={formWorker.workArea}
                     onChange={(e) =>
                       setFormWorker({ ...formWorker, workArea: e.target.value })
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                   >
+                    <option value="">-- Seleccionar Especialidad --</option>
                     {WORK_SPECIALTIES.map((sp) => (
                       <option key={sp} value={sp}>
                         {sp}
