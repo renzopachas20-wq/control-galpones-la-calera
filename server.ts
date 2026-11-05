@@ -1,5 +1,4 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -1260,9 +1259,25 @@ async function startServer() {
   });
 
   // --------------------------------------------------------------------------
+  // Healthcheck de Producción (Cloud Run / Verificación de Estado)
+  // --------------------------------------------------------------------------
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'control-galpones-la-calera',
+      projectId: PROJECT_ID,
+      firestoreDatabaseId: DATABASE_ID,
+      authDomain: firebaseConfig.authDomain,
+      environment: process.env.NODE_ENV || 'development',
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  // --------------------------------------------------------------------------
   // Vite Middleware (Desarrollo) o Archivos Estáticos (Producción)
   // --------------------------------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'
@@ -1271,12 +1286,12 @@ async function startServer() {
   } else {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
+    app.use((_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Server] Control Galpones La Calera ejecutándose en http://0.0.0.0:${PORT}`);
   });
