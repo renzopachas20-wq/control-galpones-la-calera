@@ -11,10 +11,6 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function isVerifiedUser() {
-      return isSignedIn() && request.auth.token.email_verified == true;
-    }
-
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
@@ -27,8 +23,9 @@ service cloud.firestore {
       return resource.data;
     }
 
-    function isRootAdminEmail() {
-      return isVerifiedUser() && request.auth.token.email == 'renzopachas20@gmail.com';
+    // Identificador inmutable del primer usuario Administrador en Firebase Authentication
+    function isBootstrapAdminUid() {
+      return isSignedIn() && request.auth.uid == 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2';
     }
 
     function hasCallerProfile() {
@@ -42,7 +39,7 @@ service cloud.firestore {
     function isActiveAdmin() {
       return isSignedIn() && (
         (hasCallerProfile() && callerProfile().active == true && callerProfile().role == 'Administrador') ||
-        (!hasCallerProfile() && isRootAdminEmail())
+        (!hasCallerProfile() && isBootstrapAdminUid())
       );
     }
 
@@ -117,16 +114,16 @@ service cloud.firestore {
       // Query Enforcer: Only an active Admin can list user profiles
       allow list: if isActiveAdmin() && existing().uid is string && existing().uid.size() <= 128;
 
-      // Creation: Only an active Admin can create users, OR the verified root admin email bootstrapping their own profile
+      // Creation: Only an active Admin can create users, OR the exact bootstrap Admin UID registering their initial Admin profile
       allow create: if isSignedIn() &&
         isValidId(userId) &&
         isValidUserProfile(incoming()) &&
         incoming().uid == userId && (
           isActiveAdmin() ||
           (
-            isRootAdminEmail() &&
-            request.auth.uid == userId &&
-            incoming().email == 'renzopachas20@gmail.com' &&
+            isBootstrapAdminUid() &&
+            userId == 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2' &&
+            incoming().uid == 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2' &&
             incoming().role == 'Administrador' &&
             incoming().active == true
           )

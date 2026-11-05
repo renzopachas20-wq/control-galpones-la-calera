@@ -33,7 +33,7 @@ export const OFFICIAL_ROLES = [
 
 export type OfficialRole = (typeof OFFICIAL_ROLES)[number];
 
-export const ROOT_ADMIN_EMAIL = 'renzopachas20@gmail.com';
+export const ROOT_ADMIN_UID = 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2';
 
 export interface UserProfile {
   uid: string;
@@ -111,6 +111,27 @@ export function mapFirebaseAuthErrorToSpanish(error: unknown): string {
 }
 
 export async function fetchOrBootstrapProfile(user: User): Promise<UserProfile> {
+  // 1. Verificar e inicializar desde el procedimiento seguro del servidor (/api/auth/verify-session)
+  try {
+    const idToken = await user.getIdToken();
+    const res = await fetch('/api/auth/verify-session', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    if (res.ok) {
+      const body = (await res.json()) as { ok?: boolean; profile?: UserProfile };
+      if (body.ok && body.profile) {
+        return body.profile;
+      }
+    }
+  } catch {
+    // Continuar con lectura directa en Firestore si la petición local falla
+  }
+
+  // 2. Lectura directa en Cloud Firestore (/users/{uid})
   const userRef = doc(db, 'users', user.uid);
   let snap;
   try {
@@ -137,12 +158,12 @@ export async function fetchOrBootstrapProfile(user: User): Promise<UserProfile> 
     };
   }
 
-  // Si es el correo del Administrador raíz verificado, inicializar su perfil
-  const cleanEmail = (user.email || '').toLowerCase();
-  if (cleanEmail === ROOT_ADMIN_EMAIL && user.emailVerified) {
+  // 3. Respaldo de registro para el UID exacto del primer Administrador (jcSCn1eJ7Yao4xYeV6J8eZpszLR2)
+  if (user.uid === ROOT_ADMIN_UID) {
     const nowIso = new Date().toISOString();
+    const cleanEmail = (user.email || 'admin@lacalera.pe').toLowerCase();
     const rootProfile: UserProfile = {
-      uid: user.uid,
+      uid: ROOT_ADMIN_UID,
       email: cleanEmail,
       displayName: user.displayName || 'Administrador General',
       role: 'Administrador',

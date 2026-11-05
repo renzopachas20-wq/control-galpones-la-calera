@@ -28,7 +28,7 @@ export const OFFICIAL_ROLES = [
 
 export type OfficialRole = (typeof OFFICIAL_ROLES)[number];
 
-const ROOT_ADMIN_EMAIL = 'renzopachas20@gmail.com';
+export const ROOT_ADMIN_UID = 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2';
 
 interface VerifiedCaller {
   uid: string;
@@ -202,25 +202,25 @@ async function verifyAdminCaller(req: Request): Promise<{
   const caller = await verifyIdTokenWithGoogle(idToken);
   let profile = await fetchUserProfileFromFirestore(caller.uid, idToken);
 
-  // Si es el administrador raíz verificado y aún no existe su documento en /users/{uid}, inicializarlo en el servidor
-  if (!profile && caller.email === ROOT_ADMIN_EMAIL && caller.emailVerified) {
+  // Si es el UID del primer usuario Administrador y aún no existe su documento en /users/{uid}, registrarlo desde el servidor
+  if (!profile && caller.uid === ROOT_ADMIN_UID) {
     const nowIso = new Date().toISOString();
     const bootstrapProfile = {
-      uid: caller.uid,
-      email: caller.email,
+      uid: ROOT_ADMIN_UID,
+      email: caller.email || 'admin@lacalera.pe',
       displayName: caller.displayName || 'Administrador General',
       role: 'Administrador' as OfficialRole,
       active: true,
       assignedSectorIds: [],
       assignedGalponIds: [],
       createdAt: nowIso,
-      createdBy: caller.email,
+      createdBy: caller.email || ROOT_ADMIN_UID,
       updatedAt: nowIso,
-      updatedBy: caller.email,
+      updatedBy: caller.email || ROOT_ADMIN_UID,
       lastLoginAt: nowIso,
     };
     const createUrl = `${getFirestoreBaseUrl()}/users?documentId=${encodeURIComponent(
-      caller.uid
+      ROOT_ADMIN_UID
     )}`;
     const createRes = await fetch(createUrl, {
       method: 'POST',
@@ -289,24 +289,24 @@ async function startServer() {
       const caller = await verifyIdTokenWithGoogle(idToken);
       let profile = await fetchUserProfileFromFirestore(caller.uid, idToken);
 
-      if (!profile && caller.email === ROOT_ADMIN_EMAIL && caller.emailVerified) {
+      if (!profile && caller.uid === ROOT_ADMIN_UID) {
         const nowIso = new Date().toISOString();
         const bootstrapProfile = {
-          uid: caller.uid,
-          email: caller.email,
+          uid: ROOT_ADMIN_UID,
+          email: caller.email || 'admin@lacalera.pe',
           displayName: caller.displayName || 'Administrador General',
           role: 'Administrador' as OfficialRole,
           active: true,
           assignedSectorIds: [],
           assignedGalponIds: [],
           createdAt: nowIso,
-          createdBy: caller.email,
+          createdBy: caller.email || ROOT_ADMIN_UID,
           updatedAt: nowIso,
-          updatedBy: caller.email,
+          updatedBy: caller.email || ROOT_ADMIN_UID,
           lastLoginAt: nowIso,
         };
         const createUrl = `${getFirestoreBaseUrl()}/users?documentId=${encodeURIComponent(
-          caller.uid
+          ROOT_ADMIN_UID
         )}`;
         const createRes = await fetch(createUrl, {
           method: 'POST',
