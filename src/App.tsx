@@ -76,7 +76,40 @@ const ATTENDANCE_STATUSES = [
   'Descanso Médico'
 ];
 
-const DEFAULT_TECHNOLOGIES = ['Big Herdsman', 'Big Dutchman', 'Vidulma'];
+const DEFAULT_TECHNOLOGIES: string[] = [];
+
+// Limpieza única de producción autorizada (elimina cualquier registro de prueba previo y conserva nuevos registros reales)
+if (typeof window !== 'undefined') {
+  try {
+    const alreadyResetForProduction = localStorage.getItem('calera_production_reset_v1');
+    if (!alreadyResetForProduction) {
+      const keysToClear = [
+        'calera_technologies_clean',
+        'calera_master_catalog_clean',
+        'calera_sectors_clean',
+        'calera_advances_clean',
+        'calera_workforce_clean',
+        'calera_materials_clean',
+        'calera_attendance_clean',
+        'calera_audit_logs_clean',
+        'calera_active_user_clean',
+        'calera_clean_slate_initialized_v1',
+        'calera_sectors_v4',
+        'calera_advances_v4',
+        'calera_master_workforce_v4',
+        'calera_attendance_v4',
+        'calera_sectors_v6',
+        'calera_advances_v6',
+        'calera_master_workforce_v6',
+        'calera_attendance_v6',
+        'calera_materials_v6',
+        'calera_master_catalog_v6'
+      ];
+      keysToClear.forEach((k) => localStorage.removeItem(k));
+      localStorage.setItem('calera_production_reset_v1', 'true');
+    }
+  } catch {}
+}
 
 // Construye las 6 áreas de un galpón filtrando el Catálogo Maestro por la plantilla/proveedor elegido
 function buildAreasFromCatalog(
@@ -200,7 +233,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [currentTab, setCurrentTab] = useState('dashboard');
 
-  // Plantillas / Proveedores
+  // Plantillas / Proveedores (Inician vacíos)
   const [technologies, setTechnologies] = useState<string[]>(() => {
     try {
       const s = localStorage.getItem('calera_technologies_clean');
@@ -303,9 +336,9 @@ export default function App() {
 
   const [activeUserName, setActiveUserName] = useState<string>(() => {
     try {
-      return localStorage.getItem('calera_active_user_clean') || 'Administrador';
+      return localStorage.getItem('calera_active_user_clean') || '';
     } catch {
-      return 'Administrador';
+      return '';
     }
   });
 
