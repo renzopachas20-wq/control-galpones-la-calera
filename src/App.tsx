@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
+import * as XLSX from 'xlsx';
 import {
   Building2,
   CheckCircle2,
@@ -112,15 +113,17 @@ if (typeof window !== 'undefined') {
 }
 
 // Construye las 6 áreas de un galpón filtrando el Catálogo Maestro por la plantilla/proveedor elegido
+// Construye las 6 áreas de un galpón filtrando el Catálogo Maestro por la plantilla/proveedor elegido (sin inventar sistemas ni estructuras predeterminadas C-7)
 function buildAreasFromCatalog(
   catalog: any[],
   technology: string,
   startDateStr: string
 ) {
+  const cleanTech = (technology || '').trim();
   const baseDate = startDateStr ? new Date(startDateStr) : new Date();
-  const techItems = catalog.filter(
-    (item) => item.technology === technology
-  );
+  const techItems = cleanTech
+    ? catalog.filter((item) => item.technology === cleanTech)
+    : [];
 
   return ALL_AREAS.map((areaName, aIdx) => {
     const hasSistemas = AREAS_WITH_SISTEMAS.includes(areaName);
@@ -129,9 +132,11 @@ function buildAreasFromCatalog(
     if (hasSistemas) {
       const sisMap = new Map<string, any>();
       itemsInArea.forEach((item, idx) => {
-        const sisName = item.sistemaName || 'Sistema General';
+        const sisName = String(item.sistemaName || '').trim();
+        const strName = String(item.structureName || '').trim();
+        if (!sisName || !strName) return;
         const locType = item.locationType || 'Interno';
-        const sisKey = `${locType}__${sisName}`;
+        const sisKey = `${locType}__${sisName.toLowerCase()}`;
         if (!sisMap.has(sisKey)) {
           sisMap.set(sisKey, {
             id: generateId('sis'),
@@ -142,12 +147,12 @@ function buildAreasFromCatalog(
         }
         const sisObj = sisMap.get(sisKey);
         let strObj = sisObj.structures.find(
-          (s: any) => s.name === (item.structureName || 'Estructura Principal')
+          (s: any) => String(s.name || '').trim().toLowerCase() === strName.toLowerCase()
         );
         if (!strObj) {
           strObj = {
             id: generateId('str'),
-            name: item.structureName || 'Estructura Principal',
+            name: strName,
             activities: []
           };
           sisObj.structures.push(strObj);
@@ -156,7 +161,7 @@ function buildAreasFromCatalog(
         const actStart = new Date(baseDate);
         actStart.setDate(actStart.getDate() + idx * 2);
         const actEnd = new Date(actStart);
-        actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 5));
+        actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 1));
 
         strObj.activities.push({
           id: generateId('act'),
@@ -165,10 +170,10 @@ function buildAreasFromCatalog(
           locationType: locType,
           sistemaName: sisName,
           structureName: strObj.name,
-          targetUnits: Number(item.targetUnits) || 100,
-          unit: item.unit || 'Und',
+          targetUnits: Number(item.targetUnits) || 0,
+          unit: item.unit || '',
           weight: Number(item.weight) || 1.0,
-          plannedHH: Number(item.plannedHH) || 40,
+          plannedHH: Number(item.plannedHH) || 0,
           startDate: actStart.toISOString().split('T')[0],
           dueDate: actEnd.toISOString().split('T')[0],
           status: 'Pendiente'
@@ -184,19 +189,21 @@ function buildAreasFromCatalog(
     } else {
       const strMap = new Map<string, any>();
       itemsInArea.forEach((item, idx) => {
-        const strName = item.structureName || 'Estructura Principal';
-        if (!strMap.has(strName)) {
-          strMap.set(strName, {
+        const strName = String(item.structureName || '').trim();
+        if (!strName) return;
+        const strKey = strName.toLowerCase();
+        if (!strMap.has(strKey)) {
+          strMap.set(strKey, {
             id: generateId('str'),
             name: strName,
             activities: []
           });
         }
-        const strObj = strMap.get(strName);
+        const strObj = strMap.get(strKey);
         const actStart = new Date(baseDate);
         actStart.setDate(actStart.getDate() + idx * 2);
         const actEnd = new Date(actStart);
-        actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 5));
+        actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 1));
 
         strObj.activities.push({
           id: generateId('act'),
@@ -205,10 +212,10 @@ function buildAreasFromCatalog(
           locationType: 'Interno',
           sistemaName: null,
           structureName: strName,
-          targetUnits: Number(item.targetUnits) || 100,
-          unit: item.unit || 'Und',
+          targetUnits: Number(item.targetUnits) || 0,
+          unit: item.unit || '',
           weight: Number(item.weight) || 1.0,
-          plannedHH: Number(item.plannedHH) || 40,
+          plannedHH: Number(item.plannedHH) || 0,
           startDate: actStart.toISOString().split('T')[0],
           dueDate: actEnd.toISOString().split('T')[0],
           status: 'Pendiente'
@@ -223,6 +230,303 @@ function buildAreasFromCatalog(
       };
     }
   });
+}
+
+// Sincroniza de forma aditiva y no destructiva las áreas de un galpón con el Catálogo Maestro (C-3 y C-7)
+function mergeAreasWithCatalog(
+  existingAreas: any[],
+  catalog: any[],
+  technology: string,
+  startDateStr: string
+) {
+  const cleanTech = (technology || '').trim();
+  const baseDate = startDateStr ? new Date(startDateStr) : new Date();
+  const techItems = cleanTech
+    ? catalog.filter((item) => item.technology === cleanTech)
+    : [];
+
+  // Recopilar todos los códigos de actividades que ya existen en el galpón para no duplicarlas ni regenerar IDs
+  const existingActivityCodes = new Set<string>();
+  (existingAreas || []).forEach((area: any) => {
+    if (area.hasSistemas && area.sistemas) {
+      area.sistemas.forEach((sis: any) => {
+        (sis.structures || []).forEach((str: any) => {
+          (str.activities || []).forEach((act: any) => {
+            if (act.code) {
+              existingActivityCodes.add(String(act.code).trim().toUpperCase());
+            }
+          });
+        });
+      });
+    } else {
+      (area.structures || []).forEach((str: any) => {
+        (str.activities || []).forEach((act: any) => {
+          if (act.code) {
+            existingActivityCodes.add(String(act.code).trim().toUpperCase());
+          }
+        });
+      });
+    }
+  });
+
+  return ALL_AREAS.map((areaName, aIdx) => {
+    const hasSistemas = AREAS_WITH_SISTEMAS.includes(areaName);
+    const existingArea = (existingAreas || []).find((a: any) => a.name === areaName);
+    const areaId = existingArea?.id || generateId(`area_${aIdx}`);
+    const itemsInArea = techItems.filter((i) => i.areaName === areaName);
+
+    if (hasSistemas) {
+      const sistemasCopy: any[] = (existingArea?.sistemas || []).map((sis: any) => ({
+        ...sis,
+        id: sis.id || generateId('sis'),
+        structures: (sis.structures || []).map((str: any) => ({
+          ...str,
+          id: str.id || generateId('str'),
+          activities: [...(str.activities || [])]
+        }))
+      }));
+
+      itemsInArea.forEach((item, idx) => {
+        const cleanItemCode = String(item.code || '').trim().toUpperCase();
+        if (!cleanItemCode || existingActivityCodes.has(cleanItemCode)) {
+          return;
+        }
+
+        const sisName = String(item.sistemaName || '').trim();
+        const locType = item.locationType || 'Interno';
+        const strName = String(item.structureName || '').trim();
+        if (!sisName || !strName) return;
+
+        let sisObj = sistemasCopy.find(
+          (s: any) =>
+            String(s.name || '').trim().toLowerCase() === sisName.toLowerCase() &&
+            (s.locationType || 'Interno') === locType
+        );
+        if (!sisObj) {
+          sisObj = {
+            id: generateId('sis'),
+            name: sisName,
+            locationType: locType,
+            structures: []
+          };
+          sistemasCopy.push(sisObj);
+        }
+
+        let strObj = (sisObj.structures || []).find(
+          (st: any) => String(st.name || '').trim().toLowerCase() === strName.toLowerCase()
+        );
+        if (!strObj) {
+          strObj = {
+            id: generateId('str'),
+            name: strName,
+            activities: []
+          };
+          sisObj.structures.push(strObj);
+        }
+
+        const actStart = new Date(baseDate);
+        actStart.setDate(actStart.getDate() + idx * 2);
+        const actEnd = new Date(actStart);
+        actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 1));
+
+        strObj.activities.push({
+          id: generateId('act'),
+          code: cleanItemCode,
+          name: item.name,
+          locationType: locType,
+          sistemaName: sisObj.name,
+          structureName: strObj.name,
+          targetUnits: Number(item.targetUnits) || 0,
+          unit: item.unit || '',
+          weight: Number(item.weight) || 1.0,
+          plannedHH: Number(item.plannedHH) || 0,
+          startDate: actStart.toISOString().split('T')[0],
+          dueDate: actEnd.toISOString().split('T')[0],
+          status: 'Pendiente'
+        });
+
+        existingActivityCodes.add(cleanItemCode);
+      });
+
+      return {
+        ...existingArea,
+        id: areaId,
+        name: areaName,
+        hasSistemas: true,
+        sistemas: sistemasCopy
+      };
+    } else {
+      const structuresCopy: any[] = (existingArea?.structures || []).map((str: any) => ({
+        ...str,
+        id: str.id || generateId('str'),
+        activities: [...(str.activities || [])]
+      }));
+
+      itemsInArea.forEach((item, idx) => {
+        const cleanItemCode = String(item.code || '').trim().toUpperCase();
+        if (!cleanItemCode || existingActivityCodes.has(cleanItemCode)) {
+          return;
+        }
+
+        const strName = String(item.structureName || '').trim();
+        if (!strName) return;
+
+        let strObj = structuresCopy.find(
+          (st: any) => String(st.name || '').trim().toLowerCase() === strName.toLowerCase()
+        );
+        if (!strObj) {
+          strObj = {
+            id: generateId('str'),
+            name: strName,
+            activities: []
+          };
+          structuresCopy.push(strObj);
+        }
+
+        const actStart = new Date(baseDate);
+        actStart.setDate(actStart.getDate() + idx * 2);
+        const actEnd = new Date(actStart);
+        actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 1));
+
+        strObj.activities.push({
+          id: generateId('act'),
+          code: cleanItemCode,
+          name: item.name,
+          locationType: 'Interno',
+          sistemaName: null,
+          structureName: strObj.name,
+          targetUnits: Number(item.targetUnits) || 0,
+          unit: item.unit || '',
+          weight: Number(item.weight) || 1.0,
+          plannedHH: Number(item.plannedHH) || 0,
+          startDate: actStart.toISOString().split('T')[0],
+          dueDate: actEnd.toISOString().split('T')[0],
+          status: 'Pendiente'
+        });
+
+        existingActivityCodes.add(cleanItemCode);
+      });
+
+      return {
+        ...existingArea,
+        id: areaId,
+        name: areaName,
+        hasSistemas: false,
+        structures: structuresCopy
+      };
+    }
+  });
+}
+
+// Calcula el consumo acumulado de un material de forma determinística a partir de todos los partes diarios (C-1)
+function computeMaterialUsedQty(mat: any, advances: any[]): number {
+  const baseInitial = Number(mat.initialUsedQty || 0);
+  const consumedFromAdvances = (advances || []).reduce((acc: number, adv: any) => {
+    if (!adv || adv.isSecondarySharedCopy || !Array.isArray(adv.materialsUsedToday)) {
+      return acc;
+    }
+    const matSumInAdvance = adv.materialsUsedToday.reduce((subAcc: number, u: any) => {
+      if (!u) return subAcc;
+      if (u.materialId) {
+        return u.materialId === mat.id ? subAcc + Number(u.qty || 0) : subAcc;
+      }
+      // Soporte retrocompatible para registros antiguos sin materialId verificando el galpón
+      const sameCode =
+        String(u.code || '').trim().toUpperCase() ===
+        String(mat.code || '').trim().toUpperCase();
+      const sameGalpon = !mat.galponId || adv.galponId === mat.galponId;
+      return sameCode && sameGalpon ? subAcc + Number(u.qty || 0) : subAcc;
+    }, 0);
+    return acc + matSumInAdvance;
+  }, 0);
+  return Math.max(0, Math.round((baseInitial + consumedFromAdvances) * 100) / 100);
+}
+
+function recalculateMaterialsFromAdvances(materialsList: any[], advancesList: any[]): any[] {
+  return (materialsList || []).map((mat) => ({
+    ...mat,
+    usedQty: computeMaterialUsedQty(mat, advancesList)
+  }));
+}
+
+// Exportación CSV compatible con Excel con BOM UTF-8 y escape completo de comillas, comas, punto y coma y saltos de línea (C-8)
+function escapeCsvCell(value: any): string {
+  if (value === null || value === undefined) return '""';
+  const str = String(value).replace(/\r\n/g, ' ').replace(/[\r\n]/g, ' ');
+  const escaped = str.replace(/"/g, '""');
+  return `"${escaped}"`;
+}
+
+function downloadCsvFile(
+  filename: string,
+  headers: string[],
+  rows: any[][],
+  titleLine?: string
+) {
+  const lines: string[] = [];
+  if (titleLine) {
+    lines.push(escapeCsvCell(titleLine));
+  }
+  lines.push(headers.map(escapeCsvCell).join(','));
+  rows.forEach((row) => {
+    lines.push(row.map(escapeCsvCell).join(','));
+  });
+  const csvContent = '\uFEFF' + lines.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.setAttribute('download', filename);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Parsea texto pegado desde Excel (TSV) o CSV respetando comillas
+function parsePastedTabularText(text: string): string[][] {
+  if (!text || !text.trim()) return [];
+  const rawLines = text
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .filter((l) => l.trim().length > 0);
+
+  return rawLines.map((line) => {
+    if (line.includes('\t')) {
+      return line.split('\t').map((c) => c.trim());
+    }
+    const separator = line.includes(';') && !line.includes(',') ? ';' : ',';
+    const result: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === separator && !inQuotes) {
+        result.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    result.push(current.trim());
+    return result;
+  });
+}
+
+function normalizeHeaderKey(str: string): string {
+  return String(str || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '');
 }
 
 // ============================================================================
@@ -384,6 +688,36 @@ export default function App() {
     'catalogo' | 'materiales' | 'personal' | null
   >(null);
   const [bulkCsvText, setBulkCsvText] = useState<string>('');
+  const [bulkRawRows, setBulkRawRows] = useState<string[][]>([]);
+  const [bulkFileName, setBulkFileName] = useState<string>('');
+  const [bulkTargetGalponId, setBulkTargetGalponId] = useState<string>('');
+  const [deleteConfirmModal, setDeleteConfirmModal] = useState<{
+    type:
+      | 'sector'
+      | 'galpon'
+      | 'activity'
+      | 'material'
+      | 'worker'
+      | 'advance'
+      | 'catalog_item'
+      | 'template_provider';
+    sectorId?: string;
+    galponId?: string;
+    targetId?: string;
+    code: string;
+    name: string;
+    subtitle?: string;
+    stats: {
+      galpones: number;
+      activities: number;
+      advances: number;
+      materials: number;
+      workers: number;
+      extraInfo?: string;
+    };
+    mode: 'preserve_unassign' | 'cascade_delete';
+    deleteLinkedSharedAdvance?: boolean;
+  } | null>(null);
 
   // Estados de Formularios (Sin valores predeterminados forzados)
   const [formProject, setFormProject] = useState({
@@ -813,7 +1147,10 @@ export default function App() {
           sis.structures?.forEach((str: any) => {
             str.activities?.forEach((act: any) => {
               const logsForAct = dailyAdvances.filter(
-                (l) => l.galponId === currentGalpon.id && l.activityCode === act.code
+                (l) =>
+                  l.galponId === currentGalpon.id &&
+                  ((l.activityId && l.activityId === act.id) ||
+                    l.activityCode === act.code)
               );
               const accumulatedQty = logsForAct.reduce(
                 (sum, item) => sum + Number(item.quantityToday || 0),
@@ -842,28 +1179,33 @@ export default function App() {
               else if (shouldHaveStarted) computedStatus = 'No iniciada (Alerta)';
 
               // Asociación inequívoca: Galpón + Área + Sistema + Estructura (por ID único cuando está disponible)
-              const linkedMaterials = materials.filter((m) => {
-                if (!m.galponId || m.galponId !== currentGalpon.id) return false;
-                if (m.structureId && str.id) {
-                  if (m.structureId !== str.id) return false;
-                  if (m.sistemaId && sis.id && m.sistemaId !== sis.id) return false;
-                  if (m.areaId && area.id && m.areaId !== area.id) return false;
-                  return true;
-                }
-                const sameArea =
-                  Boolean(m.areaName) &&
-                  Boolean(area.name) &&
-                  m.areaName.toLowerCase() === area.name.toLowerCase();
-                const sameSistema =
-                  Boolean(m.sistemaName) &&
-                  Boolean(sis.name) &&
-                  m.sistemaName.toLowerCase() === sis.name.toLowerCase();
-                const sameStructure =
-                  Boolean(m.structureName) &&
-                  Boolean(str.name) &&
-                  m.structureName.toLowerCase() === str.name.toLowerCase();
-                return sameArea && sameSistema && sameStructure;
-              });
+              const linkedMaterials = materials
+                .filter((m) => {
+                  if (!m.galponId || m.galponId !== currentGalpon.id) return false;
+                  if (m.structureId && str.id) {
+                    if (m.structureId !== str.id) return false;
+                    if (m.sistemaId && sis.id && m.sistemaId !== sis.id) return false;
+                    if (m.areaId && area.id && m.areaId !== area.id) return false;
+                    return true;
+                  }
+                  const sameArea =
+                    Boolean(m.areaName) &&
+                    Boolean(area.name) &&
+                    m.areaName.toLowerCase() === area.name.toLowerCase();
+                  const sameSistema =
+                    Boolean(m.sistemaName) &&
+                    Boolean(sis.name) &&
+                    m.sistemaName.toLowerCase() === sis.name.toLowerCase();
+                  const sameStructure =
+                    Boolean(m.structureName) &&
+                    Boolean(str.name) &&
+                    m.structureName.toLowerCase() === str.name.toLowerCase();
+                  return sameArea && sameSistema && sameStructure;
+                })
+                .map((m) => ({
+                  ...m,
+                  usedQty: computeMaterialUsedQty(m, dailyAdvances)
+                }));
 
               list.push({
                 ...act,
@@ -891,7 +1233,10 @@ export default function App() {
         area.structures.forEach((str: any) => {
           str.activities?.forEach((act: any) => {
             const logsForAct = dailyAdvances.filter(
-              (l) => l.galponId === currentGalpon.id && l.activityCode === act.code
+              (l) =>
+                l.galponId === currentGalpon.id &&
+                ((l.activityId && l.activityId === act.id) ||
+                  l.activityCode === act.code)
             );
             const accumulatedQty = logsForAct.reduce(
               (sum, item) => sum + Number(item.quantityToday || 0),
@@ -920,23 +1265,28 @@ export default function App() {
             else if (shouldHaveStarted) computedStatus = 'No iniciada (Alerta)';
 
             // Asociación inequívoca: Galpón + Área + Estructura (por ID único cuando está disponible)
-            const linkedMaterials = materials.filter((m) => {
-              if (!m.galponId || m.galponId !== currentGalpon.id) return false;
-              if (m.structureId && str.id) {
-                if (m.structureId !== str.id) return false;
-                if (m.areaId && area.id && m.areaId !== area.id) return false;
-                return true;
-              }
-              const sameArea =
-                Boolean(m.areaName) &&
-                Boolean(area.name) &&
-                m.areaName.toLowerCase() === area.name.toLowerCase();
-              const sameStructure =
-                Boolean(m.structureName) &&
-                Boolean(str.name) &&
-                m.structureName.toLowerCase() === str.name.toLowerCase();
-              return sameArea && sameStructure;
-            });
+            const linkedMaterials = materials
+              .filter((m) => {
+                if (!m.galponId || m.galponId !== currentGalpon.id) return false;
+                if (m.structureId && str.id) {
+                  if (m.structureId !== str.id) return false;
+                  if (m.areaId && area.id && m.areaId !== area.id) return false;
+                  return true;
+                }
+                const sameArea =
+                  Boolean(m.areaName) &&
+                  Boolean(area.name) &&
+                  m.areaName.toLowerCase() === area.name.toLowerCase();
+                const sameStructure =
+                  Boolean(m.structureName) &&
+                  Boolean(str.name) &&
+                  m.structureName.toLowerCase() === str.name.toLowerCase();
+                return sameArea && sameStructure;
+              })
+              .map((m) => ({
+                ...m,
+                usedQty: computeMaterialUsedQty(m, dailyAdvances)
+              }));
 
             list.push({
               ...act,
@@ -1161,14 +1511,20 @@ export default function App() {
     setEditingTemplateValue('');
   };
 
-  const handleDeleteTemplateProvider = (techName: string) => {
-    setTechnologies((prev) => prev.filter((t) => t !== techName));
-    setMasterCatalog((prev) => prev.filter((item) => item.technology !== techName));
-    recordUserMovement(
-      'ELIMINACIÓN',
-      'Catálogo Maestro',
-      `Eliminó plantilla/proveedor "${techName}"`
-    );
+  const requestDeleteTemplateProvider = (techName: string) => {
+    const catalogCount = masterCatalog.filter((c) => c.technology === techName).length;
+    const galponesCount = allGalponesList.filter((g) => g.technology === techName).length;
+    const materialsCount = materials.filter((m) => m.technology === techName).length;
+    setDeleteConfirmModal({
+      type: 'template_provider',
+      code: techName,
+      name: techName,
+      stats: {
+        catalogItems: catalogCount,
+        galpones: galponesCount,
+        materials: materialsCount
+      }
+    });
   };
 
   const openNewCatalogModal = () => {
@@ -1277,14 +1633,16 @@ export default function App() {
     setEditingCatalogId(null);
   };
 
-  const handleDeleteCatalogItem = (id: string) => {
+  const requestDeleteCatalogItem = (id: string) => {
     const targetItem = masterCatalog.find((c) => c.id === id);
-    setMasterCatalog((prev) => prev.filter((c) => c.id !== id));
-    recordUserMovement(
-      'ELIMINACIÓN',
-      'Catálogo Maestro',
-      `Eliminó actividad maestra [${targetItem?.code || id}] ${targetItem?.name || ''}`
-    );
+    if (!targetItem) return;
+    setDeleteConfirmModal({
+      type: 'catalog_item',
+      entityId: id,
+      code: targetItem.code,
+      name: targetItem.name,
+      extraDetails: `Proveedor: ${targetItem.technology || 'Sin proveedor'} • Área: ${targetItem.areaName} • Estructura: ${targetItem.structureName}`
+    });
   };
 
   // ==========================================================================
@@ -1343,14 +1701,54 @@ export default function App() {
     setModalEditProject(false);
   };
 
-  const handleDeleteSector = (secId: string) => {
+  const requestDeleteSector = (secId: string) => {
     const targetSec = sectors.find((s) => s.id === secId);
-    setSectors((prev) => prev.filter((s) => s.id !== secId));
-    recordUserMovement(
-      'ELIMINACIÓN',
-      'Sectores y Galpones',
-      `Eliminó sector [${targetSec?.code || secId}] ${targetSec?.name || ''}`
+    if (!targetSec) return;
+
+    const galponIds = new Set<string>(
+      (targetSec.galpones || []).map((g: any) => g.id)
     );
+    let activitiesCount = 0;
+    (targetSec.galpones || []).forEach((g: any) => {
+      (g.areas || []).forEach((area: any) => {
+        if (area.hasSistemas && area.sistemas) {
+          area.sistemas.forEach((sis: any) => {
+            (sis.structures || []).forEach((str: any) => {
+              activitiesCount += (str.activities || []).length;
+            });
+          });
+        } else {
+          (area.structures || []).forEach((str: any) => {
+            activitiesCount += (str.activities || []).length;
+          });
+        }
+      });
+    });
+
+    const advancesCount = dailyAdvances.filter(
+      (a) => a.sectorId === secId || galponIds.has(a.galponId)
+    ).length;
+    const materialsCount = materials.filter(
+      (m) => m.sectorId === secId || (m.galponId && galponIds.has(m.galponId))
+    ).length;
+    const workersCount = masterWorkforce.filter(
+      (w) => w.sectorId === secId || (w.galponId && galponIds.has(w.galponId))
+    ).length;
+
+    setDeleteConfirmModal({
+      type: 'sector',
+      sectorId: secId,
+      code: targetSec.code,
+      name: targetSec.name,
+      stats: {
+        galpones: (targetSec.galpones || []).length,
+        activities: activitiesCount,
+        advances: advancesCount,
+        materials: materialsCount,
+        workers: workersCount
+      },
+      mode: 'preserve_unassign'
+    });
   };
 
   const handleSaveNewGalpon = (e: React.FormEvent) => {
@@ -1418,37 +1816,31 @@ export default function App() {
 
     const updatedCode = formGalpon.code.trim().toUpperCase();
     const updatedName = formGalpon.name.trim().toUpperCase();
+    const cleanTech = formGalpon.technology.trim();
 
     setSectors((prev) =>
       prev.map((s) => ({
         ...s,
         galpones: (s.galpones || []).map((g: any) => {
           if (g.id !== formGalpon.id) return g;
-          const techChanged = g.technology !== formGalpon.technology;
-          const hasNoActs =
-            !g.areas ||
-            g.areas.every((a: any) =>
-              a.hasSistemas
-                ? (a.sistemas || []).every((sis: any) =>
-                    (sis.structures || []).every((st: any) => !(st.activities || []).length)
-                  )
-                : (a.structures || []).every((st: any) => !(st.activities || []).length)
-            );
+          const techChanged = g.technology !== cleanTech;
 
           return {
             ...g,
             code: updatedCode,
             name: updatedName,
-            technology: formGalpon.technology,
+            technology: cleanTech,
             description: formGalpon.description.trim(),
             supervisors: supList,
             startDate: formGalpon.startDate,
             endDate: formGalpon.endDate,
+            // Sincronización aditiva cuando cambia la plantilla, conservando actividades personalizadas e IDs de estructuras (C-3)
             areas:
-              techChanged && hasNoActs
-                ? buildAreasFromCatalog(
+              techChanged && cleanTech
+                ? mergeAreasWithCatalog(
+                    g.areas || [],
                     masterCatalog,
-                    formGalpon.technology,
+                    cleanTech,
                     formGalpon.startDate
                   )
                 : g.areas
@@ -1460,40 +1852,307 @@ export default function App() {
     recordUserMovement(
       'MODIFICACIÓN',
       'Sectores y Galpones',
-      `Modificó galpón [${updatedCode}] ${updatedName} (Proveedor: ${formGalpon.technology})`
+      `Modificó galpón [${updatedCode}] ${updatedName} (Proveedor: ${cleanTech})`
     );
     setModalEditGalpon(false);
   };
 
-  const handleDeleteGalpon = (secId: string, galId: string) => {
-    const targetGal = allGalponesList.find((g) => g.id === galId);
-    setSectors((prev) =>
-      prev.map((s) =>
-        s.id === secId
-          ? { ...s, galpones: (s.galpones || []).filter((g: any) => g.id !== galId) }
-          : s
-      )
-    );
-    recordUserMovement(
-      'ELIMINACIÓN',
-      'Sectores y Galpones',
-      `Eliminó galpón [${targetGal?.code || galId}] ${targetGal?.name || ''} del sector ${targetGal?.sectorName || ''}`
-    );
+  const requestDeleteGalpon = (secId: string, galId: string) => {
+    const sec = sectors.find((s) => s.id === secId);
+    const targetGal = sec?.galpones?.find((g: any) => g.id === galId);
+    if (!targetGal) return;
+
+    let activitiesCount = 0;
+    (targetGal.areas || []).forEach((area: any) => {
+      if (area.hasSistemas && area.sistemas) {
+        area.sistemas.forEach((sis: any) => {
+          (sis.structures || []).forEach((str: any) => {
+            activitiesCount += (str.activities || []).length;
+          });
+        });
+      } else {
+        (area.structures || []).forEach((str: any) => {
+          activitiesCount += (str.activities || []).length;
+        });
+      }
+    });
+
+    const advancesCount = dailyAdvances.filter((a) => a.galponId === galId).length;
+    const materialsCount = materials.filter((m) => m.galponId === galId).length;
+    const workersCount = masterWorkforce.filter((w) => w.galponId === galId).length;
+
+    setDeleteConfirmModal({
+      type: 'galpon',
+      sectorId: secId,
+      galponId: galId,
+      code: targetGal.code,
+      name: targetGal.name,
+      stats: {
+        galpones: 1,
+        activities: activitiesCount,
+        advances: advancesCount,
+        materials: materialsCount,
+        workers: workersCount
+      },
+      mode: 'preserve_unassign'
+    });
+  };
+
+  const handleConfirmDeleteEntity = () => {
+    if (!deleteConfirmModal) return;
+    const { type, entityId, sectorId, galponId, code, name, mode } = deleteConfirmModal;
+
+    if (type === 'sector') {
+      const targetSec = sectors.find((s) => s.id === sectorId);
+      const galponIds = new Set<string>(
+        (targetSec?.galpones || []).map((g: any) => g.id)
+      );
+
+      const nextAdvances = dailyAdvances.filter(
+        (a) => a.sectorId !== sectorId && !galponIds.has(a.galponId)
+      );
+      setDailyAdvances(nextAdvances);
+
+      setMaterials((prevMats) => {
+        const updatedMats =
+          mode === 'cascade_delete'
+            ? prevMats.filter(
+                (m) =>
+                  m.sectorId !== sectorId &&
+                  (!m.galponId || !galponIds.has(m.galponId))
+              )
+            : prevMats.map((m) => {
+                if (
+                  m.sectorId === sectorId ||
+                  (m.galponId && galponIds.has(m.galponId))
+                ) {
+                  return {
+                    ...m,
+                    sectorId: '',
+                    galponId: '',
+                    areaId: '',
+                    sistemaId: '',
+                    structureId: ''
+                  };
+                }
+                return m;
+              });
+        return recalculateMaterialsFromAdvances(updatedMats, nextAdvances);
+      });
+
+      setMasterWorkforce((prevWorkers) =>
+        prevWorkers.map((w) => {
+          if (
+            w.sectorId === sectorId ||
+            (w.galponId && galponIds.has(w.galponId))
+          ) {
+            return { ...w, sectorId: '', galponId: '' };
+          }
+          return w;
+        })
+      );
+
+      setSectors((prev) => {
+        const next = prev.filter((s) => s.id !== sectorId);
+        if (selectedSectorId === sectorId) {
+          setSelectedSectorId(next[0]?.id || '');
+          setSelectedGalponId(next[0]?.galpones?.[0]?.id || '');
+        }
+        return next;
+      });
+
+      recordUserMovement(
+        'ELIMINACIÓN',
+        'Sectores y Galpones',
+        `Eliminó sector [${code}] ${name} (${mode === 'preserve_unassign' ? 'materiales y operarios conservados como Sin galpón asignado' : 'eliminación en cascada de registros asociados'})`
+      );
+    } else if (type === 'galpon' && galponId) {
+      const nextAdvances = dailyAdvances.filter((a) => a.galponId !== galponId);
+      setDailyAdvances(nextAdvances);
+
+      setMaterials((prevMats) => {
+        const updatedMats =
+          mode === 'cascade_delete'
+            ? prevMats.filter((m) => m.galponId !== galponId)
+            : prevMats.map((m) => {
+                if (m.galponId === galponId) {
+                  return {
+                    ...m,
+                    sectorId: '',
+                    galponId: '',
+                    areaId: '',
+                    sistemaId: '',
+                    structureId: ''
+                  };
+                }
+                return m;
+              });
+        return recalculateMaterialsFromAdvances(updatedMats, nextAdvances);
+      });
+
+      setMasterWorkforce((prevWorkers) =>
+        prevWorkers.map((w) =>
+          w.galponId === galponId ? { ...w, galponId: '' } : w
+        )
+      );
+
+      const targetGal = allGalponesList.find((g) => g.id === galponId);
+      setSectors((prev) =>
+        prev.map((s) => {
+          if (s.id !== sectorId) return s;
+          const nextGals = (s.galpones || []).filter((g: any) => g.id !== galponId);
+          if (selectedGalponId === galponId) {
+            setSelectedGalponId(nextGals[0]?.id || '');
+          }
+          return { ...s, galpones: nextGals };
+        })
+      );
+
+      recordUserMovement(
+        'ELIMINACIÓN',
+        'Sectores y Galpones',
+        `Eliminó galpón [${code}] ${name} del sector ${targetGal?.sectorName || ''} (${mode === 'preserve_unassign' ? 'materiales y operarios conservados como Sin galpón asignado' : 'eliminación en cascada de registros asociados'})`
+      );
+    } else if (type === 'activity' && entityId && sectorId && galponId) {
+      const targetAct = evaluatedActivities.find((a) => a.id === entityId);
+      setSectors((prev) =>
+        prev.map((s) => {
+          if (s.id !== sectorId) return s;
+          return {
+            ...s,
+            galpones: s.galpones.map((g: any) => {
+              if (g.id !== galponId) return g;
+              return {
+                ...g,
+                areas: (g.areas || []).map((area: any) => {
+                  if (area.hasSistemas && area.sistemas) {
+                    return {
+                      ...area,
+                      sistemas: area.sistemas.map((sis: any) => ({
+                        ...sis,
+                        structures: (sis.structures || []).map((str: any) => ({
+                          ...str,
+                          activities: (str.activities || []).filter(
+                            (a: any) => a.id !== entityId
+                          )
+                        }))
+                      }))
+                    };
+                  }
+                  return {
+                    ...area,
+                    structures: (area.structures || []).map((str: any) => ({
+                      ...str,
+                      activities: (str.activities || []).filter(
+                        (a: any) => a.id !== entityId
+                      )
+                    }))
+                  };
+                })
+              };
+            })
+          };
+        })
+      );
+
+      // Si el usuario confirma eliminar la actividad, también limpiamos sus avances diarios en este galpón y recalculamos materiales
+      const nextAdvances = dailyAdvances.filter(
+        (a) =>
+          !(
+            a.galponId === galponId &&
+            (a.activityId === entityId ||
+              (targetAct?.code && a.activityCode === targetAct.code))
+          )
+      );
+      setDailyAdvances(nextAdvances);
+      setMaterials((prevMats) =>
+        recalculateMaterialsFromAdvances(prevMats, nextAdvances)
+      );
+
+      const targetGal = allGalponesList.find((g) => g.id === galponId);
+      recordUserMovement(
+        'ELIMINACIÓN',
+        'Actividades',
+        `Eliminó actividad [${code}] ${name} del galpón ${targetGal?.code || galponId}`
+      );
+    } else if (type === 'material' && entityId) {
+      setMaterials((prev) => prev.filter((m) => m.id !== entityId));
+      recordUserMovement(
+        'ELIMINACIÓN',
+        'Materiales',
+        `Eliminó material [${code}] ${name}`
+      );
+    } else if (type === 'worker' && entityId) {
+      setMasterWorkforce((prev) => prev.filter((w) => w.id !== entityId));
+      recordUserMovement(
+        'ELIMINACIÓN',
+        'Personal y Asistencia',
+        `Eliminó operario [${code}] ${name}`
+      );
+    } else if (type === 'advance' && entityId) {
+      const targetAdv = dailyAdvances.find((a) => a.id === entityId);
+      if (targetAdv) {
+        const nextAdvances = targetAdv.sharedGroupId
+          ? dailyAdvances.filter((a) => a.sharedGroupId !== targetAdv.sharedGroupId)
+          : dailyAdvances.filter((a) => a.id !== entityId);
+
+        setDailyAdvances(nextAdvances);
+        setMaterials((prevMats) =>
+          recalculateMaterialsFromAdvances(prevMats, nextAdvances)
+        );
+
+        const revertedMatsText =
+          targetAdv.materialsUsedToday?.length > 0
+            ? ` (Stock revertido: ${targetAdv.materialsUsedToday
+                .map((u: any) => `${u.name} +${u.qty} ${u.unit}`)
+                .join(', ')})`
+            : '';
+
+        recordUserMovement(
+          'ELIMINACIÓN',
+          'Avance Diario',
+          `Eliminó parte diario de [${targetAdv.activityCode}] ${name} (${targetAdv.date} • Cantidad: ${targetAdv.quantityToday})${targetAdv.sharedGroupId ? ' [Trabajo Biproyecto sincronizado en ambos galpones]' : ''}${revertedMatsText}`
+        );
+      }
+    } else if (type === 'catalog_item' && entityId) {
+      setMasterCatalog((prev) => prev.filter((c) => c.id !== entityId));
+      recordUserMovement(
+        'ELIMINACIÓN',
+        'Catálogo Maestro',
+        `Eliminó actividad maestra [${code}] ${name}`
+      );
+    } else if (type === 'template_provider' && code) {
+      setTechnologies((prev) => prev.filter((t) => t !== code));
+      setMasterCatalog((prev) => prev.filter((item) => item.technology !== code));
+      recordUserMovement(
+        'ELIMINACIÓN',
+        'Catálogo Maestro',
+        `Eliminó plantilla/proveedor "${code}"`
+      );
+    }
+
+    setDeleteConfirmModal(null);
   };
 
   const handleReloadGalponFromCatalog = (secId: string, galponObj: any) => {
-    const newAreas = buildAreasFromCatalog(
-      masterCatalog,
-      galponObj.technology || 'Big Herdsman',
-      galponObj.startDate || getSystemToday()
-    );
+    const cleanTech = (galponObj.technology || '').trim();
     setSectors((prev) =>
       prev.map((s) =>
         s.id === secId
           ? {
               ...s,
               galpones: s.galpones.map((g: any) =>
-                g.id === galponObj.id ? { ...g, areas: newAreas } : g
+                g.id === galponObj.id
+                  ? {
+                      ...g,
+                      areas: mergeAreasWithCatalog(
+                        g.areas || [],
+                        masterCatalog,
+                        cleanTech,
+                        galponObj.startDate || getSystemToday()
+                      )
+                    }
+                  : g
               )
             }
           : s
@@ -1502,7 +2161,7 @@ export default function App() {
     recordUserMovement(
       'MODIFICACIÓN',
       'Sectores y Galpones',
-      `Sincronizó actividades del galpón [${galponObj.code}] desde el Catálogo Maestro (${galponObj.technology})`
+      `Sincronizó actividades del galpón [${galponObj.code}] desde el Catálogo Maestro (${cleanTech || 'Sin proveedor'}) conservando estructuras y actividades personalizadas`
     );
   };
 
@@ -1527,6 +2186,8 @@ export default function App() {
 
     if (!finalStructure) return;
 
+    if (AREAS_WITH_SISTEMAS.includes(formActivity.areaName) && !finalSistema) return;
+
     const newActObj = {
       id: generateId('act'),
       code: formActivity.code.trim().toUpperCase(),
@@ -1535,11 +2196,11 @@ export default function App() {
         ? formActivity.locationType || 'Interno'
         : 'Interno',
       sistemaName: AREAS_WITH_SISTEMAS.includes(formActivity.areaName)
-        ? finalSistema || null
+        ? finalSistema
         : null,
       structureName: finalStructure,
       targetUnits: Number(formActivity.targetUnits) || 0,
-      unit: formActivity.unit.trim() || 'Und',
+      unit: formActivity.unit.trim(),
       weight: Number(formActivity.weight) || 1.0,
       plannedHH: Number(formActivity.plannedHH) || 0,
       startDate: formActivity.startDate || getSystemToday(),
@@ -1583,21 +2244,22 @@ export default function App() {
 
               if (AREAS_WITH_SISTEMAS.includes(area.name)) {
                 const sisList = [...(area.sistemas || [])];
-                const targetSisName = newActObj.sistemaName || 'General';
-                let sisObj = sisList.find(
+                const targetSisName = newActObj.sistemaName || '';
+                if (!targetSisName) return area;
+                let sisIdx = sisList.findIndex(
                   (sis) =>
                     (sis.name || '').toLowerCase() === targetSisName.toLowerCase() &&
                     (sis.locationType || 'Interno') === newActObj.locationType
                 );
-                if (!sisObj) {
-                  sisObj = {
-                    id: generateId('sis'),
-                    name: targetSisName,
-                    locationType: newActObj.locationType,
-                    structures: []
-                  };
-                  sisList.push(sisObj);
-                }
+                let sisObj =
+                  sisIdx >= 0
+                    ? { ...sisList[sisIdx] }
+                    : {
+                        id: generateId('sis'),
+                        name: targetSisName,
+                        locationType: newActObj.locationType,
+                        structures: []
+                      };
                 const strList = [...(sisObj.structures || [])];
                 let strObj = strList.find(
                   (st: any) =>
@@ -1614,17 +2276,27 @@ export default function App() {
                   };
                   strList.push(strObj);
                 } else {
+                  const alreadyExists = (strObj.activities || []).some(
+                    (ex: any) => ex.code === newActObj.code
+                  );
                   strObj = {
                     ...strObj,
-                    activities: [
-                      ...(strObj.activities || []),
-                      { ...newActObj, id: generateId('act'), sistemaName: targetSisName }
-                    ]
+                    activities: alreadyExists
+                      ? strObj.activities
+                      : [
+                          ...(strObj.activities || []),
+                          { ...newActObj, id: generateId('act'), sistemaName: targetSisName }
+                        ]
                   };
                   const strIdx = strList.findIndex((st: any) => st.id === strObj.id);
                   if (strIdx >= 0) strList[strIdx] = strObj;
                 }
-                sisObj.structures = strList;
+                sisObj = { ...sisObj, structures: strList };
+                if (sisIdx >= 0) {
+                  sisList[sisIdx] = sisObj;
+                } else {
+                  sisList.push(sisObj);
+                }
                 return { ...area, hasSistemas: true, sistemas: sisList };
               } else {
                 const strList = [...(area.structures || [])];
@@ -1641,12 +2313,17 @@ export default function App() {
                   };
                   strList.push(strObj);
                 } else {
+                  const alreadyExists = (strObj.activities || []).some(
+                    (ex: any) => ex.code === newActObj.code
+                  );
                   strObj = {
                     ...strObj,
-                    activities: [
-                      ...(strObj.activities || []),
-                      { ...newActObj, id: generateId('act') }
-                    ]
+                    activities: alreadyExists
+                      ? strObj.activities
+                      : [
+                          ...(strObj.activities || []),
+                          { ...newActObj, id: generateId('act') }
+                        ]
                   };
                   const strIdx = strList.findIndex((st: any) => st.id === strObj.id);
                   if (strIdx >= 0) strList[strIdx] = strObj;
@@ -1699,6 +2376,13 @@ export default function App() {
     e.preventDefault();
     if (!modalEditGalponActivity || !currentGalpon || !currentSector) return;
 
+    const existingAct = evaluatedActivities.find(
+      (a) => a.id === modalEditGalponActivity.id
+    );
+    const oldCode = existingAct?.code || '';
+    const newCode = modalEditGalponActivity.code.trim().toUpperCase();
+    const newName = modalEditGalponActivity.name.trim();
+
     setSectors((prev) =>
       prev.map((s) => {
         if (s.id !== currentSector.id) return s;
@@ -1720,14 +2404,14 @@ export default function App() {
                           act.id === modalEditGalponActivity.id
                             ? {
                                 ...act,
-                                code: modalEditGalponActivity.code.trim().toUpperCase(),
-                                name: modalEditGalponActivity.name.trim(),
+                                code: newCode,
+                                name: newName,
                                 targetUnits:
-                                  Number(modalEditGalponActivity.targetUnits) || 100,
-                                unit: modalEditGalponActivity.unit || 'Und',
+                                  Number(modalEditGalponActivity.targetUnits) || 0,
+                                unit: (modalEditGalponActivity.unit || '').trim(),
                                 weight: Number(modalEditGalponActivity.weight) || 1.0,
                                 plannedHH:
-                                  Number(modalEditGalponActivity.plannedHH) || 40,
+                                  Number(modalEditGalponActivity.plannedHH) || 0,
                                 startDate: modalEditGalponActivity.startDate,
                                 dueDate: modalEditGalponActivity.dueDate
                               }
@@ -1745,13 +2429,13 @@ export default function App() {
                       act.id === modalEditGalponActivity.id
                         ? {
                             ...act,
-                            code: modalEditGalponActivity.code.trim().toUpperCase(),
-                            name: modalEditGalponActivity.name.trim(),
+                            code: newCode,
+                            name: newName,
                             targetUnits:
-                              Number(modalEditGalponActivity.targetUnits) || 100,
-                            unit: modalEditGalponActivity.unit || 'Und',
+                              Number(modalEditGalponActivity.targetUnits) || 0,
+                            unit: (modalEditGalponActivity.unit || '').trim(),
                             weight: Number(modalEditGalponActivity.weight) || 1.0,
-                            plannedHH: Number(modalEditGalponActivity.plannedHH) || 40,
+                            plannedHH: Number(modalEditGalponActivity.plannedHH) || 0,
                             startDate: modalEditGalponActivity.startDate,
                             dueDate: modalEditGalponActivity.dueDate
                           }
@@ -1766,59 +2450,55 @@ export default function App() {
       })
     );
 
+    // Actualizar referencias en los avances diarios para conservar historial, progreso y consumo intactos (C-4)
+    setDailyAdvances((prevAdvances) =>
+      prevAdvances.map((adv) => {
+        if (
+          adv.galponId === currentGalpon.id &&
+          (adv.activityId === modalEditGalponActivity.id ||
+            (oldCode && adv.activityCode === oldCode))
+        ) {
+          return {
+            ...adv,
+            activityId: modalEditGalponActivity.id,
+            activityCode: newCode
+          };
+        }
+        return adv;
+      })
+    );
+
     recordUserMovement(
       'MODIFICACIÓN',
       'Actividades',
-      `Modificó actividad [${modalEditGalponActivity.code.trim().toUpperCase()}] ${modalEditGalponActivity.name.trim()} en galpón ${currentGalpon.code}`
+      `Modificó actividad [${oldCode && oldCode !== newCode ? `${oldCode} → ${newCode}` : newCode}] ${newName} en galpón ${currentGalpon.code}`
     );
     setModalEditGalponActivity(null);
   };
 
-  const handleDeleteGalponActivity = (actId: string) => {
+  const requestDeleteGalponActivity = (actId: string) => {
     if (!currentGalpon || !currentSector) return;
     const targetAct = evaluatedActivities.find((a) => a.id === actId);
-    setSectors((prev) =>
-      prev.map((s) => {
-        if (s.id !== currentSector.id) return s;
-        return {
-          ...s,
-          galpones: s.galpones.map((g: any) => {
-            if (g.id !== currentGalpon.id) return g;
-            return {
-              ...g,
-              areas: (g.areas || []).map((area: any) => {
-                if (area.hasSistemas && area.sistemas) {
-                  return {
-                    ...area,
-                    sistemas: area.sistemas.map((sis: any) => ({
-                      ...sis,
-                      structures: (sis.structures || []).map((str: any) => ({
-                        ...str,
-                        activities: (str.activities || []).filter(
-                          (a: any) => a.id !== actId
-                        )
-                      }))
-                    }))
-                  };
-                }
-                return {
-                  ...area,
-                  structures: (area.structures || []).map((str: any) => ({
-                    ...str,
-                    activities: (str.activities || []).filter((a: any) => a.id !== actId)
-                  }))
-                };
-              })
-            };
-          })
-        };
-      })
-    );
-    recordUserMovement(
-      'ELIMINACIÓN',
-      'Actividades',
-      `Eliminó actividad [${targetAct?.code || actId}] ${targetAct?.name || ''} del galpón ${currentGalpon.code}`
-    );
+    if (!targetAct) return;
+    const relatedAdvancesCount = dailyAdvances.filter(
+      (a) =>
+        a.galponId === currentGalpon.id &&
+        (a.activityId === actId || a.activityCode === targetAct.code)
+    ).length;
+
+    setDeleteConfirmModal({
+      type: 'activity',
+      entityId: actId,
+      sectorId: currentSector.id,
+      galponId: currentGalpon.id,
+      code: targetAct.code,
+      name: targetAct.name,
+      stats: {
+        advances: relatedAdvancesCount,
+        materials: targetAct.linkedMaterials?.length || 0
+      },
+      extraDetails: `Galpón: ${currentGalpon.code} • Área: ${targetAct.areaName} • Estructura: ${targetAct.structureName}`
+    });
   };
 
   const handleGanttDateChange = (
@@ -2096,7 +2776,11 @@ export default function App() {
       );
     }
 
-    const newMatPayload = {
+    const existingMat = editingMaterialId
+      ? materials.find((m) => m.id === editingMaterialId)
+      : null;
+
+    const baseMatPayload = {
       id: editingMaterialId || generateId('mat'),
       sectorId: resolvedSectorId,
       galponId: resolvedGalponId,
@@ -2111,8 +2795,13 @@ export default function App() {
       structureId: resolvedStructureId,
       structureName: finalStructure,
       totalQty: Number(formMaterial.totalQty) || 0,
-      usedQty: Number(formMaterial.usedQty) || 0,
+      initialUsedQty: existingMat ? Number(existingMat.initialUsedQty || 0) : 0,
+      usedQty: 0,
       unit: cleanUnit
+    };
+    const newMatPayload = {
+      ...baseMatPayload,
+      usedQty: computeMaterialUsedQty(baseMatPayload, dailyAdvances)
     };
 
     const assignedGalForLog = allGalponesList.find(
@@ -2171,18 +2860,36 @@ export default function App() {
     setEditingMaterialId(null);
   };
 
-  const handleDeleteMaterial = (id: string) => {
+  const requestDeleteMaterial = (id: string) => {
     const targetMat = materials.find((m) => m.id === id);
-    setMaterials((prev) => prev.filter((m) => m.id !== id));
-    recordUserMovement(
-      'ELIMINACIÓN',
-      'Materiales',
-      `Eliminó material [${targetMat?.code || id}] ${targetMat?.name || ''}`
-    );
+    if (!targetMat) return;
+    const relatedAdvancesCount = dailyAdvances.filter((adv) =>
+      (adv.materialsUsedToday || []).some(
+        (u: any) =>
+          u.materialId === id ||
+          (!u.materialId &&
+            u.code === targetMat.code &&
+            (!targetMat.galponId || targetMat.galponId === adv.galponId))
+      )
+    ).length;
+    const galInfo = targetMat.galponId
+      ? allGalponesList.find((g) => g.id === targetMat.galponId)
+      : null;
+
+    setDeleteConfirmModal({
+      type: 'material',
+      entityId: id,
+      code: targetMat.code,
+      name: targetMat.name,
+      stats: {
+        advances: relatedAdvancesCount
+      },
+      extraDetails: `${galInfo ? `${galInfo.sectorName} • ${galInfo.code}` : 'Sin galpón asignado'} • Consumido: ${targetMat.usedQty || 0} / ${targetMat.totalQty || 0} ${targetMat.unit || ''}`
+    });
   };
 
   // ==========================================================================
-  // HANDLERS: AVANCE DIARIO EN CASCADA + CONSUMO MANUAL DE MATERIALES POR ID
+  // HANDLERS: AVANCE DIARIO EN CASCADA + TRABAJO BIPROYECTO (C-2) + CONSUMO POR ID (C-1)
   // ==========================================================================
   const openNewAdvanceModal = (prefill?: Partial<typeof formAdvance>) => {
     setEditingAdvanceId(null);
@@ -2207,15 +2914,31 @@ export default function App() {
 
   const openEditAdvanceModal = (adv: any) => {
     setEditingAdvanceId(adv.id);
-    const act = evaluatedActivities.find((a) => a.code === adv.activityCode);
+    const act = evaluatedActivities.find(
+      (a) => (adv.activityId && a.id === adv.activityId) || a.code === adv.activityCode
+    );
     const manualInputs: Record<string, string> = {};
 
-    if (adv.materialsUsedToday?.length > 0) {
-      adv.materialsUsedToday.forEach((u: any) => {
+    // Si es un avance compartido (Trabajo Biproyecto), reconstruir los insumos totales del grupo compartido
+    const groupLogs = adv.sharedGroupId
+      ? dailyAdvances.filter((a) => a.sharedGroupId === adv.sharedGroupId)
+      : [adv];
+    const primarySharedLog =
+      groupLogs.find((a) => !a.isSecondarySharedCopy) || adv;
+    const secondarySharedLog = groupLogs.find(
+      (a) => a.id !== primarySharedLog.id
+    );
+
+    const sourceMaterialsList =
+      adv.sharedGroupId && primarySharedLog.sharedTotalMaterialsUsed
+        ? primarySharedLog.sharedTotalMaterialsUsed
+        : primarySharedLog.materialsUsedToday || adv.materialsUsedToday || [];
+
+    if (sourceMaterialsList.length > 0) {
+      sourceMaterialsList.forEach((u: any) => {
         if (u.materialId) {
           manualInputs[u.materialId] = String(u.qty ?? '');
         } else {
-          // Compatibilidad con registros antiguos sin materialId
           const matchedMat =
             act?.linkedMaterials?.find((m: any) => m.code === u.code) ||
             materials.find(
@@ -2230,6 +2953,30 @@ export default function App() {
       });
     }
 
+    const savedSplitMode: '50_50' | '100_both' =
+      adv.splitMode === '50_50' || primarySharedLog.splitMode === '50_50'
+        ? '50_50'
+        : '100_both';
+
+    const rawTotalQty =
+      adv.sharedGroupId && primarySharedLog.rawInputQty !== undefined
+        ? primarySharedLog.rawInputQty
+        : adv.sharedGroupId && savedSplitMode === '50_50'
+          ? Math.round(Number(adv.quantityToday || 0) * 2 * 100) / 100
+          : adv.quantityToday;
+
+    const rawTotalHH =
+      adv.sharedGroupId && primarySharedLog.rawInputHH !== undefined
+        ? primarySharedLog.rawInputHH
+        : adv.sharedGroupId && savedSplitMode === '50_50'
+          ? Math.round(Number(adv.hoursWorked || 0) * 2 * 100) / 100
+          : adv.hoursWorked;
+
+    const cleanNote = (adv.note || '').replace(
+      /^\[Trabajo Biproyecto[^\]]*\]\s*/i,
+      ''
+    );
+
     setFormAdvance({
       areaName: act?.areaName || '',
       locationType: act?.locationType || 'Todos',
@@ -2237,13 +2984,17 @@ export default function App() {
       structureName: act?.structureName || '',
       activityCode: adv.activityCode || '',
       date: adv.date || '',
-      quantityToday: String(adv.quantityToday ?? ''),
-      hoursWorked: String(adv.hoursWorked ?? ''),
+      quantityToday: String(rawTotalQty ?? ''),
+      hoursWorked: String(rawTotalHH ?? ''),
       supervisor: adv.supervisor || '',
-      note: adv.note || '',
-      sharedAcrossTwoGalpones: false,
-      secondGalponId: '',
-      splitMode: '100_both',
+      note: cleanNote,
+      sharedAcrossTwoGalpones: Boolean(adv.sharedGroupId && secondarySharedLog),
+      secondGalponId: secondarySharedLog
+        ? secondarySharedLog.galponId === currentGalpon?.id
+          ? primarySharedLog.galponId
+          : secondarySharedLog.galponId
+        : '',
+      splitMode: savedSplitMode,
       manualMaterialInputs: manualInputs
     });
     setModalNewAdvance(true);
@@ -2257,9 +3008,9 @@ export default function App() {
     const rawQty = Number(formAdvance.quantityToday) || 0;
     const rawHH = Number(formAdvance.hoursWorked) || 0;
     const isShared =
-      !editingAdvanceId &&
       formAdvance.sharedAcrossTwoGalpones &&
-      Boolean(formAdvance.secondGalponId);
+      Boolean(formAdvance.secondGalponId) &&
+      formAdvance.secondGalponId !== currentGalpon.id;
     const factor = isShared && formAdvance.splitMode === '50_50' ? 0.5 : 1;
 
     const qtyPerGalpon = Math.round(rawQty * factor * 100) / 100;
@@ -2268,7 +3019,51 @@ export default function App() {
     const selectedAct = evaluatedActivities.find(
       (a) => a.code === formAdvance.activityCode
     );
-    const usedMatsList: {
+    const secondGalponObj = isShared
+      ? allGalponesList.find((g) => g.id === formAdvance.secondGalponId)
+      : null;
+
+    // Encontrar actividad equivalente en el segundo galpón (si existe) para vincular su activityId
+    let secondGalponActId: string | undefined = undefined;
+    if (secondGalponObj) {
+      (secondGalponObj.areas || []).forEach((area: any) => {
+        if (area.hasSistemas && area.sistemas) {
+          area.sistemas.forEach((sis: any) => {
+            (sis.structures || []).forEach((str: any) => {
+              (str.activities || []).forEach((act: any) => {
+                if (act.code === formAdvance.activityCode) {
+                  secondGalponActId = act.id;
+                }
+              });
+            });
+          });
+        } else {
+          (area.structures || []).forEach((str: any) => {
+            (str.activities || []).forEach((act: any) => {
+              if (act.code === formAdvance.activityCode) {
+                secondGalponActId = act.id;
+              }
+            });
+          });
+        }
+      });
+    }
+
+    const totalUsedMatsList: {
+      materialId: string;
+      code: string;
+      name: string;
+      qty: number;
+      unit: string;
+    }[] = [];
+    const primaryGalponMatsList: {
+      materialId: string;
+      code: string;
+      name: string;
+      qty: number;
+      unit: string;
+    }[] = [];
+    const secondaryGalponMatsList: {
       materialId: string;
       code: string;
       name: string;
@@ -2282,13 +3077,57 @@ export default function App() {
         const qtyUsed =
           manualVal !== undefined && manualVal !== '' ? Number(manualVal) : 0;
         if (qtyUsed > 0) {
-          usedMatsList.push({
+          totalUsedMatsList.push({
             materialId: mat.id,
             code: mat.code,
             name: mat.name,
             qty: qtyUsed,
             unit: mat.unit
           });
+
+          if (isShared && secondGalponObj) {
+            // Si existe un material homólogo asignado específicamente al segundo galpón, repartimos 50/50 entre ambos inventarios;
+            // si el material pertenece solo al galpón actual o es global, descontamos una única vez sobre su materialId sin duplicar descuento.
+            const counterpartMat = materials.find(
+              (m) =>
+                m.id !== mat.id &&
+                m.galponId === secondGalponObj.id &&
+                m.code.toLowerCase() === mat.code.toLowerCase()
+            );
+            if (counterpartMat) {
+              const halfQty = Math.round(qtyUsed * 0.5 * 100) / 100;
+              primaryGalponMatsList.push({
+                materialId: mat.id,
+                code: mat.code,
+                name: mat.name,
+                qty: halfQty,
+                unit: mat.unit
+              });
+              secondaryGalponMatsList.push({
+                materialId: counterpartMat.id,
+                code: counterpartMat.code,
+                name: counterpartMat.name,
+                qty: Math.round((qtyUsed - halfQty) * 100) / 100,
+                unit: counterpartMat.unit
+              });
+            } else {
+              primaryGalponMatsList.push({
+                materialId: mat.id,
+                code: mat.code,
+                name: mat.name,
+                qty: qtyUsed,
+                unit: mat.unit
+              });
+            }
+          } else {
+            primaryGalponMatsList.push({
+              materialId: mat.id,
+              code: mat.code,
+              name: mat.name,
+              qty: qtyUsed,
+              unit: mat.unit
+            });
+          }
         }
       });
     }
@@ -2297,122 +3136,155 @@ export default function App() {
       formAdvance.supervisor.trim() ||
       currentGalpon.supervisors?.[0] ||
       activeUserName ||
-      'Supervisor';
+      '';
+
+    const cleanUserNote = formAdvance.note
+      .replace(/^\[Trabajo Biproyecto[^\]]*\]\s*/i, '')
+      .trim();
 
     if (editingAdvanceId) {
       const oldAdv = dailyAdvances.find((a) => a.id === editingAdvanceId);
+      const oldGroupId = oldAdv?.sharedGroupId;
 
-      // Revertir consumo anterior y recalcular el nuevo consumo por ID único sin duplicaciones
-      setMaterials((prev) =>
-        prev.map((m) => {
-          let updatedUsed = Number(m.usedQty || 0);
+      // Removemos el avance anterior (y su par biproyecto si pertenecía a un grupo compartido) para reemplazarlo limpiamente
+      const baseAdvances = oldGroupId
+        ? dailyAdvances.filter((a) => a.sharedGroupId !== oldGroupId)
+        : dailyAdvances.filter((a) => a.id !== editingAdvanceId);
 
-          if (oldAdv && oldAdv.materialsUsedToday?.length > 0) {
-            oldAdv.materialsUsedToday.forEach((oldU: any) => {
-              const matchesOld = oldU.materialId
-                ? m.id === oldU.materialId
-                : m.code === oldU.code &&
-                  (!m.galponId || m.galponId === oldAdv.galponId);
-              if (matchesOld) {
-                updatedUsed -= Number(oldU.qty || 0);
-              }
-            });
-          }
+      const sharedGroupId = isShared
+        ? oldGroupId || generateId('shared_grp')
+        : undefined;
 
-          const newUsage = usedMatsList.find((u) => u.materialId === m.id);
-          if (newUsage) {
-            updatedUsed += Number(newUsage.qty || 0);
-          }
-
-          return {
-            ...m,
-            usedQty: Math.max(0, Math.round(updatedUsed * 10) / 10)
-          };
-        })
-      );
-
-      const updatedAdvObj = {
+      const updatedPrimaryLog: any = {
         ...(oldAdv || {}),
         id: editingAdvanceId,
-        galponId: oldAdv?.galponId || currentGalpon.id,
+        sharedGroupId,
+        isSecondarySharedCopy: false,
+        sharedWithGalponId: isShared ? formAdvance.secondGalponId : undefined,
+        sharedWithGalponCode: isShared ? secondGalponObj?.code : undefined,
+        splitMode: isShared ? formAdvance.splitMode : undefined,
+        rawInputQty: rawQty,
+        rawInputHH: rawHH,
+        sharedTotalMaterialsUsed: totalUsedMatsList,
+        galponId: currentGalpon.id,
+        activityId: selectedAct?.id || oldAdv?.activityId,
         activityCode: formAdvance.activityCode,
         date: formAdvance.date || getSystemToday(),
-        quantityToday: rawQty,
-        hoursWorked: rawHH,
+        quantityToday: qtyPerGalpon,
+        hoursWorked: hhPerGalpon,
         supervisor: finalSupervisor,
-        note: formAdvance.note,
-        materialsUsedToday: usedMatsList
+        note: isShared
+          ? `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${secondGalponObj?.code || formAdvance.secondGalponId}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`
+          : cleanUserNote,
+        materialsUsedToday: primaryGalponMatsList
       };
 
-      setDailyAdvances((prev) =>
-        prev.map((a) => (a.id === editingAdvanceId ? updatedAdvObj : a))
+      const replacementLogs: any[] = [updatedPrimaryLog];
+
+      if (isShared && secondGalponObj) {
+        replacementLogs.push({
+          id: generateId('adv'),
+          sharedGroupId,
+          isSecondarySharedCopy: true,
+          sharedWithGalponId: currentGalpon.id,
+          sharedWithGalponCode: currentGalpon.code,
+          splitMode: formAdvance.splitMode,
+          rawInputQty: rawQty,
+          rawInputHH: rawHH,
+          galponId: secondGalponObj.id,
+          activityId: secondGalponActId,
+          activityCode: formAdvance.activityCode,
+          date: formAdvance.date || getSystemToday(),
+          quantityToday: qtyPerGalpon,
+          hoursWorked: hhPerGalpon,
+          supervisor: finalSupervisor,
+          note: `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${currentGalpon.code}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`,
+          materialsUsedToday: secondaryGalponMatsList
+        });
+      }
+
+      const nextAdvances = [...replacementLogs, ...baseAdvances];
+      setDailyAdvances(nextAdvances);
+      setMaterials((prevMats) =>
+        recalculateMaterialsFromAdvances(prevMats, nextAdvances)
       );
 
       const matsSummary =
-        usedMatsList.length > 0
-          ? ` | Materiales: ${usedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
+        totalUsedMatsList.length > 0
+          ? ` | Materiales: ${totalUsedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
           : '';
 
       recordUserMovement(
         'MODIFICACIÓN',
         'Avance Diario',
-        `Modificó parte diario de [${formAdvance.activityCode}] ${selectedAct?.name || ''} en galpón ${currentGalpon.code}: +${rawQty} ${selectedAct?.unit || 'Und'}, ${rawHH} HH (Fecha: ${updatedAdvObj.date})${matsSummary}`,
-        finalSupervisor
+        `Modificó parte diario${isShared ? ` Biproyecto (${currentGalpon.code} + ${secondGalponObj?.code || ''})` : ''} de [${formAdvance.activityCode}] ${selectedAct?.name || ''}: +${qtyPerGalpon} ${selectedAct?.unit || ''} c/u, ${hhPerGalpon} HH c/u (Fecha: ${updatedPrimaryLog.date})${matsSummary}`,
+        finalSupervisor || activeUserName
       );
     } else {
-      if (usedMatsList.length > 0) {
-        setMaterials((prev) =>
-          prev.map((m) => {
-            const found = usedMatsList.find((u) => u.materialId === m.id);
-            if (!found) return m;
-            return {
-              ...m,
-              usedQty: Math.round((Number(m.usedQty || 0) + found.qty) * 10) / 10
-            };
-          })
-        );
-      }
-
+      const sharedGroupId = isShared ? generateId('shared_grp') : undefined;
       const newLogs: any[] = [
         {
           id: generateId('adv'),
+          sharedGroupId,
+          isSecondarySharedCopy: false,
+          sharedWithGalponId: isShared ? formAdvance.secondGalponId : undefined,
+          sharedWithGalponCode: isShared ? secondGalponObj?.code : undefined,
+          splitMode: isShared ? formAdvance.splitMode : undefined,
+          rawInputQty: rawQty,
+          rawInputHH: rawHH,
+          sharedTotalMaterialsUsed: totalUsedMatsList,
           galponId: currentGalpon.id,
+          activityId: selectedAct?.id,
           activityCode: formAdvance.activityCode,
           date: formAdvance.date || getSystemToday(),
           quantityToday: qtyPerGalpon,
           hoursWorked: hhPerGalpon,
           supervisor: finalSupervisor,
-          note: isShared ? `[Trabajo Biproyecto] ${formAdvance.note}` : formAdvance.note,
-          materialsUsedToday: usedMatsList
+          note: isShared
+            ? `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${secondGalponObj?.code || formAdvance.secondGalponId}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`
+            : cleanUserNote,
+          materialsUsedToday: primaryGalponMatsList
         }
       ];
 
-      if (isShared) {
+      if (isShared && secondGalponObj) {
         newLogs.push({
           id: generateId('adv'),
-          galponId: formAdvance.secondGalponId,
+          sharedGroupId,
+          isSecondarySharedCopy: true,
+          sharedWithGalponId: currentGalpon.id,
+          sharedWithGalponCode: currentGalpon.code,
+          splitMode: formAdvance.splitMode,
+          rawInputQty: rawQty,
+          rawInputHH: rawHH,
+          galponId: secondGalponObj.id,
+          activityId: secondGalponActId,
           activityCode: formAdvance.activityCode,
           date: formAdvance.date || getSystemToday(),
           quantityToday: qtyPerGalpon,
           hoursWorked: hhPerGalpon,
           supervisor: finalSupervisor,
-          note: `[Trabajo Biproyecto con ${currentGalpon.code}] ${formAdvance.note}`,
-          materialsUsedToday: usedMatsList
+          note: `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${currentGalpon.code}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`,
+          materialsUsedToday: secondaryGalponMatsList
         });
       }
 
-      setDailyAdvances((prev) => [...newLogs, ...prev]);
+      const nextAdvances = [...newLogs, ...dailyAdvances];
+      setDailyAdvances(nextAdvances);
+      setMaterials((prevMats) =>
+        recalculateMaterialsFromAdvances(prevMats, nextAdvances)
+      );
 
       const matsSummary =
-        usedMatsList.length > 0
-          ? ` | Materiales: ${usedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
+        totalUsedMatsList.length > 0
+          ? ` | Materiales: ${totalUsedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
           : '';
 
       recordUserMovement(
         'REGISTRO',
         'Avance Diario',
-        `Registró parte diario de [${formAdvance.activityCode}] ${selectedAct?.name || ''} en galpón ${currentGalpon.code}: +${qtyPerGalpon} ${selectedAct?.unit || 'Und'}, ${hhPerGalpon} HH (Fecha: ${newLogs[0].date})${matsSummary}`,
-        finalSupervisor
+        `Registró parte diario${isShared ? ` Biproyecto (${currentGalpon.code} + ${secondGalponObj?.code || ''})` : ''} de [${formAdvance.activityCode}] ${selectedAct?.name || ''}: +${qtyPerGalpon} ${selectedAct?.unit || ''} c/u, ${hhPerGalpon} HH c/u (Fecha: ${newLogs[0].date})${matsSummary}`,
+        finalSupervisor || activeUserName
       );
     }
 
@@ -2436,65 +3308,50 @@ export default function App() {
     });
   };
 
-  const handleDeleteAdvance = (advId: string) => {
+  const requestDeleteAdvance = (advId: string) => {
     const targetAdv = dailyAdvances.find((a) => a.id === advId);
     if (!targetAdv) return;
-
-    // Revertir consumo de materiales vinculado por ID único
-    if (targetAdv.materialsUsedToday?.length > 0) {
-      setMaterials((prev) =>
-        prev.map((m) => {
-          let revertedQty = Number(m.usedQty || 0);
-          targetAdv.materialsUsedToday.forEach((u: any) => {
-            const matchesMat = u.materialId
-              ? m.id === u.materialId
-              : m.code === u.code &&
-                (!m.galponId || m.galponId === targetAdv.galponId);
-            if (matchesMat) {
-              revertedQty -= Number(u.qty || 0);
-            }
-          });
-          return {
-            ...m,
-            usedQty: Math.max(0, Math.round(revertedQty * 10) / 10)
-          };
-        })
-      );
-    }
-
-    setDailyAdvances((prev) => prev.filter((a) => a.id !== advId));
-
-    const actObj = evaluatedActivities.find((a) => a.code === targetAdv.activityCode);
-    const revertedMatsText =
-      targetAdv.materialsUsedToday?.length > 0
-        ? ` (Stock revertido: ${targetAdv.materialsUsedToday
-            .map((u: any) => `${u.name} +${u.qty} ${u.unit}`)
-            .join(', ')})`
-        : '';
-
-    recordUserMovement(
-      'ELIMINACIÓN',
-      'Avance Diario',
-      `Eliminó parte diario de [${targetAdv.activityCode}] ${actObj?.name || ''} (${targetAdv.date} • Cantidad: ${targetAdv.quantityToday})${revertedMatsText}`
+    const actObj = evaluatedActivities.find(
+      (a) =>
+        (targetAdv.activityId && a.id === targetAdv.activityId) ||
+        a.code === targetAdv.activityCode
     );
+    const matsUsedCount = (targetAdv.materialsUsedToday || []).length;
+
+    setDeleteConfirmModal({
+      type: 'advance',
+      entityId: advId,
+      code: targetAdv.activityCode,
+      name: actObj?.name || targetAdv.activityCode,
+      stats: {
+        materials: matsUsedCount
+      },
+      extraDetails: `Fecha: ${targetAdv.date} • Avance: +${targetAdv.quantityToday} ${actObj?.unit || ''} • ${targetAdv.hoursWorked || 0} HH${targetAdv.sharedGroupId ? ` • Trabajo Biproyecto compartido (${targetAdv.sharedWithGalponCode || '2 galpones'})` : ''}`
+    });
   };
 
   // ==========================================================================
-  // HANDLERS: PERSONAL Y ASISTENCIA
+  // HANDLERS: PERSONAL Y ASISTENCIA (SIN VALORES PREDETERMINADOS FIJOS - C-7)
   // ==========================================================================
   const handleSaveWorker = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formWorker.name || !formWorker.workerCode) return;
+    if (
+      !formWorker.name ||
+      !formWorker.workerCode ||
+      !formWorker.workArea ||
+      !formWorker.role
+    )
+      return;
 
     const payload = {
       id: formWorker.id || generateId('w'),
       workerCode: formWorker.workerCode.trim().toUpperCase(),
       dni: formWorker.dni.trim(),
       name: formWorker.name.trim(),
-      workArea: formWorker.workArea || 'Jaulas',
-      role: formWorker.role.trim() || 'Operario',
-      sectorId: formWorker.sectorId || currentSector?.id || '',
-      galponId: formWorker.galponId || currentGalpon?.id || '',
+      workArea: formWorker.workArea.trim(),
+      role: formWorker.role.trim(),
+      sectorId: formWorker.sectorId || '',
+      galponId: formWorker.galponId || '',
       active: true
     };
 
@@ -2534,33 +3391,38 @@ export default function App() {
   const handleWorkerSectorChange = (workerId: string, newSectorId: string) => {
     const targetW = masterWorkforce.find((w) => w.id === workerId);
     const targetSector = sectors.find((s) => s.id === newSectorId);
-    const defaultGalponId =
-      targetSector && targetSector.galpones?.length > 0
-        ? targetSector.galpones[0].id
-        : '';
 
     setMasterWorkforce((prev) =>
       prev.map((w) =>
         w.id === workerId
-          ? { ...w, sectorId: newSectorId, galponId: defaultGalponId }
+          ? { ...w, sectorId: newSectorId, galponId: '' }
           : w
       )
     );
     recordUserMovement(
       'MODIFICACIÓN',
       'Personal y Asistencia',
-      `Reasignó sector de operario [${targetW?.workerCode || workerId}] ${targetW?.name || ''} a ${targetSector?.name || 'Sin Sector'}`
+      `Reasignó sector de operario [${targetW?.workerCode || workerId}] ${targetW?.name || ''} a ${targetSector?.name || 'Sin sector asignado'}`
     );
   };
 
-  const handleDeleteWorker = (workerId: string) => {
+  const requestDeleteWorker = (workerId: string) => {
     const targetW = masterWorkforce.find((w) => w.id === workerId);
-    setMasterWorkforce((prev) => prev.filter((w) => w.id !== workerId));
-    recordUserMovement(
-      'ELIMINACIÓN',
-      'Personal y Asistencia',
-      `Eliminó operario [${targetW?.workerCode || workerId}] ${targetW?.name || ''}`
-    );
+    if (!targetW) return;
+    const attendanceDaysCount = Object.values(attendanceRecords).filter(
+      (dayMap: any) => dayMap && dayMap[workerId]
+    ).length;
+
+    setDeleteConfirmModal({
+      type: 'worker',
+      entityId: workerId,
+      code: targetW.workerCode,
+      name: targetW.name,
+      stats: {
+        attendanceDays: attendanceDaysCount
+      },
+      extraDetails: `Especialidad: ${targetW.workArea || 'Sin asignar'} • Cargo: ${targetW.role || 'Sin asignar'}`
+    });
   };
 
   const handleSetWorkerAttendance = (workerId: string, status: string) => {
@@ -2598,137 +3460,565 @@ export default function App() {
   };
 
   // ==========================================================================
-  // CARGA MASIVA EXCEL / CSV
+  // CARGA MASIVA EXCEL (.XLSX / .CSV / PEGADO DIRECTO) CON VISTA PREVIA (C-6)
   // ==========================================================================
-  const handleConfirmBulkUpload = (e: React.FormEvent) => {
-    e.preventDefault();
-    const lines = bulkCsvText
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
-    if (!lines.length || !modalBulkUpload) return;
-
-    if (modalBulkUpload === 'catalogo') {
-      const newItems: any[] = [];
-      const newTechs = new Set(technologies);
-      lines.forEach((line) => {
-        const cols = line.split(/[,;\t]/).map((c) => c.trim());
-        if (cols.length < 4 || cols[0].toLowerCase() === 'proveedor') return;
-        const [
-          tech,
-          code,
-          areaName,
-          locationType,
-          sistemaName,
-          structureName,
-          name,
-          targetUnits,
-          unit,
-          weight,
-          plannedHH
-        ] = cols;
-        const cleanTech = tech || 'Big Herdsman';
-        newTechs.add(cleanTech);
-        newItems.push({
-          id: generateId('cat'),
-          technology: cleanTech,
-          code: (code || `ACT-${newItems.length + 1}`).toUpperCase(),
-          areaName: areaName || 'Sistema de Jaulas',
-          locationType: locationType || 'Interno',
-          sistemaName: sistemaName || 'Sistema General',
-          structureName: structureName || 'Estructura Principal',
-          name: name || 'Actividad importada',
-          targetUnits: Number(targetUnits) || 100,
-          unit: unit || 'Und',
-          weight: Number(weight) || 1.0,
-          plannedHH: Number(plannedHH) || 40,
-          durationDays: 5
-        });
-      });
-      setTechnologies(Array.from(newTechs));
-      setMasterCatalog((prev) => [...prev, ...newItems]);
-      recordUserMovement(
-        'REGISTRO',
-        'Carga Masiva',
-        `Importó ${newItems.length} actividades al Catálogo Maestro`
-      );
-    } else if (modalBulkUpload === 'materiales') {
-      const newMats: any[] = [];
-      const newTechs = new Set(technologies);
-      lines.forEach((line) => {
-        const cols = line.split(/[,;\t]/).map((c) => c.trim());
-        if (cols.length < 3 || cols[0].toLowerCase() === 'proveedor') return;
-        const [tech, code, name, areaName, sistemaName, structureName, totalQty, unit, galponCode] =
-          cols;
-        const cleanTech = tech || '';
-        if (cleanTech) newTechs.add(cleanTech);
-        const matchedGalpon = galponCode
-          ? allGalponesList.find(
-              (g) => g.code.toLowerCase() === galponCode.toLowerCase()
-            )
-          : null;
-        newMats.push({
-          id: generateId('mat'),
-          sectorId: matchedGalpon ? matchedGalpon.sectorId : '',
-          galponId: matchedGalpon ? matchedGalpon.id : '',
-          technology: cleanTech,
-          code: (code || `MAT-${newMats.length + 1}`).toUpperCase(),
-          name: name || 'Material importado',
-          areaId: '',
-          areaName: areaName || '',
-          locationType: '',
-          sistemaId: '',
-          sistemaName: sistemaName || null,
-          structureId: '',
-          structureName: structureName || '',
-          totalQty: Number(totalQty) || 0,
-          usedQty: 0,
-          unit: unit || ''
-        });
-      });
-      setTechnologies(Array.from(newTechs));
-      setMaterials((prev) => [...prev, ...newMats]);
-      recordUserMovement(
-        'REGISTRO',
-        'Carga Masiva',
-        `Importó ${newMats.length} materiales en Control de Materiales`
-      );
-    } else if (modalBulkUpload === 'personal') {
-      const newWorkers: any[] = [];
-      lines.forEach((line) => {
-        const cols = line.split(/[,;\t]/).map((c) => c.trim());
-        if (cols.length < 2 || cols[0].toLowerCase() === 'codigo') return;
-        const [workerCode, dni, name, workArea, role] = cols;
-        newWorkers.push({
-          id: generateId('w'),
-          workerCode: (workerCode || `OP-${newWorkers.length + 1}`).toUpperCase(),
-          dni: dni || '',
-          name: name || 'Operario',
-          workArea: workArea || 'Jaulas',
-          role: role || 'Operario',
-          sectorId: currentSector?.id || '',
-          galponId: currentGalpon?.id || '',
-          active: true
-        });
-      });
-      setMasterWorkforce((prev) => [...prev, ...newWorkers]);
-      recordUserMovement(
-        'REGISTRO',
-        'Carga Masiva',
-        `Importó ${newWorkers.length} operarios a la Planilla de Personal`
-      );
-    }
-
+  const resetBulkUploadState = () => {
     setBulkCsvText('');
+    setBulkRawRows([]);
+    setBulkFileName('');
+    setBulkTargetGalponId('');
     setModalBulkUpload(null);
   };
 
-  // Exportar Sábana Global CSV
+  const handleBulkFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setBulkFileName(file.name);
+
+    try {
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      if (ext === 'csv' || ext === 'txt') {
+        const text = await file.text();
+        const rows = parsePastedTabularText(text);
+        setBulkRawRows(rows);
+      } else {
+        const buffer = await file.arrayBuffer();
+        const workbook = XLSX.read(buffer, { type: 'array' });
+        const firstSheetName = workbook.SheetNames[0];
+        if (!firstSheetName) {
+          setBulkRawRows([]);
+          return;
+        }
+        const sheet = workbook.Sheets[firstSheetName];
+        const jsonMatrix = XLSX.utils.sheet_to_json<any[]>(sheet, {
+          header: 1,
+          defval: '',
+          raw: false
+        });
+        const cleanRows = (jsonMatrix || [])
+          .map((row) =>
+            (Array.isArray(row) ? row : []).map((cell) => String(cell ?? '').trim())
+          )
+          .filter((row) => row.some((c) => c !== ''));
+        setBulkRawRows(cleanRows);
+      }
+    } catch (err) {
+      console.error('Error al leer archivo de importación:', err);
+      setBulkRawRows([]);
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const bulkImportAnalysis = useMemo(() => {
+    if (!modalBulkUpload) {
+      return {
+        allRows: [] as any[],
+        validRows: [] as any[],
+        duplicateRows: [] as any[],
+        rejectedRows: [] as any[]
+      };
+    }
+
+    const rawMatrix =
+      bulkRawRows.length > 0
+        ? bulkRawRows
+        : parsePastedTabularText(bulkCsvText);
+
+    if (rawMatrix.length === 0) {
+      return {
+        allRows: [] as any[],
+        validRows: [] as any[],
+        duplicateRows: [] as any[],
+        rejectedRows: [] as any[]
+      };
+    }
+
+    const firstRowNorm = rawMatrix[0].map(normalizeHeaderKey);
+    const headerKeywords = [
+      'proveedor',
+      'plantilla',
+      'tecnologia',
+      'codigo',
+      'code',
+      'area',
+      'ubicacion',
+      'sistema',
+      'estructura',
+      'actividad',
+      'material',
+      'descripcion',
+      'nombre',
+      'meta',
+      'cantidad',
+      'total',
+      'unidad',
+      'peso',
+      'hh',
+      'galpon',
+      'dni',
+      'especialidad',
+      'cargo',
+      'rol'
+    ];
+    const hasHeader = firstRowNorm.some((h) =>
+      headerKeywords.some((kw) => h === kw || h.includes(kw))
+    );
+    const dataRows = hasHeader ? rawMatrix.slice(1) : rawMatrix;
+
+    const findColIndex = (aliases: string[], fallbackIdx: number) => {
+      if (!hasHeader) return fallbackIdx;
+      const found = firstRowNorm.findIndex((h) =>
+        aliases.some((al) => h === al || h.includes(al))
+      );
+      return found >= 0 ? found : fallbackIdx;
+    };
+
+    const allRows: any[] = [];
+    const seenCodesInBatch = new Set<string>();
+
+    if (modalBulkUpload === 'catalogo') {
+      const idxTech = findColIndex(['proveedor', 'plantilla', 'tecnologia'], 0);
+      const idxCode = findColIndex(['codigo', 'code', 'cod'], 1);
+      const idxArea = findColIndex(['area'], 2);
+      const idxLoc = findColIndex(['ubicacion', 'locacion', 'tipo'], 3);
+      const idxSis = findColIndex(['sistema'], 4);
+      const idxStr = findColIndex(['estructura'], 5);
+      const idxName = findColIndex(['actividad', 'nombre', 'descripcion'], 6);
+      const idxTarget = findColIndex(['meta', 'cantidad', 'objetivo'], 7);
+      const idxUnit = findColIndex(['unidad', 'und', 'medida'], 8);
+      const idxWeight = findColIndex(['peso', 'ponderacion'], 9);
+      const idxHH = findColIndex(['hh', 'horas'], 10);
+
+      const existingCodes = new Set(
+        masterCatalog.map((c) => `${(c.technology || '').toLowerCase()}::${(c.code || '').toUpperCase()}`)
+      );
+
+      dataRows.forEach((cols, i) => {
+        const rowNumber = hasHeader ? i + 2 : i + 1;
+        const technology = (cols[idxTech] || '').trim();
+        const code = (cols[idxCode] || '').trim().toUpperCase();
+        const rawArea = (cols[idxArea] || '').trim();
+        const rawLoc = (cols[idxLoc] || '').trim();
+        const sistemaName = (cols[idxSis] || '').trim();
+        const structureName = (cols[idxStr] || '').trim();
+        const name = (cols[idxName] || '').trim();
+        const rawTarget = (cols[idxTarget] || '').trim();
+        const unit = (cols[idxUnit] || '').trim();
+        const rawWeight = (cols[idxWeight] || '').trim();
+        const rawHH = (cols[idxHH] || '').trim();
+
+        const matchedArea = ALL_AREAS.find(
+          (a) => normalizeHeaderKey(a) === normalizeHeaderKey(rawArea)
+        );
+        const areaRequiresSistema = matchedArea
+          ? AREAS_WITH_SISTEMAS.includes(matchedArea)
+          : false;
+
+        const targetUnits = Number(rawTarget);
+        const weight = rawWeight !== '' ? Number(rawWeight) : 1.0;
+        const plannedHH = rawHH !== '' ? Number(rawHH) : 0;
+
+        const errors: string[] = [];
+        if (!technology) errors.push('Falta Proveedor');
+        if (!code) errors.push('Falta Código');
+        if (!rawArea) {
+          errors.push('Falta Área');
+        } else if (!matchedArea) {
+          errors.push(`Área inválida ("${rawArea}")`);
+        }
+        if (areaRequiresSistema && !sistemaName) {
+          errors.push('Falta Sistema (obligatorio en esta área)');
+        }
+        if (!structureName) errors.push('Falta Estructura');
+        if (!name) errors.push('Falta Nombre de Actividad');
+        if (!rawTarget || isNaN(targetUnits) || targetUnits <= 0) {
+          errors.push('Meta debe ser mayor a 0');
+        }
+        if (!unit) errors.push('Falta Unidad');
+
+        let status: 'valid' | 'duplicate' | 'rejected' = 'valid';
+        let statusReason = 'Fila válida lista para importar';
+
+        const compositeKey = `${technology.toLowerCase()}::${code}`;
+        if (errors.length > 0) {
+          status = 'rejected';
+          statusReason = errors.join(' • ');
+        } else if (existingCodes.has(compositeKey)) {
+          status = 'duplicate';
+          statusReason = `Código [${code}] ya existe en el Catálogo Maestro para "${technology}"`;
+        } else if (seenCodesInBatch.has(compositeKey)) {
+          status = 'duplicate';
+          statusReason = `Código [${code}] duplicado dentro del mismo archivo`;
+        } else {
+          seenCodesInBatch.add(compositeKey);
+        }
+
+        const cleanLoc =
+          rawLoc.toLowerCase() === 'externo' ? 'Externo' : 'Interno';
+
+        allRows.push({
+          rowNumber,
+          status,
+          statusReason,
+          payload: {
+            id: generateId('cat'),
+            technology,
+            code,
+            areaName: matchedArea || rawArea,
+            locationType: areaRequiresSistema ? cleanLoc : 'Interno',
+            sistemaName: areaRequiresSistema ? sistemaName : null,
+            structureName,
+            name,
+            targetUnits: isNaN(targetUnits) ? 0 : targetUnits,
+            unit,
+            weight: isNaN(weight) || weight <= 0 ? 1.0 : weight,
+            plannedHH: isNaN(plannedHH) || plannedHH < 0 ? 0 : plannedHH,
+            durationDays: 5
+          }
+        });
+      });
+    } else if (modalBulkUpload === 'materiales') {
+      const idxTech = findColIndex(['proveedor', 'plantilla', 'tecnologia'], 0);
+      const idxCode = findColIndex(['codigo', 'code', 'cod'], 1);
+      const idxName = findColIndex(['material', 'descripcion', 'nombre'], 2);
+      const idxArea = findColIndex(['area'], 3);
+      const idxSis = findColIndex(['sistema'], 4);
+      const idxStr = findColIndex(['estructura'], 5);
+      const idxQty = findColIndex(['cantidad', 'total', 'stock', 'meta'], 6);
+      const idxUnit = findColIndex(['unidad', 'und', 'medida'], 7);
+      const idxGalpon = findColIndex(['galpon', 'destino'], 8);
+
+      dataRows.forEach((cols, i) => {
+        const rowNumber = hasHeader ? i + 2 : i + 1;
+        const technology = (cols[idxTech] || '').trim();
+        const code = (cols[idxCode] || '').trim().toUpperCase();
+        const name = (cols[idxName] || '').trim();
+        const rawArea = (cols[idxArea] || '').trim();
+        const sistemaName = (cols[idxSis] || '').trim();
+        const structureName = (cols[idxStr] || '').trim();
+        const rawQty = (cols[idxQty] || '').trim();
+        const unit = (cols[idxUnit] || '').trim();
+        const rawGalponCol = (cols[idxGalpon] || '').trim();
+
+        const matchedArea = ALL_AREAS.find(
+          (a) => normalizeHeaderKey(a) === normalizeHeaderKey(rawArea)
+        );
+        const areaRequiresSistema = matchedArea
+          ? AREAS_WITH_SISTEMAS.includes(matchedArea)
+          : false;
+        const totalQty = Number(rawQty);
+
+        // Identificar Galpón destino (por columna del archivo o por selector explícito en el modal)
+        let targetGalObj: any = null;
+        const errors: string[] = [];
+
+        if (rawGalponCol) {
+          targetGalObj = allGalponesList.find(
+            (g) =>
+              g.id === rawGalponCol ||
+              g.code.toLowerCase() === rawGalponCol.toLowerCase() ||
+              g.name.toLowerCase() === rawGalponCol.toLowerCase()
+          );
+          if (!targetGalObj) {
+            errors.push(`Galpón destino "${rawGalponCol}" no existe`);
+          }
+        } else if (bulkTargetGalponId) {
+          targetGalObj = allGalponesList.find((g) => g.id === bulkTargetGalponId);
+          if (!targetGalObj) {
+            errors.push('Galpón destino seleccionado no válido');
+          }
+        } else {
+          errors.push('Falta Galpón destino (indíquelo en columna o selecciónelo arriba)');
+        }
+
+        if (!technology) errors.push('Falta Proveedor');
+        if (!code) errors.push('Falta Código de Material');
+        if (!name) errors.push('Falta Nombre de Material');
+        if (!rawArea) {
+          errors.push('Falta Área');
+        } else if (!matchedArea) {
+          errors.push(`Área inválida ("${rawArea}")`);
+        }
+        if (areaRequiresSistema && !sistemaName) {
+          errors.push('Falta Sistema (obligatorio en esta área)');
+        }
+        if (!structureName) errors.push('Falta Estructura');
+        if (!rawQty || isNaN(totalQty) || totalQty <= 0) {
+          errors.push('Cantidad Total debe ser mayor a 0');
+        }
+        if (!unit) errors.push('Falta Unidad');
+
+        // Verificar que la relación Área -> Sistema -> Estructura exista realmente en el galpón destino o en el Catálogo Maestro (sin inventar estructuras)
+        let resolvedAreaId = '';
+        let resolvedSistemaId = '';
+        let resolvedStructureId = '';
+        let resolvedLocType = 'Interno';
+
+        if (targetGalObj && matchedArea && structureName) {
+          const areaObj = (targetGalObj.areas || []).find(
+            (a: any) => a.name === matchedArea
+          );
+          if (areaObj) {
+            resolvedAreaId = areaObj.id || '';
+            if (areaRequiresSistema) {
+              const sisObj = (areaObj.sistemas || []).find(
+                (s: any) =>
+                  normalizeHeaderKey(s.name || '') ===
+                  normalizeHeaderKey(sistemaName)
+              );
+              if (sisObj) {
+                resolvedSistemaId = sisObj.id || '';
+                resolvedLocType = sisObj.locationType || 'Interno';
+                const strObj = (sisObj.structures || []).find(
+                  (st: any) =>
+                    normalizeHeaderKey(st.name || '') ===
+                    normalizeHeaderKey(structureName)
+                );
+                if (strObj) {
+                  resolvedStructureId = strObj.id || '';
+                } else {
+                  errors.push(
+                    `La estructura "${structureName}" no existe en el sistema "${sistemaName}" del galpón ${targetGalObj.code}`
+                  );
+                }
+              } else {
+                errors.push(
+                  `El sistema "${sistemaName}" no existe en el área "${matchedArea}" del galpón ${targetGalObj.code}`
+                );
+              }
+            } else {
+              const strObj = (areaObj.structures || []).find(
+                (st: any) =>
+                  normalizeHeaderKey(st.name || '') ===
+                  normalizeHeaderKey(structureName)
+              );
+              if (strObj) {
+                resolvedStructureId = strObj.id || '';
+              } else {
+                errors.push(
+                  `La estructura "${structureName}" no existe en el área "${matchedArea}" del galpón ${targetGalObj.code}`
+                );
+              }
+            }
+          } else {
+            errors.push(
+              `El área "${matchedArea}" no existe en el galpón ${targetGalObj.code}`
+            );
+          }
+        }
+
+        const existingMatKey = `${targetGalObj?.id || ''}::${code}`;
+        const alreadyExistsInGalpon = materials.some(
+          (m) =>
+            (m.galponId || '') === (targetGalObj?.id || '') &&
+            (m.code || '').toUpperCase() === code
+        );
+
+        let status: 'valid' | 'duplicate' | 'rejected' = 'valid';
+        let statusReason = `Válido → ${targetGalObj?.sectorName || ''} • ${targetGalObj?.code || ''}`;
+
+        if (errors.length > 0) {
+          status = 'rejected';
+          statusReason = errors.join(' • ');
+        } else if (alreadyExistsInGalpon) {
+          status = 'duplicate';
+          statusReason = `Código [${code}] ya está registrado en el galpón ${targetGalObj?.code || ''}`;
+        } else if (seenCodesInBatch.has(existingMatKey)) {
+          status = 'duplicate';
+          statusReason = `Código [${code}] duplicado dentro del archivo para el mismo galpón`;
+        } else {
+          seenCodesInBatch.add(existingMatKey);
+        }
+
+        allRows.push({
+          rowNumber,
+          status,
+          statusReason,
+          galponLabel: targetGalObj
+            ? `${targetGalObj.sectorName} • ${targetGalObj.code}`
+            : 'Sin identificar',
+          payload: {
+            id: generateId('mat'),
+            sectorId: targetGalObj?.sectorId || '',
+            galponId: targetGalObj?.id || '',
+            technology,
+            code,
+            name,
+            areaId: resolvedAreaId,
+            areaName: matchedArea || rawArea,
+            locationType: resolvedLocType,
+            sistemaId: resolvedSistemaId,
+            sistemaName: areaRequiresSistema ? sistemaName : null,
+            structureId: resolvedStructureId,
+            structureName,
+            totalQty: isNaN(totalQty) ? 0 : totalQty,
+            usedQty: 0,
+            unit
+          }
+        });
+      });
+    } else if (modalBulkUpload === 'personal') {
+      const idxCode = findColIndex(['codigo', 'code', 'cod'], 0);
+      const idxDni = findColIndex(['dni', 'documento', 'cedula'], 1);
+      const idxName = findColIndex(['nombre', 'operario', 'trabajador'], 2);
+      const idxArea = findColIndex(['especialidad', 'area'], 3);
+      const idxRole = findColIndex(['cargo', 'rol', 'puesto'], 4);
+      const idxGalpon = findColIndex(['galpon', 'destino'], 5);
+
+      const existingWorkerCodes = new Set(
+        masterWorkforce.map((w) => (w.workerCode || '').toUpperCase())
+      );
+
+      dataRows.forEach((cols, i) => {
+        const rowNumber = hasHeader ? i + 2 : i + 1;
+        const workerCode = (cols[idxCode] || '').trim().toUpperCase();
+        const dni = (cols[idxDni] || '').trim();
+        const name = (cols[idxName] || '').trim();
+        const workArea = (cols[idxArea] || '').trim();
+        const role = (cols[idxRole] || '').trim();
+        const rawGalponCol = (cols[idxGalpon] || '').trim();
+
+        let targetGalObj: any = null;
+        if (rawGalponCol) {
+          targetGalObj = allGalponesList.find(
+            (g) =>
+              g.id === rawGalponCol ||
+              g.code.toLowerCase() === rawGalponCol.toLowerCase()
+          );
+        } else if (bulkTargetGalponId) {
+          targetGalObj = allGalponesList.find((g) => g.id === bulkTargetGalponId);
+        }
+
+        const errors: string[] = [];
+        if (!workerCode) errors.push('Falta Código de Operario');
+        if (!name) errors.push('Falta Nombre Completo');
+        if (!workArea) errors.push('Falta Especialidad');
+        if (!role) errors.push('Falta Cargo');
+        if (rawGalponCol && !targetGalObj) {
+          errors.push(`Galpón "${rawGalponCol}" no existe`);
+        }
+
+        let status: 'valid' | 'duplicate' | 'rejected' = 'valid';
+        let statusReason = targetGalObj
+          ? `Válido → ${targetGalObj.sectorName} • ${targetGalObj.code}`
+          : 'Válido (Sin galpón asignado)';
+
+        if (errors.length > 0) {
+          status = 'rejected';
+          statusReason = errors.join(' • ');
+        } else if (existingWorkerCodes.has(workerCode)) {
+          status = 'duplicate';
+          statusReason = `Código [${workerCode}] ya existe en la Planilla de Personal`;
+        } else if (seenCodesInBatch.has(workerCode)) {
+          status = 'duplicate';
+          statusReason = `Código [${workerCode}] duplicado dentro del archivo`;
+        } else {
+          seenCodesInBatch.add(workerCode);
+        }
+
+        allRows.push({
+          rowNumber,
+          status,
+          statusReason,
+          payload: {
+            id: generateId('w'),
+            workerCode,
+            dni,
+            name,
+            workArea,
+            role,
+            sectorId: targetGalObj?.sectorId || '',
+            galponId: targetGalObj?.id || '',
+            active: true
+          }
+        });
+      });
+    }
+
+    return {
+      allRows,
+      validRows: allRows.filter((r) => r.status === 'valid'),
+      duplicateRows: allRows.filter((r) => r.status === 'duplicate'),
+      rejectedRows: allRows.filter((r) => r.status === 'rejected')
+    };
+  }, [
+    modalBulkUpload,
+    bulkRawRows,
+    bulkCsvText,
+    bulkTargetGalponId,
+    masterCatalog,
+    materials,
+    masterWorkforce,
+    allGalponesList
+  ]);
+
+  const handleConfirmBulkUpload = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!modalBulkUpload) return;
+    const validPayloads = bulkImportAnalysis.validRows.map((r) => r.payload);
+    if (validPayloads.length === 0) return;
+
+    if (modalBulkUpload === 'catalogo') {
+      const newTechs = new Set(technologies);
+      validPayloads.forEach((item) => {
+        if (item.technology) newTechs.add(item.technology);
+      });
+      setTechnologies(Array.from(newTechs));
+      setMasterCatalog((prev) => [...prev, ...validPayloads]);
+      recordUserMovement(
+        'REGISTRO',
+        'Carga Masiva',
+        `Importó ${validPayloads.length} actividades válidas al Catálogo Maestro (${bulkImportAnalysis.duplicateRows.length} duplicadas omitidas, ${bulkImportAnalysis.rejectedRows.length} rechazadas)`
+      );
+    } else if (modalBulkUpload === 'materiales') {
+      const newTechs = new Set(technologies);
+      validPayloads.forEach((mat) => {
+        if (mat.technology) newTechs.add(mat.technology);
+      });
+      setTechnologies(Array.from(newTechs));
+      setMaterials((prev) => [...prev, ...validPayloads]);
+      recordUserMovement(
+        'REGISTRO',
+        'Carga Masiva',
+        `Importó ${validPayloads.length} materiales válidos en Control de Materiales (${bulkImportAnalysis.duplicateRows.length} duplicados omitidos, ${bulkImportAnalysis.rejectedRows.length} rechazados)`
+      );
+    } else if (modalBulkUpload === 'personal') {
+      setMasterWorkforce((prev) => [...prev, ...validPayloads]);
+      recordUserMovement(
+        'REGISTRO',
+        'Carga Masiva',
+        `Importó ${validPayloads.length} operarios válidos a la Planilla de Personal (${bulkImportAnalysis.duplicateRows.length} duplicados omitidos, ${bulkImportAnalysis.rejectedRows.length} rechazados)`
+      );
+    }
+
+    resetBulkUploadState();
+  };
+
+  // ==========================================================================
+  // EXPORTACIONES CSV COMPATIBLES CON EXCEL (UTF-8 BOM + BLOB - C-8)
+  // ==========================================================================
   const handleExportGlobalCSV = () => {
-    let csv = 'data:text/csv;charset=utf-8,';
-    csv += 'REPORTE GLOBAL DE PROYECTOS GALPONES AUTOMATIZADOS\n';
-    csv +=
-      'Sector,Galpon,Proveedor,Area,Ubicacion,Sistema,Estructura,Codigo,Actividad,Meta,Unidad,Peso,Ejecutado,Avance %,HH Plan,HH Ejec,Estado\n';
+    const headers = [
+      'Sector',
+      'Galpón',
+      'Proveedor',
+      'Área',
+      'Ubicación',
+      'Sistema',
+      'Estructura',
+      'Código',
+      'Actividad',
+      'Meta',
+      'Unidad',
+      'Peso',
+      'Ejecutado',
+      'Avance %',
+      'HH Plan',
+      'HH Ejec',
+      'Estado'
+    ];
+    const rows: (string | number)[][] = [];
 
     sectors.forEach((sec) => {
       (sec.galpones || []).forEach((gal: any) => {
@@ -2740,15 +4030,42 @@ export default function App() {
             act: any
           ) => {
             const logs = dailyAdvances.filter(
-              (l) => l.galponId === gal.id && l.activityCode === act.code
+              (l) =>
+                l.galponId === gal.id &&
+                ((l.activityId && l.activityId === act.id) ||
+                  l.activityCode === act.code)
             );
-            const execQty = logs.reduce((s, i) => s + Number(i.quantityToday || 0), 0);
-            const execHH = logs.reduce((s, i) => s + Number(i.hoursWorked || 0), 0);
+            const execQty = logs.reduce(
+              (s, i) => s + Number(i.quantityToday || 0),
+              0
+            );
+            const execHH = logs.reduce(
+              (s, i) => s + Number(i.hoursWorked || 0),
+              0
+            );
             const pct =
               act.targetUnits > 0
                 ? Math.min(100, Math.round((execQty / act.targetUnits) * 1000) / 10)
                 : 0;
-            csv += `"${sec.name}","${gal.code}","${gal.technology || ''}","${area.name}","${locType}","${sisName}","${strName}","${act.code}","${act.name}",${act.targetUnits},"${act.unit}",${act.weight},${execQty},${pct}%,${act.plannedHH || 0},${execHH},"${pct >= 100 ? 'Completada' : pct > 0 ? 'En proceso' : 'Pendiente'}"\n`;
+            rows.push([
+              sec.name || '',
+              gal.code || '',
+              gal.technology || 'Sin proveedor',
+              area.name || '',
+              locType || 'Interno',
+              sisName || '-',
+              strName || '',
+              act.code || '',
+              act.name || '',
+              act.targetUnits ?? 0,
+              act.unit || '',
+              act.weight ?? 1,
+              execQty,
+              `${pct}%`,
+              act.plannedHH || 0,
+              execHH,
+              pct >= 100 ? 'Completada' : pct > 0 ? 'En proceso' : 'Pendiente'
+            ]);
           };
 
           if (area.hasSistemas && area.sistemas) {
@@ -2775,13 +4092,172 @@ export default function App() {
       });
     });
 
-    const encodedUri = encodeURI(csv);
-    const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `Reporte_Global_Galpones_${getSystemToday()}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    downloadCsvFile(
+      `Reporte_Global_Galpones_${getSystemToday()}.csv`,
+      headers,
+      rows
+    );
+  };
+
+  const handleExportMaterialsCSV = () => {
+    const headers = [
+      'Sector',
+      'Galpón',
+      'Proveedor',
+      'Código',
+      'Material',
+      'Área',
+      'Sistema',
+      'Estructura',
+      'Stock Inicial',
+      'Consumido',
+      'Disponible',
+      'Unidad',
+      'Estado'
+    ];
+    const visibleMaterials = materials.filter((m) => {
+      if (filterMaterialGalpon !== 'Todos') {
+        if (filterMaterialGalpon === '__UNASSIGNED__') {
+          if (m.galponId) return false;
+        } else if (m.galponId !== filterMaterialGalpon) {
+          return false;
+        }
+      }
+      if (filterMaterialTech !== 'Todas' && m.technology !== filterMaterialTech) {
+        return false;
+      }
+      if (filterMaterialArea !== 'Todas' && m.areaName !== filterMaterialArea) {
+        return false;
+      }
+      if (searchMaterialText.trim()) {
+        const q = searchMaterialText.toLowerCase().trim();
+        const galObj = allGalponesList.find((g) => g.id === m.galponId);
+        const galLabel = galObj
+          ? `${galObj.code} ${galObj.name} ${galObj.sectorName}`.toLowerCase()
+          : 'sin galpón asignado';
+        const matches =
+          (m.code || '').toLowerCase().includes(q) ||
+          (m.name || '').toLowerCase().includes(q) ||
+          (m.structureName || '').toLowerCase().includes(q) ||
+          (m.sistemaName || '').toLowerCase().includes(q) ||
+          (m.areaName || '').toLowerCase().includes(q) ||
+          (m.technology || '').toLowerCase().includes(q) ||
+          galLabel.includes(q);
+        if (!matches) return false;
+      }
+      return true;
+    });
+
+    const rows = visibleMaterials.map((m: any) => {
+      const galInfo = m.galponId
+        ? allGalponesList.find((g) => g.id === m.galponId)
+        : null;
+      const total = Number(m.totalQty) || 0;
+      const used = computeMaterialUsedQty(m, dailyAdvances);
+      const avail = Math.max(0, Math.round((total - used) * 100) / 100);
+      const status =
+        total > 0 && avail / total <= 0.15
+          ? 'Stock Crítico'
+          : avail === 0 && total > 0
+            ? 'Agotado'
+            : 'Disponible';
+      return [
+        galInfo?.sectorName || 'Sin sector asignado',
+        galInfo ? `${galInfo.code} - ${galInfo.name}` : 'Sin galpón asignado',
+        m.technology || 'Sin proveedor',
+        m.code || '',
+        m.name || '',
+        m.areaName || 'Sin área',
+        m.sistemaName || '-',
+        m.structureName || 'Sin estructura',
+        total,
+        used,
+        avail,
+        m.unit || '',
+        status
+      ];
+    });
+
+    downloadCsvFile(
+      `Inventario_Materiales_${getSystemToday()}.csv`,
+      headers,
+      rows
+    );
+  };
+
+  const handleExportAttendanceCSV = () => {
+    const headers = [
+      'Fecha',
+      'Código Operario',
+      'DNI',
+      'Nombre Completo',
+      'Especialidad',
+      'Cargo',
+      'Sector Asignado',
+      'Galpón Asignado',
+      'Estado Asistencia'
+    ];
+    const dayMap = attendanceRecords[attendanceDate] || {};
+    const rows = filteredAttendanceWorkers.map((w: any) => {
+      const secObj = sectors.find((s) => s.id === w.sectorId);
+      const galObj = allGalponesList.find((g) => g.id === w.galponId);
+      const status = dayMap[w.id] || 'Sin marcar';
+      return [
+        attendanceDate,
+        w.workerCode || '',
+        w.dni || '',
+        w.name || '',
+        w.workArea || 'Sin asignar',
+        w.role || 'Sin asignar',
+        secObj?.name || 'Sin sector asignado',
+        galObj ? `${galObj.code} - ${galObj.name}` : 'Sin galpón asignado',
+        status
+      ];
+    });
+
+    downloadCsvFile(
+      `Control_Asistencia_${attendanceDate || getSystemToday()}.csv`,
+      headers,
+      rows
+    );
+  };
+
+  const handleExportMovementsCSV = () => {
+    const headers = [
+      'Fecha y Hora',
+      'Usuario',
+      'Tipo de Movimiento',
+      'Módulo',
+      'Detalle del Movimiento'
+    ];
+    const visibleLogs = auditLogs.filter((log) => {
+      if (filterLogAction !== 'Todas' && log.action !== filterLogAction) return false;
+      if (filterLogModule !== 'Todos' && log.module !== filterLogModule) return false;
+      if (searchLogText.trim()) {
+        const q = searchLogText.toLowerCase().trim();
+        const match =
+          (log.description || '').toLowerCase().includes(q) ||
+          (log.user || '').toLowerCase().includes(q) ||
+          (log.module || '').toLowerCase().includes(q) ||
+          (log.action || '').toLowerCase().includes(q);
+        if (!match) return false;
+      }
+      return true;
+    });
+
+    const rows = visibleLogs.map((log: any) => [
+      log.timestamp || '',
+      log.user || '',
+      log.action || '',
+      log.module || '',
+      log.description || ''
+    ]);
+
+    downloadCsvFile(
+      `Historial_Movimientos_${getSystemToday()}.csv`,
+      headers,
+      rows
+    );
   };
 
   // Listas dinámicas en cascada para el Modal de Avance Diario
@@ -2853,7 +4329,7 @@ export default function App() {
             <Building2 className="w-3.5 h-3.5 text-[#0f6b38]" />
             <span>
               {currentGalpon
-                ? `${currentGalpon.code} - ${currentGalpon.name} (${currentGalpon.technology || 'Big Herdsman'})`
+                ? `${currentGalpon.code} - ${currentGalpon.name} (${currentGalpon.technology || 'Sin proveedor'})`
                 : 'Sin Galpón seleccionado'}
             </span>
           </div>
@@ -3187,7 +4663,7 @@ export default function App() {
             </span>
             {currentGalpon && (
               <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-[#0f6b38] border border-emerald-200 font-bold text-[11px]">
-                Proveedor: {currentGalpon.technology || 'Big Herdsman'}
+                Proveedor: {currentGalpon.technology || 'Sin proveedor'}
               </span>
             )}
           </div>
@@ -3710,11 +5186,19 @@ export default function App() {
                               {act?.name || 'Actividad'}
                             </span>
                             <span className="text-xs font-mono font-black text-[#0f6b38]">
-                              +{adv.quantityToday} {act?.unit || 'Und'}
+                              +{adv.quantityToday} {act?.unit || ''}
                             </span>
                             {adv.hoursWorked > 0 && (
                               <span className="text-[11px] px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-bold">
                                 {adv.hoursWorked} HH
+                              </span>
+                            )}
+                            {adv.sharedGroupId && (
+                              <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 font-bold">
+                                Biproyecto ({adv.splitMode === '50_50' ? '50/50' : '100% Ambos'}
+                                {adv.sharedWithGalponCode
+                                  ? ` • ${adv.sharedWithGalponCode}`
+                                  : ''})
                               </span>
                             )}
                           </div>
@@ -3758,7 +5242,7 @@ export default function App() {
                             </button>
                             <button
                               type="button"
-                              onClick={() => handleDeleteAdvance(adv.id)}
+                              onClick={() => requestDeleteAdvance(adv.id)}
                               className="p-2 rounded-lg text-rose-600 hover:bg-rose-50 transition"
                               title="Eliminar Avance Diario (Revierte consumo de materiales)"
                             >
@@ -3838,6 +5322,15 @@ export default function App() {
                 >
                   <Check className="w-3.5 h-3.5" />
                   <span>Marcar Todos Asistió</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleExportAttendanceCSV}
+                  className="px-3 py-1.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold flex items-center gap-1"
+                >
+                  <Download className="w-3.5 h-3.5 text-[#0f6b38]" />
+                  <span>Exportar Asistencia (.CSV)</span>
                 </button>
               </div>
             </div>
@@ -4078,7 +5571,7 @@ export default function App() {
                         </button>
 
                         <button
-                          onClick={() => handleDeleteSector(sec.id)}
+                          onClick={() => requestDeleteSector(sec.id)}
                           className="px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold flex items-center gap-1"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -4121,7 +5614,7 @@ export default function App() {
                                   {gal.code} - {gal.name}
                                 </span>
                                 <span className="px-2 py-0.5 rounded bg-emerald-100 text-[#0f6b38] font-bold text-[10px]">
-                                  Plantilla: {gal.technology || 'Big Herdsman'}
+                                  Plantilla: {gal.technology || 'Sin proveedor'}
                                 </span>
                               </div>
                               <p className="text-xs text-slate-500 mt-1">
@@ -4151,8 +5644,7 @@ export default function App() {
                                       : '',
                                     startDate: gal.startDate || getSystemToday(),
                                     endDate: gal.endDate || getSystemToday(),
-                                    technology:
-                                      gal.technology || technologies[0] || 'Big Herdsman'
+                                    technology: gal.technology || ''
                                   });
                                   setModalEditGalpon(true);
                                 }}
@@ -4162,7 +5654,7 @@ export default function App() {
                                 <Edit2 className="w-3.5 h-3.5" />
                               </button>
                               <button
-                                onClick={() => handleDeleteGalpon(sec.id, gal.id)}
+                                onClick={() => requestDeleteGalpon(sec.id, gal.id)}
                                 className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
                                 title="Eliminar Galpón"
                               >
@@ -4177,7 +5669,7 @@ export default function App() {
                               className="text-[11px] font-bold text-[#0f6b38] hover:underline flex items-center gap-1"
                             >
                               <RefreshCw className="w-3 h-3" />
-                              <span>Sincronizar con Plantilla ({gal.technology})</span>
+                              <span>Sincronizar con Plantilla ({gal.technology || 'Sin proveedor'})</span>
                             </button>
                             <button
                               onClick={() => {
@@ -4224,7 +5716,13 @@ export default function App() {
                   <span>Gestionar Plantillas / Proveedores</span>
                 </button>
                 <button
-                  onClick={() => setModalBulkUpload('catalogo')}
+                  onClick={() => {
+                    setBulkCsvText('');
+                    setBulkRawRows([]);
+                    setBulkFileName('');
+                    setBulkTargetGalponId('');
+                    setModalBulkUpload('catalogo');
+                  }}
                   className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1.5"
                 >
                   <UploadCloud className="w-4 h-4 text-[#0f6b38]" />
@@ -4329,7 +5827,7 @@ export default function App() {
                                   <Edit2 className="w-3.5 h-3.5" />
                                 </button>
                                 <button
-                                  onClick={() => handleDeleteCatalogItem(item.id)}
+                                  onClick={() => requestDeleteCatalogItem(item.id)}
                                   className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
                                   title="Eliminar actividad maestra"
                                 >
@@ -4516,7 +6014,7 @@ export default function App() {
                                 <Edit2 className="w-3.5 h-3.5" />
                               </button>
                               <button
-                                onClick={() => handleDeleteGalponActivity(act.id)}
+                                onClick={() => requestDeleteGalponActivity(act.id)}
                                 className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
                                 title="Eliminar actividad"
                               >
@@ -4548,13 +6046,27 @@ export default function App() {
                   Estructura correspondientes
                 </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
-                  onClick={() => setModalBulkUpload('materiales')}
+                  type="button"
+                  onClick={handleExportMaterialsCSV}
+                  className="px-3 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 text-xs font-bold flex items-center gap-1.5"
+                >
+                  <Download className="w-4 h-4 text-[#0f6b38]" />
+                  <span>Exportar Materiales (.CSV)</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setBulkCsvText('');
+                    setBulkRawRows([]);
+                    setBulkFileName('');
+                    setBulkTargetGalponId(currentGalpon?.id || '');
+                    setModalBulkUpload('materiales');
+                  }}
                   className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1.5"
                 >
                   <UploadCloud className="w-4 h-4 text-[#0f6b38]" />
-                  <span>Carga Masiva Excel</span>
+                  <span>Carga Masiva Excel/CSV</span>
                 </button>
                 <button
                   onClick={openNewMaterialModal}
@@ -4738,8 +6250,12 @@ export default function App() {
                           return true;
                         })
                         .map((mat) => {
+                          const computedUsed = computeMaterialUsedQty(
+                            mat,
+                            dailyAdvances
+                          );
                           const balance =
-                            Number(mat.totalQty || 0) - Number(mat.usedQty || 0);
+                            Number(mat.totalQty || 0) - computedUsed;
                           const assignedGalpon = mat.galponId
                             ? allGalponesList.find((g) => g.id === mat.galponId)
                             : null;
@@ -4783,7 +6299,7 @@ export default function App() {
                                 {mat.totalQty} {mat.unit}
                               </td>
                               <td className="py-2.5 px-2 text-right font-mono text-amber-700 font-bold">
-                                {mat.usedQty || 0} {mat.unit}
+                                {computedUsed} {mat.unit}
                               </td>
                               <td className="py-2.5 px-2 text-right font-mono font-black text-[#0f6b38]">
                                 {balance} {mat.unit}
@@ -4798,7 +6314,7 @@ export default function App() {
                                     <Edit2 className="w-3.5 h-3.5" />
                                   </button>
                                   <button
-                                    onClick={() => handleDeleteMaterial(mat.id)}
+                                    onClick={() => requestDeleteMaterial(mat.id)}
                                     className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
                                     title="Eliminar material"
                                   >
@@ -4834,11 +6350,17 @@ export default function App() {
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => setModalBulkUpload('personal')}
+                  onClick={() => {
+                    setBulkCsvText('');
+                    setBulkRawRows([]);
+                    setBulkFileName('');
+                    setBulkTargetGalponId('');
+                    setModalBulkUpload('personal');
+                  }}
                   className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1.5"
                 >
                   <UploadCloud className="w-4 h-4 text-[#0f6b38]" />
-                  <span>Carga Masiva Excel</span>
+                  <span>Carga Masiva Excel/CSV</span>
                 </button>
                 <button
                   onClick={() => {
@@ -4897,8 +6419,9 @@ export default function App() {
                               .includes(searchWorkerText.toLowerCase())
                         )
                         .map((worker) => {
-                          const assignedSector =
-                            sectors.find((s) => s.id === worker.sectorId) || sectors[0];
+                          const assignedSector = sectors.find(
+                            (s) => s.id === worker.sectorId
+                          );
                           const availableGalpones = assignedSector
                             ? assignedSector.galpones || []
                             : [];
@@ -4924,7 +6447,7 @@ export default function App() {
                               </td>
                               <td className="py-2.5 px-3">
                                 <select
-                                  value={worker.workArea || 'Jaulas'}
+                                  value={worker.workArea || ''}
                                   onChange={(e) =>
                                     handleWorkerFieldChange(
                                       worker.id,
@@ -4934,6 +6457,7 @@ export default function App() {
                                   }
                                   className="px-2 py-1 border border-slate-300 rounded font-bold bg-slate-50"
                                 >
+                                  <option value="">Sin especialidad</option>
                                   {WORK_SPECIALTIES.map((sp) => (
                                     <option key={sp} value={sp}>
                                       {sp}
@@ -4941,10 +6465,10 @@ export default function App() {
                                   ))}
                                 </select>
                               </td>
-                              <td className="py-2.5 px-3">{worker.role}</td>
+                              <td className="py-2.5 px-3">{worker.role || 'Sin cargo'}</td>
                               <td className="py-2.5 px-3">
                                 <select
-                                  value={worker.sectorId}
+                                  value={worker.sectorId || ''}
                                   onChange={(e) =>
                                     handleWorkerSectorChange(worker.id, e.target.value)
                                   }
@@ -4960,7 +6484,7 @@ export default function App() {
                               </td>
                               <td className="py-2.5 px-3">
                                 <select
-                                  value={worker.galponId}
+                                  value={worker.galponId || ''}
                                   onChange={(e) =>
                                     handleWorkerFieldChange(
                                       worker.id,
@@ -4980,7 +6504,7 @@ export default function App() {
                               </td>
                               <td className="py-2.5 px-3 text-center">
                                 <button
-                                  onClick={() => handleDeleteWorker(worker.id)}
+                                  onClick={() => requestDeleteWorker(worker.id)}
                                   className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
                                   title="Eliminar operario"
                                 >
@@ -5051,6 +6575,14 @@ export default function App() {
                     className="bg-white px-2.5 py-1 rounded-lg border border-slate-300 font-bold text-[#0f6b38] w-40"
                   />
                 </div>
+                <button
+                  type="button"
+                  onClick={handleExportMovementsCSV}
+                  className="px-3.5 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] text-white font-bold flex items-center gap-1.5"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Exportar Bitácora (.CSV)</span>
+                </button>
               </div>
             </div>
 
@@ -5345,7 +6877,7 @@ export default function App() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleDeleteTemplateProvider(tech)}
+                          onClick={() => requestDeleteTemplateProvider(tech)}
                           className="p-1.5 rounded hover:bg-rose-100 text-rose-600"
                           title="Eliminar plantilla"
                         >
@@ -6846,7 +8378,7 @@ export default function App() {
                 >
                   <option value="">-- Seleccionar Actividad --</option>
                   {cascadeAdvancesList.map((a) => (
-                    <option key={a.code} value={a.code}>
+                    <option key={a.id} value={a.code}>
                       [{a.code}] {a.structureName} → {a.name} (Meta: {a.targetUnits}{' '}
                       {a.unit} | Actual: {a.accumulatedQty})
                     </option>
@@ -6929,6 +8461,134 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Trabajo Biproyecto (C-2): Compartir avance entre dos galpones */}
+              {allGalponesList.filter((g) => g.id !== currentGalpon?.id).length > 0 && (
+                <div className="p-3.5 rounded-xl border border-amber-200 bg-amber-50/60 space-y-2.5">
+                  <label className="flex items-center justify-between gap-2 cursor-pointer">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={formAdvance.sharedAcrossTwoGalpones}
+                        onChange={(e) =>
+                          setFormAdvance({
+                            ...formAdvance,
+                            sharedAcrossTwoGalpones: e.target.checked,
+                            secondGalponId: e.target.checked
+                              ? formAdvance.secondGalponId
+                              : ''
+                          })
+                        }
+                        className="accent-[#0f6b38] w-4 h-4 rounded"
+                      />
+                      <span className="font-extrabold text-slate-900">
+                        Trabajo Biproyecto (Compartir este avance entre dos galpones)
+                      </span>
+                    </div>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-200 text-amber-900">
+                      C-2
+                    </span>
+                  </label>
+
+                  {formAdvance.sharedAcrossTwoGalpones && (
+                    <div className="space-y-2.5 pt-1 border-t border-amber-200/80">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <div>
+                          <label className="block font-bold text-slate-700 mb-1">
+                            Segundo Galpón Compartido: *
+                          </label>
+                          <select
+                            required={formAdvance.sharedAcrossTwoGalpones}
+                            value={formAdvance.secondGalponId}
+                            onChange={(e) =>
+                              setFormAdvance({
+                                ...formAdvance,
+                                secondGalponId: e.target.value
+                              })
+                            }
+                            className="w-full px-2.5 py-2 rounded-xl border border-amber-300 bg-white font-bold text-slate-800"
+                          >
+                            <option value="">-- Seleccionar 2do Galpón --</option>
+                            {allGalponesList
+                              .filter((g) => g.id !== currentGalpon?.id)
+                              .map((g) => (
+                                <option key={g.id} value={g.id}>
+                                  {g.sectorName} • {g.code} - {g.name}
+                                </option>
+                              ))}
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block font-bold text-slate-700 mb-1">
+                            Modo de Reparto del Avance y HH: *
+                          </label>
+                          <select
+                            value={formAdvance.splitMode}
+                            onChange={(e) =>
+                              setFormAdvance({
+                                ...formAdvance,
+                                splitMode: e.target.value as '50_50' | '100_both'
+                              })
+                            }
+                            className="w-full px-2.5 py-2 rounded-xl border border-amber-300 bg-white font-bold text-slate-800"
+                          >
+                            <option value="50_50">
+                              50% / 50% (Dividir cantidad y HH entre ambos)
+                            </option>
+                            <option value="100_both">
+                              100% en Ambos (Aplicar total a cada galpón)
+                            </option>
+                          </select>
+                        </div>
+                      </div>
+
+                      {formAdvance.secondGalponId && (
+                        <div className="p-2.5 rounded-lg bg-white border border-amber-200 text-[11px] space-y-1">
+                          <p className="font-extrabold text-amber-900">
+                            Vista previa de distribución por galpón:
+                          </p>
+                          {(() => {
+                            const rawQ = Number(formAdvance.quantityToday) || 0;
+                            const rawH = Number(formAdvance.hoursWorked) || 0;
+                            const f = formAdvance.splitMode === '50_50' ? 0.5 : 1;
+                            const perGalQ = Math.round(rawQ * f * 100) / 100;
+                            const perGalH = Math.round(rawH * f * 100) / 100;
+                            const secGal = allGalponesList.find(
+                              (g) => g.id === formAdvance.secondGalponId
+                            );
+                            const unitStr = selectedAdvanceActivityObj?.unit || '';
+                            return (
+                              <div className="grid grid-cols-2 gap-2 pt-0.5">
+                                <div className="p-1.5 rounded bg-emerald-50 border border-emerald-200">
+                                  <span className="font-bold text-[#0f6b38] block">
+                                    1. {currentGalpon?.code}:
+                                  </span>
+                                  <span className="font-mono font-bold text-slate-800">
+                                    +{perGalQ} {unitStr} • {perGalH} HH
+                                  </span>
+                                </div>
+                                <div className="p-1.5 rounded bg-amber-50 border border-amber-200">
+                                  <span className="font-bold text-amber-900 block">
+                                    2. {secGal?.code || '2do Galpón'}:
+                                  </span>
+                                  <span className="font-mono font-bold text-slate-800">
+                                    +{perGalQ} {unitStr} • {perGalH} HH
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })()}
+                          <p className="text-[10px] text-slate-500">
+                            El consumo de materiales se registra con trazabilidad por ID único
+                            sin duplicar descuentos en el inventario.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Consumo Manual Guiado de Materiales Vinculados por ID Único */}
               {selectedAdvanceActivityObj &&
                 selectedAdvanceActivityObj.linkedMaterials?.length > 0 && (
@@ -7004,7 +8664,7 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: NUEVO OPERARIO */}
+      {/* MODAL: NUEVO OPERARIO (SIN VALORES PREDETERMINADOS FIJOS - C-7) */}
       {modalNewWorker && (
         <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-md border border-slate-200 shadow-2xl">
@@ -7076,17 +8736,69 @@ export default function App() {
                   </select>
                 </div>
                 <div>
-                  <label className="block font-bold text-slate-700 mb-1">Cargo:</label>
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Cargo: *
+                  </label>
                   <input
                     type="text"
+                    required
+                    placeholder="Ej. Operario Montajista"
                     value={formWorker.role}
                     onChange={(e) =>
                       setFormWorker({ ...formWorker, role: e.target.value })
                     }
-                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                   />
                 </div>
               </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Sector (Opcional):
+                  </label>
+                  <select
+                    value={formWorker.sectorId}
+                    onChange={(e) =>
+                      setFormWorker({
+                        ...formWorker,
+                        sectorId: e.target.value,
+                        galponId: ''
+                      })
+                    }
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50"
+                  >
+                    <option value="">-- Sin sector asignado --</option>
+                    {sectors.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Galpón (Opcional):
+                  </label>
+                  <select
+                    value={formWorker.galponId}
+                    onChange={(e) =>
+                      setFormWorker({ ...formWorker, galponId: e.target.value })
+                    }
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50"
+                  >
+                    <option value="">-- Sin galpón asignado --</option>
+                    {(
+                      sectors.find((s) => s.id === formWorker.sectorId)?.galpones || []
+                    ).map((g: any) => (
+                      <option key={g.id} value={g.id}>
+                        {g.code} - {g.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
               <div className="pt-3 flex justify-end gap-2">
                 <button
                   type="button"
@@ -7107,45 +8819,436 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: CARGA MASIVA EXCEL / CSV */}
+      {/* MODAL: CARGA MASIVA EXCEL (.XLSX / .CSV / PEGADO) CON VALIDACIÓN Y VISTA PREVIA (C-6) */}
       {modalBulkUpload && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl">
-            <h3 className="text-base font-black text-slate-900 mb-1">
-              Carga Masiva desde Excel / CSV ({modalBulkUpload.toUpperCase()})
-            </h3>
-            <p className="text-xs text-slate-500 mb-3">
-              {modalBulkUpload === 'catalogo' &&
-                'Formato de columnas: Proveedor, Codigo, Area, Ubicacion, Sistema, Estructura, Actividad, Meta, Unidad, Peso, HH'}
-              {modalBulkUpload === 'materiales' &&
-                'Formato de columnas: Proveedor, Codigo, Material, Area, Sistema, Estructura, CantidadTotal, Unidad'}
-              {modalBulkUpload === 'personal' &&
-                'Formato de columnas: Codigo, DNI, Nombre, Especialidad, Cargo'}
-            </p>
-            <form onSubmit={handleConfirmBulkUpload} className="space-y-3 text-xs">
-              <textarea
-                rows={6}
-                placeholder="Pega aquí las filas copiadas desde tu Excel o CSV..."
-                value={bulkCsvText}
-                onChange={(e) => setBulkCsvText(e.target.value)}
-                className="w-full p-3 border border-slate-300 rounded-xl font-mono text-xs bg-slate-50"
-              />
-              <div className="flex justify-end gap-2">
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-4xl border border-slate-200 shadow-2xl my-8 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-black text-slate-900">
+                  Importación Masiva desde Archivo Excel (.XLSX), CSV o Pegado Directo (
+                  {modalBulkUpload === 'catalogo'
+                    ? 'CATÁLOGO MAESTRO'
+                    : modalBulkUpload === 'materiales'
+                      ? 'CONTROL DE MATERIALES'
+                      : 'PLANILLA DE PERSONAL'}
+                  )
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {modalBulkUpload === 'catalogo' &&
+                    'Columnas requeridas: Proveedor, Codigo, Area, Ubicacion, Sistema (si aplica), Estructura, Actividad, Meta, Unidad, Peso, HH'}
+                  {modalBulkUpload === 'materiales' &&
+                    'Columnas requeridas: Proveedor, Codigo, Material, Area, Sistema (si aplica), Estructura, CantidadTotal, Unidad, Galpon (o elegir galpón destino abajo)'}
+                  {modalBulkUpload === 'personal' &&
+                    'Columnas requeridas: Codigo, DNI, Nombre, Especialidad, Cargo, Galpon (opcional)'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={resetBulkUploadState}
+                className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmBulkUpload} className="space-y-4 text-xs">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {/* Selección directa de archivo .xlsx / .xls / .csv */}
+                <div className="p-3.5 rounded-xl border-2 border-dashed border-emerald-300 bg-emerald-50/40 flex flex-col justify-between gap-2">
+                  <div>
+                    <label className="font-extrabold text-[#0f6b38] block mb-1">
+                      1. Seleccionar Archivo Excel (.xlsx, .xls) o CSV (.csv):
+                    </label>
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls,.csv"
+                      onChange={handleBulkFileSelect}
+                      className="block w-full text-xs text-slate-700 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-bold file:bg-[#0f6b38] file:text-white hover:file:bg-[#0a4e28] cursor-pointer"
+                    />
+                  </div>
+                  {bulkFileName && (
+                    <div className="flex items-center justify-between bg-white px-2.5 py-1.5 rounded-lg border border-emerald-200">
+                      <span className="font-bold text-slate-700 truncate">
+                        Archivo cargado: {bulkFileName} ({bulkRawRows.length} filas)
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setBulkRawRows([]);
+                          setBulkFileName('');
+                        }}
+                        className="text-rose-600 font-bold hover:underline ml-2"
+                      >
+                        Quitar archivo
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Selector de Galpón Destino para Materiales o Personal cuando el archivo no trae columna Galpón */}
+                {(modalBulkUpload === 'materiales' ||
+                  modalBulkUpload === 'personal') && (
+                  <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50 flex flex-col justify-between">
+                    <div>
+                      <label className="font-bold text-slate-800 block mb-1">
+                        Galpón Destino por Defecto para el Lote{' '}
+                        {modalBulkUpload === 'materiales' ? '*' : '(Opcional)'}:
+                      </label>
+                      <select
+                        value={bulkTargetGalponId}
+                        onChange={(e) => setBulkTargetGalponId(e.target.value)}
+                        className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white font-bold text-[#0f6b38]"
+                      >
+                        <option value="">
+                          -- Identificar por columna «Galpon» del archivo o seleccionar aquí --
+                        </option>
+                        {allGalponesList.map((g) => (
+                          <option key={g.id} value={g.id}>
+                            {g.sectorName} • {g.code} - {g.name} ({g.technology || 'Sin proveedor'})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1.5">
+                      {modalBulkUpload === 'materiales'
+                        ? 'Para materiales, se valida que el Área, Sistema y Estructura existan realmente en el galpón destino.'
+                        : 'Si no se indica galpón, el operario quedará registrado como Sin galpón asignado.'}
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Opción alternativa: pegar celdas directamente desde Excel o CSV */}
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">
+                  2. O pega aquí directamente las filas copiadas desde Excel / CSV:
+                </label>
+                <textarea
+                  rows={4}
+                  placeholder="Pega aquí las filas copiadas desde tu hoja de cálculo Excel o CSV..."
+                  value={bulkCsvText}
+                  onChange={(e) => {
+                    setBulkCsvText(e.target.value);
+                    if (e.target.value.trim()) {
+                      setBulkRawRows([]);
+                      setBulkFileName('');
+                    }
+                  }}
+                  className="w-full p-3 border border-slate-300 rounded-xl font-mono text-xs bg-slate-50"
+                />
+              </div>
+
+              {/* Resumen de validación: Válidas, Duplicadas y Rechazadas */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 text-center">
+                  <span className="text-[10px] font-bold uppercase text-slate-500 block">
+                    Filas Detectadas
+                  </span>
+                  <span className="text-lg font-black text-slate-900 font-mono">
+                    {bulkImportAnalysis.allRows.length}
+                  </span>
+                </div>
+                <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-center">
+                  <span className="text-[10px] font-bold uppercase text-[#0f6b38] block">
+                    Filas Válidas
+                  </span>
+                  <span className="text-lg font-black text-[#0f6b38] font-mono">
+                    {bulkImportAnalysis.validRows.length}
+                  </span>
+                </div>
+                <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-center">
+                  <span className="text-[10px] font-bold uppercase text-amber-800 block">
+                    Duplicadas (Omitidas)
+                  </span>
+                  <span className="text-lg font-black text-amber-800 font-mono">
+                    {bulkImportAnalysis.duplicateRows.length}
+                  </span>
+                </div>
+                <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-center">
+                  <span className="text-[10px] font-bold uppercase text-rose-700 block">
+                    Rechazadas (Con Error)
+                  </span>
+                  <span className="text-lg font-black text-rose-700 font-mono">
+                    {bulkImportAnalysis.rejectedRows.length}
+                  </span>
+                </div>
+              </div>
+
+              {/* Tabla de Vista Previa antes de importar */}
+              {bulkImportAnalysis.allRows.length > 0 && (
+                <div className="border border-slate-200 rounded-xl overflow-hidden">
+                  <div className="bg-slate-100 px-3 py-2 border-b border-slate-200 font-extrabold text-slate-700 flex items-center justify-between">
+                    <span>Vista Previa de Validación Antes de Importar</span>
+                    <span className="text-[11px] text-slate-500 font-normal">
+                      Solo se guardarán las filas marcadas como VÁLIDA
+                    </span>
+                  </div>
+                  <div className="max-h-56 overflow-y-auto overflow-x-auto">
+                    <table className="w-full text-left text-[11px]">
+                      <thead className="bg-slate-50 text-slate-600 uppercase border-b border-slate-200">
+                        <tr>
+                          <th className="py-2 px-2.5">Fila</th>
+                          <th className="py-2 px-2.5">Estado</th>
+                          <th className="py-2 px-2.5">Código</th>
+                          <th className="py-2 px-2.5">Descripción / Nombre</th>
+                          <th className="py-2 px-2.5">Relación / Destino</th>
+                          <th className="py-2 px-2.5">Detalle de Validación</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200">
+                        {bulkImportAnalysis.allRows.map((row) => (
+                          <tr key={row.rowNumber} className="hover:bg-slate-50">
+                            <td className="py-1.5 px-2.5 font-mono text-slate-500">
+                              #{row.rowNumber}
+                            </td>
+                            <td className="py-1.5 px-2.5">
+                              <span
+                                className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                                  row.status === 'valid'
+                                    ? 'bg-emerald-100 text-[#0f6b38]'
+                                    : row.status === 'duplicate'
+                                      ? 'bg-amber-100 text-amber-800'
+                                      : 'bg-rose-100 text-rose-700'
+                                }`}
+                              >
+                                {row.status === 'valid'
+                                  ? 'VÁLIDA'
+                                  : row.status === 'duplicate'
+                                    ? 'DUPLICADA'
+                                    : 'RECHAZADA'}
+                              </span>
+                            </td>
+                            <td className="py-1.5 px-2.5 font-mono font-bold">
+                              {row.payload.code || row.payload.workerCode || '-'}
+                            </td>
+                            <td className="py-1.5 px-2.5 font-bold text-slate-900">
+                              {row.payload.name || '-'}
+                            </td>
+                            <td className="py-1.5 px-2.5 text-slate-600">
+                              {modalBulkUpload === 'catalogo' &&
+                                `${row.payload.technology || '-'} • ${row.payload.areaName || '-'} • ${row.payload.structureName || '-'}`}
+                              {modalBulkUpload === 'materiales' &&
+                                `${row.galponLabel || '-'} • ${row.payload.areaName || '-'} • ${row.payload.structureName || '-'}`}
+                              {modalBulkUpload === 'personal' &&
+                                `${row.payload.workArea || '-'} • ${row.payload.role || '-'}`}
+                            </td>
+                            <td className="py-1.5 px-2.5 text-slate-600">
+                              {row.statusReason}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setModalBulkUpload(null)}
-                  className="px-4 py-2 font-bold text-slate-500"
+                  onClick={resetBulkUploadState}
+                  className="px-4 py-2 rounded-xl border border-slate-300 font-bold text-slate-600 hover:bg-slate-100"
                 >
-                  Cancelar
+                  Cancelar Importación
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 rounded-xl bg-[#0f6b38] text-white font-bold"
+                  disabled={bulkImportAnalysis.validRows.length === 0}
+                  className="px-5 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold"
                 >
-                  Importar Filas
+                  Importar {bulkImportAnalysis.validRows.length} Fila(s) Válida(s)
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: CONFIRMACIÓN SEGURA DE ELIMINACIÓN (SECTORES, GALPONES, ACTIVIDADES, MATERIALES, OPERARIOS, AVANCES, CATÁLOGO) */}
+      {deleteConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="p-2.5 rounded-xl bg-rose-100 text-rose-700 shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-black text-slate-900">
+                  Confirmar eliminación de{' '}
+                  {deleteConfirmModal.type === 'sector'
+                    ? 'Sector'
+                    : deleteConfirmModal.type === 'galpon'
+                      ? 'Galpón'
+                      : deleteConfirmModal.type === 'activity'
+                        ? 'Actividad'
+                        : deleteConfirmModal.type === 'material'
+                          ? 'Material'
+                          : deleteConfirmModal.type === 'worker'
+                            ? 'Operario'
+                            : deleteConfirmModal.type === 'advance'
+                              ? 'Avance Diario'
+                              : deleteConfirmModal.type === 'catalog_item'
+                                ? 'Actividad Maestra'
+                                : 'Plantilla / Proveedor'}
+                  : [{deleteConfirmModal.code}] {deleteConfirmModal.name}
+                </h3>
+                <p className="text-xs text-slate-500 mt-1">
+                  Verifica el impacto de esta acción antes de eliminar definitivamente el
+                  registro.
+                </p>
+              </div>
+            </div>
+
+            {deleteConfirmModal.extraDetails && (
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-700 font-medium">
+                {deleteConfirmModal.extraDetails}
+              </div>
+            )}
+
+            {deleteConfirmModal.stats && (
+              <div className="bg-slate-50 rounded-xl p-3.5 border border-slate-200 text-xs space-y-1.5">
+                <p className="font-extrabold text-slate-700 uppercase text-[11px]">
+                  Resumen de registros relacionados:
+                </p>
+                {deleteConfirmModal.stats.galpones !== undefined && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-600">Galpones relacionados:</span>
+                    <span className="font-mono font-bold text-slate-900">
+                      {deleteConfirmModal.stats.galpones}
+                    </span>
+                  </div>
+                )}
+                {deleteConfirmModal.stats.activities !== undefined && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-600">Actividades registradas:</span>
+                    <span className="font-mono font-bold text-slate-900">
+                      {deleteConfirmModal.stats.activities}
+                    </span>
+                  </div>
+                )}
+                {deleteConfirmModal.stats.advances !== undefined && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-600">Partes de avance diario:</span>
+                    <span className="font-mono font-bold text-slate-900">
+                      {deleteConfirmModal.stats.advances}
+                    </span>
+                  </div>
+                )}
+                {deleteConfirmModal.stats.materials !== undefined && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-600">Materiales vinculados:</span>
+                    <span className="font-mono font-bold text-slate-900">
+                      {deleteConfirmModal.stats.materials}
+                    </span>
+                  </div>
+                )}
+                {deleteConfirmModal.stats.workers !== undefined && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-600">Operarios asignados:</span>
+                    <span className="font-mono font-bold text-slate-900">
+                      {deleteConfirmModal.stats.workers}
+                    </span>
+                  </div>
+                )}
+                {deleteConfirmModal.stats.attendanceDays !== undefined && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-600">Días de asistencia registrados:</span>
+                    <span className="font-mono font-bold text-slate-900">
+                      {deleteConfirmModal.stats.attendanceDays}
+                    </span>
+                  </div>
+                )}
+                {deleteConfirmModal.stats.catalogItems !== undefined && (
+                  <div className="flex justify-between">
+                    <span className="text-slate-600">
+                      Actividades en el Catálogo Maestro:
+                    </span>
+                    <span className="font-mono font-bold text-slate-900">
+                      {deleteConfirmModal.stats.catalogItems}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {(deleteConfirmModal.type === 'sector' ||
+              deleteConfirmModal.type === 'galpon') &&
+              ((deleteConfirmModal.stats?.materials || 0) > 0 ||
+                (deleteConfirmModal.stats?.workers || 0) > 0 ||
+                (deleteConfirmModal.stats?.advances || 0) > 0) && (
+                <div className="space-y-2 text-xs">
+                  <p className="font-bold text-slate-700">
+                    ¿Cómo deseas manejar los materiales y registros vinculados?
+                  </p>
+                  <label className="flex items-start gap-2.5 p-3 rounded-xl border border-slate-200 bg-slate-50 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="deleteStrategyMode"
+                      checked={deleteConfirmModal.mode === 'preserve_unassign'}
+                      onChange={() =>
+                        setDeleteConfirmModal({
+                          ...deleteConfirmModal,
+                          mode: 'preserve_unassign'
+                        })
+                      }
+                      className="mt-0.5 accent-[#0f6b38]"
+                    />
+                    <div>
+                      <span className="font-bold text-slate-900 block">
+                        Conservar materiales y operarios como «Sin galpón asignado» (Recomendado)
+                      </span>
+                      <span className="text-slate-500 text-[11px]">
+                        Los materiales y operarios se conservan en el inventario/planilla sin
+                        galpón asignado, y se limpian los avances del galpón eliminado
+                        recalculando el stock.
+                      </span>
+                    </div>
+                  </label>
+
+                  <label className="flex items-start gap-2.5 p-3 rounded-xl border border-rose-200 bg-rose-50/40 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="deleteStrategyMode"
+                      checked={deleteConfirmModal.mode === 'cascade_delete'}
+                      onChange={() =>
+                        setDeleteConfirmModal({
+                          ...deleteConfirmModal,
+                          mode: 'cascade_delete'
+                        })
+                      }
+                      className="mt-0.5 accent-rose-600"
+                    />
+                    <div>
+                      <span className="font-bold text-rose-900 block">
+                        Eliminar también los materiales y avances vinculados
+                      </span>
+                      <span className="text-rose-700 text-[11px]">
+                        Elimina el {deleteConfirmModal.type === 'sector' ? 'sector' : 'galpón'}{' '}
+                        junto con sus partes diarios y materiales asignados, y desvincula a los
+                        operarios.
+                      </span>
+                    </div>
+                  </label>
+                </div>
+              )}
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setDeleteConfirmModal(null)}
+                className="px-4 py-2 rounded-xl border border-slate-300 font-bold text-xs text-slate-600 hover:bg-slate-100"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeleteEntity}
+                className="px-5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs"
+              >
+                Confirmar Eliminación
+              </button>
+            </div>
           </div>
         </div>
       )}
