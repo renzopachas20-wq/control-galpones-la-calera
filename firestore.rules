@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Regla base de seguridad por defecto (Zero-Trust): denegar todo acceso no autorizado.
+    // Se habilitarán progresivamente las reglas por rol y colección en las Fases 4.2, 4.3 y 4.4.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

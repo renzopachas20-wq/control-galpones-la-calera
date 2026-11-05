@@ -1,0 +1,544 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Perfil de usuario del sistema Control Galpones La Calera con rol y alcance de sectores/galpones.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "UID único de Firebase Authentication",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Correo electrónico del usuario",
+          "maxLength": 254
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Nombre completo del usuario",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "role": {
+          "type": "string",
+          "description": "Rol oficial dentro del sistema",
+          "enum": [
+            "Administrador",
+            "Jefe de proyecto",
+            "Supervisor",
+            "Auxiliar",
+            "Almacén",
+            "Solo lectura"
+          ]
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Indica si el usuario está habilitado para operar el sistema"
+        },
+        "assignedSectorIds": {
+          "type": "array",
+          "description": "Lista de IDs de sectores asignados al usuario"
+        },
+        "assignedGalponIds": {
+          "type": "array",
+          "description": "Lista de IDs de galpones asignados al usuario"
+        },
+        "createdBy": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "updatedBy": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "lastLoginAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Fecha de creación del registro"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Fecha de última actualización"
+        }
+      },
+      "required": ["uid", "email", "displayName", "role", "active"]
+    },
+    "ProviderRecord": {
+      "title": "ProviderRecord",
+      "description": "Proveedor o tecnología registrada en el sistema.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "name"]
+    },
+    "MasterCatalogItem": {
+      "title": "MasterCatalogItem",
+      "description": "Actividad base o plantilla dentro del Catálogo Maestro.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "technology": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "provider": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "areaName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "locationType": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "sistemaName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "structureName": {
+          "type": "string",
+          "maxLength": 150
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 250
+        },
+        "targetUnits": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string",
+          "maxLength": 50
+        },
+        "weight": {
+          "type": "number"
+        },
+        "estimatedHours": {
+          "type": "number"
+        },
+        "standardDays": {
+          "type": "number"
+        }
+      },
+      "required": ["id", "areaName", "structureName", "code", "name", "targetUnits", "unit"]
+    },
+    "SectorRecord": {
+      "title": "SectorRecord",
+      "description": "Sector productivo con sus galpones, áreas, sistemas, estructuras y actividades.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "galpones": {
+          "type": "array",
+          "description": "Lista de galpones pertenecientes al sector con jerarquía areas -> sistemas -> structures -> activities"
+        }
+      },
+      "required": ["id", "name", "galpones"]
+    },
+    "MaterialRecord": {
+      "title": "MaterialRecord",
+      "description": "Material e inventario vinculado inequívocamente por sectorId, galponId, areaId, sistemaId y structureId.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "sectorId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "galponId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "technology": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "provider": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "areaId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "areaName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "locationType": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "sistemaId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "sistemaName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "structureId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "structureName": {
+          "type": "string",
+          "maxLength": 150
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 250
+        },
+        "totalQty": {
+          "type": "number"
+        },
+        "initialQty": {
+          "type": "number"
+        },
+        "usedQty": {
+          "type": "number"
+        },
+        "quantityUsed": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string",
+          "maxLength": 50
+        }
+      },
+      "required": ["id", "code", "name", "unit"]
+    },
+    "DailyAdvance": {
+      "title": "DailyAdvance",
+      "description": "Parte diario de avance físico, horas hombre, soporte biproyecto y consumo de materiales por materialId.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "date": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "sectorId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "galponId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "activityId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "activityCode": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "activityName": {
+          "type": "string",
+          "maxLength": 250
+        },
+        "areaName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "locationType": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "sistemaName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "structureName": {
+          "type": "string",
+          "maxLength": 150
+        },
+        "qtyToday": {
+          "type": "number"
+        },
+        "executedQty": {
+          "type": "number"
+        },
+        "hoursWorked": {
+          "type": "number"
+        },
+        "workersCount": {
+          "type": "number"
+        },
+        "observations": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "materialsUsedToday": {
+          "type": "array",
+          "description": "Consumos de materiales del día indexados por materialId"
+        },
+        "materialsUsed": {
+          "type": "array",
+          "description": "Consumos de materiales referenciados por materialId"
+        },
+        "isBiproyecto": {
+          "type": "boolean"
+        },
+        "sharedGroupId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "secondGalponId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "totalExecutedShared": {
+          "type": "number"
+        },
+        "totalHoursShared": {
+          "type": "number"
+        }
+      },
+      "required": ["id", "date", "sectorId", "galponId", "activityCode"]
+    },
+    "WorkerRecord": {
+      "title": "WorkerRecord",
+      "description": "Operario registrado en la Planilla de Personal.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "dni": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 180
+        },
+        "specialty": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "sectorId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "galponId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "active": {
+          "type": "boolean"
+        }
+      },
+      "required": ["id", "code", "name"]
+    },
+    "AttendanceRecord": {
+      "title": "AttendanceRecord",
+      "description": "Registro de asistencia diaria de un operario.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "date": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "workerId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "workerCode": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "workerName": {
+          "type": "string",
+          "maxLength": 180
+        },
+        "sectorId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "galponId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "status": {
+          "type": "string",
+          "maxLength": 40
+        }
+      },
+      "required": ["id", "date", "workerId", "status"]
+    },
+    "MovementLog": {
+      "title": "MovementLog",
+      "description": "Registro inmutable en el Historial de Movimientos y Auditoría.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "timestamp": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "user": {
+          "type": "string",
+          "maxLength": 150
+        },
+        "userId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "userEmail": {
+          "type": "string",
+          "maxLength": 254
+        },
+        "userRole": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "type": {
+          "type": "string",
+          "enum": ["REGISTRO", "MODIFICACIÓN", "ELIMINACIÓN"]
+        },
+        "module": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "targetId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "previousValue": {
+          "type": "string",
+          "maxLength": 5000
+        },
+        "newValue": {
+          "type": "string",
+          "maxLength": 5000
+        }
+      },
+      "required": ["id", "timestamp", "user", "type", "module", "detail"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Perfiles de usuario, roles y permisos por sector y galpón"
+    },
+    "/providers/{providerId}": {
+      "schema": { "$ref": "#/entities/ProviderRecord" },
+      "description": "Proveedores y tecnologías de equipamiento"
+    },
+    "/masterCatalog/{itemId}": {
+      "schema": { "$ref": "#/entities/MasterCatalogItem" },
+      "description": "Actividades base del Catálogo Maestro y Plantillas"
+    },
+    "/sectors/{sectorId}": {
+      "schema": { "$ref": "#/entities/SectorRecord" },
+      "description": "Sectores y sus galpones con estructura jerárquica"
+    },
+    "/materials/{materialId}": {
+      "schema": { "$ref": "#/entities/MaterialRecord" },
+      "description": "Inventario y materiales asignados por estructura y galpón"
+    },
+    "/advances/{advanceId}": {
+      "schema": { "$ref": "#/entities/DailyAdvance" },
+      "description": "Avances diarios y consumos de materiales"
+    },
+    "/workers/{workerId}": {
+      "schema": { "$ref": "#/entities/WorkerRecord" },
+      "description": "Planilla de personal y asignaciones"
+    },
+    "/attendance/{attendanceId}": {
+      "schema": { "$ref": "#/entities/AttendanceRecord" },
+      "description": "Control de asistencia diaria del personal"
+    },
+    "/movements/{movementId}": {
+      "schema": { "$ref": "#/entities/MovementLog" },
+      "description": "Historial inmutable de movimientos y auditoría del sistema"
+    }
+  }
+}
