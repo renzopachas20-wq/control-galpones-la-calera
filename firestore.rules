@@ -1,66 +1,78 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // 1. Global Safety Net (Default Deny - Zero Trust)
-    match /{document=**} {
-      allow read, write: if false;
-    }
 
-    // 2. Hardened Global Primitives
-    function isSignedIn() {
+    // ===============================================================
+    // Helper Functions — Zero Trust & Matriz de 6 Roles Oficiales
+    // ===============================================================
+
+    function isAuthenticated() {
       return request.auth != null;
     }
 
-    function isValidId(id) {
-      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
     }
 
-    function incoming() {
-      return request.resource.data;
+    function userExists() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
     }
 
-    function existing() {
-      return resource.data;
-    }
-
-    // Identificador inmutable del primer usuario Administrador en Firebase Authentication
-    function isBootstrapAdminUid() {
-      return isSignedIn() && request.auth.uid == 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2';
-    }
-
-    function hasCallerProfile() {
-      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
-    }
-
-    function callerProfile() {
+    function getUserData() {
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
     }
 
-    function isActiveAdmin() {
-      return isSignedIn() && (
-        isBootstrapAdminUid() ||
-        (hasCallerProfile() && callerProfile().active == true && callerProfile().role == 'Administrador')
-      );
+    function isActiveUser() {
+      return userExists() && getUserData().active == true;
+    }
+
+    function hasRole(allowedRoles) {
+      return isActiveUser() && (getUserData().role in allowedRoles);
+    }
+
+    function isAdmin() {
+      return hasRole(['Administrador']);
+    }
+
+    function isProjectManagerOrAdmin() {
+      return hasRole(['Administrador', 'Jefe de proyecto']);
+    }
+
+    function isFieldSupervisorOrAbove() {
+      return hasRole(['Administrador', 'Jefe de proyecto', 'Supervisor']);
+    }
+
+    function canRecordFieldOperations() {
+      return hasRole(['Administrador', 'Jefe de proyecto', 'Supervisor', 'Auxiliar']);
+    }
+
+    function canManageWarehouse() {
+      return hasRole(['Administrador', 'Jefe de proyecto', 'Almacén']);
+    }
+
+    function canUpdateMaterialConsumption() {
+      return hasRole(['Administrador', 'Jefe de proyecto', 'Supervisor', 'Almacén']);
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+        email.size() >= 3 &&
+        email.size() <= 254 &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
     }
 
     function isValidRole(role) {
-      return role is string && (
-        role == 'Administrador' ||
-        role == 'Jefe de proyecto' ||
-        role == 'Supervisor' ||
-        role == 'Auxiliar' ||
-        role == 'Almacén' ||
-        role == 'Solo lectura'
-      );
+      return role in [
+        'Administrador',
+        'Jefe de proyecto',
+        'Supervisor',
+        'Auxiliar',
+        'Almacén',
+        'Solo lectura'
+      ];
     }
 
-    function isValidStringList(listVal, maxItems) {
-      return listVal is list &&
-        listVal.size() <= maxItems &&
-        (listVal.size() == 0 || (listVal[0] is string && listVal[0].size() <= 128));
-    }
-
-    // Blueprint Validation Helper for UserProfile (Never stores passwords)
     function isValidUserProfile(data) {
       return data.keys().hasAll([
           'uid',
@@ -71,17 +83,17 @@ service cloud.firestore {
           'assignedSectorIds',
           'assignedGalponIds',
           'createdAt',
-          'createdBy',
-          'updatedAt',
-          'updatedBy',
-          'lastLoginAt'
+          'updatedAt'
         ]) &&
         data.keys().hasOnly([
           'uid',
           'email',
           'displayName',
+          'dni',
+          'authMethod',
           'role',
           'active',
+          'assignedProject',
           'assignedSectorIds',
           'assignedGalponIds',
           'createdAt',
@@ -90,89 +102,161 @@ service cloud.firestore {
           'updatedBy',
           'lastLoginAt'
         ]) &&
-        isValidId(data.uid) &&
-        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.uid is string && data.uid.size() > 0 && data.uid.size() <= 128 &&
+        isValidEmail(data.email) &&
         data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 150 &&
+        (!('dni' in data) || (data.dni is string && data.dni.size() <= 32)) &&
+        (!('authMethod' in data) || (data.authMethod in ['password', 'google', 'both'])) &&
         isValidRole(data.role) &&
         data.active is bool &&
-        isValidStringList(data.assignedSectorIds, 100) &&
-        isValidStringList(data.assignedGalponIds, 200) &&
-        data.createdAt is string && data.createdAt.size() >= 1 && data.createdAt.size() <= 40 &&
-        data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 150 &&
-        data.updatedAt is string && data.updatedAt.size() >= 1 && data.updatedAt.size() <= 40 &&
-        data.updatedBy is string && data.updatedBy.size() >= 1 && data.updatedBy.size() <= 150 &&
-        data.lastLoginAt is string && data.lastLoginAt.size() <= 40;
+        (!('assignedProject' in data) || (data.assignedProject is string && data.assignedProject.size() <= 150)) &&
+        data.assignedSectorIds is list && data.assignedSectorIds.size() <= 500 &&
+        data.assignedGalponIds is list && data.assignedGalponIds.size() <= 2000 &&
+        data.createdAt is string && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() <= 64 &&
+        (!('createdBy' in data) || (data.createdBy is string && data.createdBy.size() <= 128)) &&
+        (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 128)) &&
+        (!('lastLoginAt' in data) || (data.lastLoginAt is string && data.lastLoginAt.size() <= 64));
     }
 
-    // 3. Collection: /users/{userId}
+    function isSelfLoginTimestampUpdate(userId) {
+      return isOwner(userId) &&
+        resource.data.active == true &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastLoginAt', 'updatedAt', 'updatedBy']) &&
+        request.resource.data.uid == resource.data.uid &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.active == resource.data.active &&
+        request.resource.data.email == resource.data.email &&
+        isValidUserProfile(request.resource.data);
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // 1. Perfiles de Usuario (/users/{userId})
     match /users/{userId} {
-      // PII Isolation: Only the owner (to check own active status/profile) or an active Admin can read a user document
-      allow get: if isSignedIn() && isValidId(userId) && (
-        request.auth.uid == userId || isActiveAdmin()
-      );
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isAdmin() &&
+        request.resource.data.uid == userId &&
+        isValidUserProfile(request.resource.data);
+      allow update: if (
+          isAdmin() &&
+          request.resource.data.uid == resource.data.uid &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          isValidUserProfile(request.resource.data)
+        ) || isSelfLoginTimestampUpdate(userId);
+      allow delete: if isAdmin() && request.auth.uid != userId;
+    }
 
-      // Listado del padrón de usuarios: exclusivo para un Administrador activo.
-      // No se exige filtro sobre resource.data (existing().uid) para permitir la consulta completa de la colección /users desde UserAdminModal.
-      allow list: if isActiveAdmin();
+    // 2. Proveedores Tecnológicos (/providers/{providerId})
+    match /providers/{providerId} {
+      allow read: if isActiveUser();
+      allow create, update: if isProjectManagerOrAdmin() &&
+        request.resource.data.keys().hasAll(['id', 'name']) &&
+        request.resource.data.id is string &&
+        request.resource.data.name is string &&
+        request.resource.data.name.size() >= 1 &&
+        request.resource.data.name.size() <= 120;
+      allow delete: if isAdmin();
+    }
 
-      // Creation: Only an active Admin can create users, OR the exact bootstrap Admin UID registering their initial Admin profile
-      allow create: if isSignedIn() &&
-        isValidId(userId) &&
-        isValidUserProfile(incoming()) &&
-        incoming().uid == userId && (
-          isActiveAdmin() ||
-          (
-            isBootstrapAdminUid() &&
-            userId == 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2' &&
-            incoming().uid == 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2' &&
-            incoming().role == 'Administrador' &&
-            incoming().active == true
-          )
-        );
+    // 3. Catálogo Maestro y Plantillas (/masterCatalog/{itemId})
+    match /masterCatalog/{itemId} {
+      allow read: if isActiveUser();
+      allow create, update: if isProjectManagerOrAdmin() &&
+        request.resource.data.keys().hasAll(['id', 'name', 'technology']) &&
+        request.resource.data.id is string &&
+        request.resource.data.name is string &&
+        request.resource.data.name.size() >= 1 &&
+        request.resource.data.name.size() <= 300;
+      allow delete: if isAdmin();
+    }
 
-      // Action-Based Updates: Must start with validation helper and preserve immortal fields
-      allow update: if isSignedIn() &&
-        isValidId(userId) &&
-        isValidUserProfile(incoming()) &&
-        incoming().uid == existing().uid &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().createdBy == existing().createdBy && (
-          // Action 1: Active Administrator managing user profile, role, active state, or assignments
-          (
-            isActiveAdmin() &&
-            !(userId == request.auth.uid && (incoming().active == false || incoming().role != 'Administrador')) &&
-            incoming().diff(existing()).affectedKeys().hasOnly([
-              'displayName',
-              'email',
-              'role',
-              'active',
-              'assignedSectorIds',
-              'assignedGalponIds',
-              'updatedAt',
-              'updatedBy',
-              'lastLoginAt'
-            ])
-          ) ||
-          // Action 2: Active user updating exclusively their own lastLoginAt upon sign-in
-          (
-            request.auth.uid == userId &&
-            existing().active == true &&
-            incoming().role == existing().role &&
-            incoming().active == existing().active &&
-            incoming().email == existing().email &&
-            incoming().displayName == existing().displayName &&
-            incoming().assignedSectorIds == existing().assignedSectorIds &&
-            incoming().assignedGalponIds == existing().assignedGalponIds &&
-            incoming().diff(existing()).affectedKeys().hasOnly([
-              'lastLoginAt',
-              'updatedAt',
-              'updatedBy'
-            ])
-          )
-        );
+    // 4. Sectores, Galpones y Cronograma de Actividades (/sectors/{sectorId})
+    match /sectors/{sectorId} {
+      allow read: if isActiveUser();
+      allow create: if isProjectManagerOrAdmin() &&
+        request.resource.data.keys().hasAll(['id', 'name', 'galpones']) &&
+        request.resource.data.id is string &&
+        request.resource.data.name is string &&
+        request.resource.data.galpones is list;
+      allow update: if canRecordFieldOperations() &&
+        request.resource.data.keys().hasAll(['id', 'name', 'galpones']) &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.name is string &&
+        request.resource.data.galpones is list;
+      allow delete: if isAdmin();
+    }
 
-      // Accounts are deactivated (active: false), never hard-deleted
-      allow delete: if false;
+    // 5. Control de Materiales (/materials/{materialId})
+    match /materials/{materialId} {
+      allow read: if isActiveUser();
+      allow create: if canManageWarehouse() &&
+        request.resource.data.keys().hasAll(['id', 'name', 'unit', 'totalQty', 'usedQty']) &&
+        request.resource.data.id is string &&
+        request.resource.data.name is string;
+      allow update: if (canUpdateMaterialConsumption() || canRecordFieldOperations()) &&
+        request.resource.data.keys().hasAll(['id', 'name', 'unit', 'totalQty', 'usedQty']) &&
+        request.resource.data.id == resource.data.id;
+      allow delete: if hasRole(['Administrador', 'Almacén']);
+    }
+
+    // 6. Partes de Avance Diario (/advances/{advanceId})
+    match /advances/{advanceId} {
+      allow read: if isActiveUser();
+      allow create: if canRecordFieldOperations() &&
+        request.resource.data.keys().hasAll(['id', 'date', 'galponId', 'activityCode', 'quantityToday']) &&
+        request.resource.data.id is string &&
+        request.resource.data.galponId is string &&
+        request.resource.data.activityCode is string;
+      allow update: if isFieldSupervisorOrAbove() &&
+        request.resource.data.keys().hasAll(['id', 'date', 'galponId', 'activityCode', 'quantityToday']) &&
+        request.resource.data.id == resource.data.id;
+      allow delete: if isProjectManagerOrAdmin();
+    }
+
+    // 7. Planilla Maestra de Personal (/workers/{workerId})
+    match /workers/{workerId} {
+      allow read: if isActiveUser();
+      allow create, update: if isFieldSupervisorOrAbove() &&
+        request.resource.data.keys().hasAll(['id', 'name', 'role']) &&
+        request.resource.data.id is string &&
+        request.resource.data.name is string &&
+        request.resource.data.name.size() >= 1 &&
+        request.resource.data.name.size() <= 200;
+      allow delete: if isAdmin();
+    }
+
+    // 8. Control de Asistencia (/attendance/{attendanceId})
+    match /attendance/{attendanceId} {
+      allow read: if isActiveUser();
+      allow create, update: if canRecordFieldOperations() &&
+        request.resource.data.keys().hasAll(['id', 'date', 'records']) &&
+        request.resource.data.id is string &&
+        request.resource.data.date is string &&
+        request.resource.data.records is map;
+      allow delete: if isProjectManagerOrAdmin();
+    }
+
+    // 9. Historial de Movimientos / Auditoría Inmutable (/movements/{movementId})
+    match /movements/{movementId} {
+      allow read: if isActiveUser() && !hasRole(['Auxiliar']);
+      allow create: if isActiveUser() &&
+        request.resource.data.keys().hasAll(['id', 'timestamp', 'user', 'userId', 'type', 'module', 'detail']) &&
+        request.resource.data.id is string &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.type in ['REGISTRO', 'MODIFICACIÓN', 'ELIMINACIÓN'] &&
+        request.resource.data.module is string &&
+        request.resource.data.detail is string &&
+        request.resource.data.detail.size() <= 5000;
+      // Los registros de auditoría son estrictamente inmutables
+      allow update, delete: if false;
+    }
+
+    // 10. Denegación por defecto para cualquier otra ruta (Zero Trust)
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

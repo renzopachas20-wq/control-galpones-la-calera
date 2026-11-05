@@ -1,26 +1,28 @@
 import {
   signInWithEmailAndPassword,
+  signInWithPopup,
+  GoogleAuthProvider,
   signOut,
   sendPasswordResetEmail,
   onAuthStateChanged,
-  onIdTokenChanged,
-  type User,
+  setPersistence,
+  browserLocalPersistence,
+  type User
 } from 'firebase/auth';
 import {
-  collection,
   doc,
   getDoc,
   setDoc,
-  updateDoc,
+  collection,
+  getDocs,
   onSnapshot,
-  type Unsubscribe,
+  type Unsubscribe
 } from 'firebase/firestore';
-import {
-  auth,
-  db,
-  handleFirestoreError,
-  OperationType,
-} from './config';
+import { auth, db } from './config';
+
+// ============================================================================
+// 1. Definición de los Seis Roles Oficiales y Perfil de Usuario
+// ============================================================================
 
 export const OFFICIAL_ROLES = [
   'Administrador',
@@ -28,244 +30,270 @@ export const OFFICIAL_ROLES = [
   'Supervisor',
   'Auxiliar',
   'Almacén',
-  'Solo lectura',
+  'Solo lectura'
 ] as const;
 
 export type OfficialRole = (typeof OFFICIAL_ROLES)[number];
-
-export const ROOT_ADMIN_UID = 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2';
+export type AuthMethod = 'password' | 'google' | 'both';
 
 export interface UserProfile {
   uid: string;
   email: string;
   displayName: string;
+  dni?: string;
+  authMethod?: AuthMethod;
   role: OfficialRole;
   active: boolean;
+  assignedProject?: string;
   assignedSectorIds: string[];
   assignedGalponIds: string[];
   createdAt: string;
   createdBy: string;
   updatedAt: string;
   updatedBy: string;
-  lastLoginAt: string;
+  lastLoginAt?: string;
 }
 
 export interface CreateUserInput {
   email: string;
-  displayName: string;
   password?: string;
-  generateTempPassword?: boolean;
+  displayName: string;
+  dni?: string;
+  authMethod?: AuthMethod;
   role: OfficialRole;
   active: boolean;
+  assignedProject?: string;
   assignedSectorIds: string[];
   assignedGalponIds: string[];
 }
 
 export interface UpdateUserInput {
   displayName?: string;
+  dni?: string;
+  email?: string;
+  authMethod?: AuthMethod;
   role?: OfficialRole;
   active?: boolean;
+  assignedProject?: string;
   assignedSectorIds?: string[];
   assignedGalponIds?: string[];
 }
 
-export function mapFirebaseAuthErrorToSpanish(error: unknown): string {
-  const code = (error as { code?: string })?.code || '';
-  const message = error instanceof Error ? error.message : String(error);
+// ============================================================================
+// 2. Mensajes Claros de Error en Español
+// ============================================================================
 
-  if (
-    code === 'auth/wrong-password' ||
-    code === 'auth/invalid-credential' ||
-    code === 'auth/invalid-login-credentials' ||
-    message.includes('INVALID_LOGIN_CREDENTIALS') ||
-    message.includes('INVALID_PASSWORD')
-  ) {
-    return 'Correo electrónico o contraseña incorrectos. Verifica tus datos e inténtalo nuevamente.';
-  }
-  if (code === 'auth/user-not-found' || message.includes('EMAIL_NOT_FOUND')) {
-    return 'No existe ninguna cuenta registrada con este correo electrónico.';
-  }
-  if (code === 'auth/invalid-email' || message.includes('INVALID_EMAIL')) {
-    return 'El formato del correo electrónico ingresado no es válido.';
-  }
-  if (code === 'auth/user-disabled' || message.includes('USER_DISABLED')) {
-    return 'Esta cuenta de usuario se encuentra desactivada. Contacta al Administrador.';
-  }
-  if (code === 'auth/too-many-requests' || message.includes('TOO_MANY_ATTEMPTS_TRY_LATER')) {
-    return 'Se detectaron demasiados intentos fallidos consecutivos. Por seguridad, espera unos minutos o utiliza la opción de recuperar contraseña.';
-  }
-  if (code === 'auth/network-request-failed') {
-    return 'Error de conexión con el servidor. Verifica tu conexión a internet e inténtalo nuevamente.';
-  }
-  if (
-    code === 'auth/operation-not-allowed' ||
-    message.includes('PASSWORD_LOGIN_DISABLED') ||
-    message.includes('OPERATION_NOT_ALLOWED')
-  ) {
-    return 'El inicio de sesión con correo y contraseña está pendiente de activación en Firebase Console (Authentication > Sign-in method > Correo electrónico/contraseña).';
-  }
-  if (code === 'auth/user-token-expired' || code === 'auth/id-token-expired') {
-    return 'Tu sesión ha vencido por seguridad. Inicia sesión nuevamente.';
-  }
-  return message || 'No se pudo completar la operación de autenticación.';
-}
+export function translateFirebaseAuthError(error: any): string {
+  const code = error?.code || '';
+  const msg = String(error?.message || '');
 
-export async function fetchOrBootstrapProfile(user: User): Promise<UserProfile> {
-  // 1. Verificar e inicializar desde el procedimiento seguro del servidor (/api/auth/verify-session)
-  try {
-    const idToken = await user.getIdToken();
-    const res = await fetch('/api/auth/verify-session', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${idToken}`,
-        'Content-Type': 'application/json',
-      },
-    });
-    if (res.ok) {
-      const body = (await res.json()) as { ok?: boolean; profile?: UserProfile };
-      if (body.ok && body.profile) {
-        return body.profile;
+  switch (code) {
+    case 'auth/invalid-credential':
+    case 'auth/wrong-password':
+    case 'auth/user-not-found':
+      return 'Credenciales incorrectas. Verifique su correo electrónico y contraseña.';
+    case 'auth/invalid-email':
+      return 'El formato del correo electrónico no es válido.';
+    case 'auth/user-disabled':
+      return 'Esta cuenta ha sido deshabilitada en el servidor de autenticación.';
+    case 'auth/too-many-requests':
+      return 'Demasiados intentos fallidos. Por seguridad, espere unos minutos o restablezca su contraseña.';
+    case 'auth/network-request-failed':
+      return 'Error de conexión a internet. Verifique su red e intente nuevamente.';
+    case 'auth/user-token-expired':
+    case 'auth/id-token-expired':
+      return 'Su sesión ha vencido. Por favor, inicie sesión nuevamente.';
+    case 'auth/popup-closed-by-user':
+      return 'Se cerró la ventana de inicio de sesión con Google antes de completar la autenticación.';
+    case 'auth/popup-blocked':
+      return 'El navegador bloqueó la ventana emergente de Google. Permita ventanas emergentes e intente de nuevo.';
+    case 'auth/cancelled-popup-request':
+      return 'Solicitud de ventana emergente cancelada. Intente nuevamente.';
+    case 'auth/account-exists-with-different-credential':
+      return 'Ya existe una cuenta con este correo electrónico bajo otro método de acceso.';
+    default:
+      if (msg.includes('PROFILE_NOT_FOUND') || msg.includes('no está autorizada')) {
+        return 'Acceso denegado: Su cuenta no está autorizada en Control Galpones La Calera. Solicite al Administrador que registre su acceso.';
       }
-    }
-  } catch {
-    // Continuar con lectura directa en Firestore si la petición local falla
+      if (msg.includes('USER_INACTIVE') || msg.includes('desactivada')) {
+        return 'Acceso bloqueado: Su cuenta ha sido desactivada por el Administrador.';
+      }
+      return msg || 'Ocurrió un error inesperado de autenticación.';
   }
-
-  // 2. Lectura directa en Cloud Firestore (/users/{uid})
-  const userRef = doc(db, 'users', user.uid);
-  let snap;
-  try {
-    snap = await getDoc(userRef);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `users/${user.uid}`);
-  }
-
-  if (snap.exists()) {
-    const data = snap.data() as UserProfile;
-    return {
-      uid: data.uid || user.uid,
-      email: data.email || user.email || '',
-      displayName: data.displayName || user.displayName || user.email || 'Usuario',
-      role: OFFICIAL_ROLES.includes(data.role) ? data.role : 'Solo lectura',
-      active: Boolean(data.active),
-      assignedSectorIds: Array.isArray(data.assignedSectorIds) ? data.assignedSectorIds : [],
-      assignedGalponIds: Array.isArray(data.assignedGalponIds) ? data.assignedGalponIds : [],
-      createdAt: data.createdAt || '',
-      createdBy: data.createdBy || '',
-      updatedAt: data.updatedAt || '',
-      updatedBy: data.updatedBy || '',
-      lastLoginAt: data.lastLoginAt || '',
-    };
-  }
-
-  // 3. Respaldo de registro para el UID exacto del primer Administrador (jcSCn1eJ7Yao4xYeV6J8eZpszLR2)
-  if (user.uid === ROOT_ADMIN_UID) {
-    const nowIso = new Date().toISOString();
-    const cleanEmail = (user.email || 'admin@lacalera.pe').toLowerCase();
-    const rootProfile: UserProfile = {
-      uid: ROOT_ADMIN_UID,
-      email: cleanEmail,
-      displayName: user.displayName || 'Administrador General',
-      role: 'Administrador',
-      active: true,
-      assignedSectorIds: [],
-      assignedGalponIds: [],
-      createdAt: nowIso,
-      createdBy: cleanEmail,
-      updatedAt: nowIso,
-      updatedBy: cleanEmail,
-      lastLoginAt: nowIso,
-    };
-    try {
-      await setDoc(userRef, rootProfile);
-      return rootProfile;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, `users/${user.uid}`);
-    }
-  }
-
-  throw new Error(
-    'Tu cuenta no tiene un perfil activo asignado en Control Galpones La Calera. Solicita tu habilitación al Administrador.'
-  );
 }
 
-export async function loginWithEmailAndPassword(
+// ============================================================================
+// 3. Autenticación y Gestión de Sesión (Correo/Contraseña + Google)
+// ============================================================================
+
+export async function loginWithEmail(
   email: string,
   password: string
-): Promise<UserProfile> {
+): Promise<{ user: User; profile: UserProfile }> {
+  await setPersistence(auth, browserLocalPersistence);
   const cleanEmail = email.trim().toLowerCase();
-  if (!cleanEmail) {
-    throw new Error('Ingresa tu correo electrónico.');
-  }
-  if (!password) {
-    throw new Error('Ingresa tu contraseña.');
-  }
-
-  let credential;
-  try {
-    credential = await signInWithEmailAndPassword(auth, cleanEmail, password);
-  } catch (error) {
-    throw new Error(mapFirebaseAuthErrorToSpanish(error));
-  }
-
+  const credential = await signInWithEmailAndPassword(auth, cleanEmail, password);
   const profile = await fetchOrBootstrapProfile(credential.user);
+  return { user: credential.user, profile };
+}
 
-  if (!profile.active) {
-    await signOut(auth);
+/**
+ * Inicio de sesión con Google utilizando Firebase Authentication (GoogleAuthProvider).
+ * Compatible con navegador web y preparado para contenedor móvil Capacitor/Android.
+ * Verifica obligatoriamente que exista un perfil activo autorizado en /users/{uid}.
+ */
+export async function loginWithGoogle(): Promise<{ user: User; profile: UserProfile }> {
+  await setPersistence(auth, browserLocalPersistence);
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
+
+  const credential = await signInWithPopup(auth, provider);
+  try {
+    const profile = await fetchOrBootstrapProfile(credential.user);
+    return { user: credential.user, profile };
+  } catch (err) {
+    await signOut(auth).catch(() => {});
+    throw err;
+  }
+}
+
+export async function logoutSession(): Promise<void> {
+  await signOut(auth);
+}
+
+export async function requestPasswordReset(email: string): Promise<void> {
+  const cleanEmail = email.trim().toLowerCase();
+  await sendPasswordResetEmail(auth, cleanEmail);
+}
+
+/**
+ * Obtiene y valida el perfil del usuario en `/users/{uid}`.
+ * Sincroniza con `/api/auth/verify-session` para:
+ * - Soportar vinculación segura de cuentas Google pre-autorizadas por el Administrador.
+ * - Actualizar `lastLoginAt` y registrar el refreshToken en la bóveda cifrada del servidor.
+ * - Rechazar inmediatamente cualquier cuenta no autorizada o desactivada.
+ */
+export async function fetchOrBootstrapProfile(user: User): Promise<UserProfile> {
+  const idToken = await user.getIdToken();
+  const refreshToken = user.refreshToken || '';
+
+  // 1. Verificar sesión en el backend primero (permite vincular cuentas Google pre-autorizadas y validar estado)
+  try {
+    const resp = await fetch('/api/auth/verify-session', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`
+      },
+      body: JSON.stringify({ refreshToken })
+    });
+
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data?.profile) {
+        return normalizeUserProfile(data.profile);
+      }
+    } else if (resp.status === 403) {
+      const errData = await resp.json().catch(() => ({}));
+      await signOut(auth).catch(() => {});
+      throw new Error(
+        errData?.message ||
+          'Su cuenta no tiene autorización activa para ingresar al sistema.'
+      );
+    }
+  } catch (err: any) {
+    if (
+      err?.message?.includes('autorizada') ||
+      err?.message?.includes('desactivada') ||
+      err?.message?.includes('autorización') ||
+      err?.message?.includes('bloqueado')
+    ) {
+      throw err;
+    }
+    // Si hay un fallo transitorio de red hacia /api, continuamos con verificación directa en Firestore
+  }
+
+  // 2. Lectura directa desde Firestore SDK como respaldo
+  const userRef = doc(db, 'users', user.uid);
+  const snap = await getDoc(userRef);
+
+  if (!snap.exists()) {
+    await signOut(auth).catch(() => {});
     throw new Error(
-      'Tu cuenta ha sido desactivada por el Administrador y no puede acceder al sistema.'
+      'Su cuenta no está autorizada en Control Galpones La Calera. Solicite al Administrador que registre su acceso.'
     );
   }
 
-  // Actualizar fecha de último inicio de sesión (lastLoginAt)
+  const profile = normalizeUserProfile(snap.data() as UserProfile);
+
+  if (!profile.active) {
+    await signOut(auth).catch(() => {});
+    throw new Error(
+      'Su cuenta ha sido desactivada por el Administrador. Comuníquese con la gerencia de proyecto.'
+    );
+  }
+
+  if (!OFFICIAL_ROLES.includes(profile.role)) {
+    await signOut(auth).catch(() => {});
+    throw new Error(
+      `El rol asignado (${profile.role}) no es válido en la matriz oficial de permisos.`
+    );
+  }
+
   const nowIso = new Date().toISOString();
   try {
-    await updateDoc(doc(db, 'users', credential.user.uid), {
-      lastLoginAt: nowIso,
-      updatedAt: nowIso,
-      updatedBy: profile.email,
-    });
+    await setDoc(
+      userRef,
+      {
+        ...profile,
+        lastLoginAt: nowIso,
+        updatedAt: nowIso,
+        updatedBy: user.uid
+      },
+      { merge: true }
+    );
     profile.lastLoginAt = nowIso;
-    profile.updatedAt = nowIso;
-    profile.updatedBy = profile.email;
   } catch {
-    // Si la actualización de lastLoginAt no es crítica, continuar con el perfil verificado
+    // Ignorar fallo no crítico de actualización de lastLoginAt
   }
 
   return profile;
 }
 
-export async function sendPasswordRecoveryEmail(email: string): Promise<void> {
-  const cleanEmail = email.trim().toLowerCase();
-  if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-    throw new Error('Ingresa un correo electrónico válido para recuperar tu contraseña.');
-  }
-  try {
-    await sendPasswordResetEmail(auth, cleanEmail);
-  } catch (error) {
-    throw new Error(mapFirebaseAuthErrorToSpanish(error));
-  }
+export function normalizeUserProfile(raw: any): UserProfile {
+  return {
+    uid: String(raw?.uid || ''),
+    email: String(raw?.email || '').toLowerCase(),
+    displayName: String(raw?.displayName || ''),
+    dni: raw?.dni ? String(raw.dni) : '',
+    authMethod:
+      raw?.authMethod === 'google' || raw?.authMethod === 'both' || raw?.authMethod === 'password'
+        ? raw.authMethod
+        : 'password',
+    role: (OFFICIAL_ROLES.includes(raw?.role) ? raw.role : 'Solo lectura') as OfficialRole,
+    active: Boolean(raw?.active),
+    assignedProject: raw?.assignedProject ? String(raw.assignedProject) : 'TODOS',
+    assignedSectorIds: Array.isArray(raw?.assignedSectorIds)
+      ? raw.assignedSectorIds.map(String)
+      : [],
+    assignedGalponIds: Array.isArray(raw?.assignedGalponIds)
+      ? raw.assignedGalponIds.map(String)
+      : [],
+    createdAt: String(raw?.createdAt || new Date().toISOString()),
+    createdBy: String(raw?.createdBy || 'system'),
+    updatedAt: String(raw?.updatedAt || new Date().toISOString()),
+    updatedBy: String(raw?.updatedBy || 'system'),
+    ...(raw?.lastLoginAt ? { lastLoginAt: String(raw.lastLoginAt) } : {})
+  };
 }
 
-export async function logoutUser(): Promise<void> {
-  await signOut(auth);
-}
-
-export function subscribeToAuthChanges(
-  onUserChange: (user: User | null) => void
-): Unsubscribe {
-  return onAuthStateChanged(auth, onUserChange);
-}
-
-export function subscribeToTokenChanges(
-  onTokenChange: (user: User | null) => void
-): Unsubscribe {
-  return onIdTokenChanged(auth, onTokenChange);
-}
-
-export function subscribeToCurrentUserProfile(
+/**
+ * Suscripción en tiempo real al documento `/users/{uid}` del usuario autenticado.
+ * Permite detectar inmediatamente desactivación de cuenta o cambios de rol/alcance en vivo.
+ */
+export function subscribeToUserProfile(
   uid: string,
-  onProfile: (profile: UserProfile | null) => void,
+  onProfileChange: (profile: UserProfile | null) => void,
   onError?: (err: Error) => void
 ): Unsubscribe {
   const userRef = doc(db, 'users', uid);
@@ -273,24 +301,10 @@ export function subscribeToCurrentUserProfile(
     userRef,
     (snap) => {
       if (!snap.exists()) {
-        onProfile(null);
+        onProfileChange(null);
         return;
       }
-      const data = snap.data() as UserProfile;
-      onProfile({
-        uid: data.uid || uid,
-        email: data.email || '',
-        displayName: data.displayName || '',
-        role: OFFICIAL_ROLES.includes(data.role) ? data.role : 'Solo lectura',
-        active: Boolean(data.active),
-        assignedSectorIds: Array.isArray(data.assignedSectorIds) ? data.assignedSectorIds : [],
-        assignedGalponIds: Array.isArray(data.assignedGalponIds) ? data.assignedGalponIds : [],
-        createdAt: data.createdAt || '',
-        createdBy: data.createdBy || '',
-        updatedAt: data.updatedAt || '',
-        updatedBy: data.updatedBy || '',
-        lastLoginAt: data.lastLoginAt || '',
-      });
+      onProfileChange(normalizeUserProfile(snap.data()));
     },
     (err) => {
       if (onError) onError(err);
@@ -298,116 +312,104 @@ export function subscribeToCurrentUserProfile(
   );
 }
 
-export function subscribeToAllUsers(
-  onUsers: (users: UserProfile[]) => void,
-  onError?: (err: Error) => void
-): Unsubscribe {
-  const colRef = collection(db, 'users');
-  return onSnapshot(
-    colRef,
-    (snap) => {
-      const list: UserProfile[] = [];
-      snap.forEach((docSnap) => {
-        const d = docSnap.data() as UserProfile;
-        list.push({
-          uid: d.uid || docSnap.id,
-          email: d.email || '',
-          displayName: d.displayName || '',
-          role: OFFICIAL_ROLES.includes(d.role) ? d.role : 'Solo lectura',
-          active: Boolean(d.active),
-          assignedSectorIds: Array.isArray(d.assignedSectorIds) ? d.assignedSectorIds : [],
-          assignedGalponIds: Array.isArray(d.assignedGalponIds) ? d.assignedGalponIds : [],
-          createdAt: d.createdAt || '',
-          createdBy: d.createdBy || '',
-          updatedAt: d.updatedAt || '',
-          updatedBy: d.updatedBy || '',
-          lastLoginAt: d.lastLoginAt || '',
-        });
-      });
-      list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-      onUsers(list);
-    },
-    (err) => {
-      if (onError) {
-        onError(err);
-      } else {
-        handleFirestoreError(err, OperationType.LIST, 'users');
-      }
-    }
-  );
-}
+export { onAuthStateChanged };
 
-async function getBearerHeader(): Promise<Record<string, string>> {
+// ============================================================================
+// 4. Funciones de Administración de Usuarios (Exclusivas para Administrador)
+// ============================================================================
+
+async function getAdminAuthHeaders(): Promise<Record<string, string>> {
   const currentUser = auth.currentUser;
   if (!currentUser) {
-    throw new Error('Tu sesión ha expirado. Inicia sesión nuevamente.');
+    throw new Error('Sesión no encontrada. Inicie sesión nuevamente.');
   }
-  const idToken = await currentUser.getIdToken(true);
+  const idToken = await currentUser.getIdToken();
   return {
-    Authorization: `Bearer ${idToken}`,
     'Content-Type': 'application/json',
+    Authorization: `Bearer ${idToken}`
   };
 }
 
-export async function adminCreateUserOnServer(input: CreateUserInput): Promise<{
-  profile: UserProfile;
-  temporaryPassword: string;
-}> {
-  const headers = await getBearerHeader();
-  const res = await fetch('/api/admin/users', {
+export async function adminListUsers(): Promise<UserProfile[]> {
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    const list: UserProfile[] = [];
+    snap.forEach((docSnap) => {
+      list.push(normalizeUserProfile(docSnap.data()));
+    });
+    list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+    return list;
+  } catch {
+    const headers = await getAdminAuthHeaders();
+    const resp = await fetch('/api/admin/users', { method: 'GET', headers });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data?.message || 'Error al listar los usuarios.');
+    }
+    return (data.users || []).map(normalizeUserProfile);
+  }
+}
+
+export async function adminCreateUser(input: CreateUserInput): Promise<UserProfile> {
+  const headers = await getAdminAuthHeaders();
+  const resp = await fetch('/api/admin/users', {
     method: 'POST',
     headers,
-    body: JSON.stringify(input),
+    body: JSON.stringify(input)
   });
-  const data = (await res.json()) as {
-    ok?: boolean;
-    profile?: UserProfile;
-    temporaryPassword?: string;
-    error?: string;
-  };
-  if (!res.ok || !data.ok || !data.profile) {
-    throw new Error(data.error || 'No se pudo crear el usuario en el servidor.');
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(data?.message || 'Error al crear el usuario.');
   }
-  return {
-    profile: data.profile,
-    temporaryPassword: data.temporaryPassword || '',
-  };
+  return normalizeUserProfile(data.user);
 }
 
-export async function adminUpdateUserOnServer(
+export async function adminUpdateUser(
   uid: string,
-  input: UpdateUserInput
-): Promise<UserProfile> {
-  const headers = await getBearerHeader();
-  const res = await fetch(`/api/admin/users/${encodeURIComponent(uid)}`, {
+  updates: UpdateUserInput
+): Promise<{ user: UserProfile; authEmailSyncNote?: string }> {
+  const headers = await getAdminAuthHeaders();
+  const resp = await fetch(`/api/admin/users/${encodeURIComponent(uid)}`, {
     method: 'PATCH',
     headers,
-    body: JSON.stringify(input),
+    body: JSON.stringify(updates)
   });
-  const data = (await res.json()) as {
-    ok?: boolean;
-    profile?: UserProfile;
-    error?: string;
-  };
-  if (!res.ok || !data.ok || !data.profile) {
-    throw new Error(data.error || 'No se pudo actualizar el usuario en el servidor.');
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(data?.message || 'Error al actualizar el usuario.');
   }
-  return data.profile;
+  return {
+    user: normalizeUserProfile(data.user),
+    authEmailSyncNote: data.authEmailSyncNote
+  };
 }
 
-export async function adminSendPasswordResetOnServer(uid: string): Promise<string> {
-  const headers = await getBearerHeader();
-  const res = await fetch(`/api/admin/users/${encodeURIComponent(uid)}/reset-password`, {
+export async function adminGenerateTempPassword(
+  uid: string,
+  tempPassword?: string
+): Promise<{ mode: 'direct_update' | 'reset_email_sent'; tempPassword?: string; message: string }> {
+  const headers = await getAdminAuthHeaders();
+  const resp = await fetch(`/api/admin/users/${encodeURIComponent(uid)}/temp-password`, {
     method: 'POST',
     headers,
+    body: JSON.stringify({ tempPassword })
   });
-  const data = (await res.json()) as {
-    ok?: boolean;
-    message?: string;
-    error?: string;
-  };
-  if (!res.ok || !data.ok) {
-    throw new Error(data.error || 'No se pudo enviar el correo de recuperación.');
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(data?.message || 'Error al generar contraseña temporal.');
   }
-  return data.message || 'Correo de recuperación enviado.';
+  return data;
+}
+
+export async function adminSendPasswordReset(uid: string): Promise<string> {
+  const headers = await getAdminAuthHeaders();
+  const resp = await fetch(`/api/admin/users/${encodeURIComponent(uid)}/reset-password`, {
+    method: 'POST',
+    headers
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(data?.message || 'Error al enviar el correo de recuperación.');
+  }
+  return data.message || 'Correo de restablecimiento enviado.';
 }

@@ -28,6 +28,16 @@ import {
   Package,
   BookOpen
 } from 'lucide-react';
+import { useAuthProfile } from './components/AuthGate';
+import { useFirestoreOperationalSync } from './firebase/firestoreDataService';
+import {
+  hasModulePermission,
+  filterSectorsByScope,
+  MODULE_LABELS,
+  ACTION_LABELS,
+  type AppModuleId,
+  type PermissionAction
+} from './firebase/permissions';
 
 // ============================================================================
 // UTILIDADES Y CONSTANTES BASE (SIN DATOS DE DEMOSTRACIÓN)
@@ -830,7 +840,59 @@ export default function App() {
   const [editingTemplateIndex, setEditingTemplateIndex] = useState<number | null>(null);
   const [editingTemplateValue, setEditingTemplateValue] = useState('');
 
-  // Persistencia en localStorage
+  // Contexto de Autenticación, Matriz de Roles y Sincronización Firestore en Tiempo Real
+  const { profile } = useAuthProfile();
+  const [permissionNotice, setPermissionNotice] = useState<string | null>(null);
+
+  const { syncStatus, lastSyncedAt, recordAuditMovement } = useFirestoreOperationalSync({
+    profile,
+    technologies,
+    setTechnologies,
+    masterCatalog,
+    setMasterCatalog,
+    sectors,
+    setSectors,
+    materials,
+    setMaterials,
+    dailyAdvances,
+    setDailyAdvances,
+    masterWorkforce,
+    setMasterWorkforce,
+    attendanceRecords,
+    setAttendanceRecords,
+    auditLogs,
+    setAuditLogs
+  });
+
+  // Mantener activeUserName sincronizado con el usuario autenticado real
+  useEffect(() => {
+    if (profile) {
+      setActiveUserName(`${profile.displayName} (${profile.role})`);
+    }
+  }, [profile]);
+
+  const canDo = (moduleId: AppModuleId, action: PermissionAction): boolean =>
+    hasModulePermission(profile, moduleId, action);
+
+  const requirePermission = (moduleId: AppModuleId, action: PermissionAction): boolean => {
+    if (hasModulePermission(profile, moduleId, action)) {
+      setPermissionNotice(null);
+      return true;
+    }
+    const msg = `Acceso restringido: Su rol (${profile?.role || 'Sin rol'}) no tiene permiso para "${ACTION_LABELS[action]}" en el módulo "${MODULE_LABELS[moduleId]}".`;
+    setPermissionNotice(msg);
+    setTimeout(() => {
+      setPermissionNotice((prev) => (prev === msg ? null : prev));
+    }, 5000);
+    return false;
+  };
+
+  // Filtrado de Sectores y Galpones según el alcance asignado al usuario (Sector / Galpón / Proyecto)
+  const scopedSectors = useMemo(() => {
+    return filterSectorsByScope(sectors, profile);
+  }, [sectors, profile]);
+
+  // Caché local de respaldo (Firestore es la fuente principal de verdad)
   useEffect(() => {
     localStorage.setItem('calera_technologies_clean', JSON.stringify(technologies));
   }, [technologies]);
@@ -841,14 +903,14 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem('calera_sectors_clean', JSON.stringify(sectors));
-    if (sectors.length > 0 && !sectors.some((s) => s.id === selectedSectorId)) {
-      setSelectedSectorId(sectors[0].id);
-      setSelectedGalponId(sectors[0].galpones?.[0]?.id || '');
-    } else if (sectors.length === 0) {
+    if (scopedSectors.length > 0 && !scopedSectors.some((s) => s.id === selectedSectorId)) {
+      setSelectedSectorId(scopedSectors[0].id);
+      setSelectedGalponId(scopedSectors[0].galpones?.[0]?.id || '');
+    } else if (scopedSectors.length === 0) {
       setSelectedSectorId('');
       setSelectedGalponId('');
     }
-  }, [sectors, selectedSectorId]);
+  }, [sectors, scopedSectors, selectedSectorId]);
 
   useEffect(() => {
     localStorage.setItem('calera_advances_clean', JSON.stringify(dailyAdvances));
@@ -878,8 +940,12 @@ export default function App() {
     action: 'REGISTRO' | 'MODIFICACIÓN' | 'ELIMINACIÓN',
     module: string,
     description: string,
-    customUser?: string
+    _customUser?: string
   ) => {
+    if (profile) {
+      recordAuditMovement(action, module, description);
+      return;
+    }
     const now = new Date();
     const timestamp = `${getSystemToday()} ${String(now.getHours()).padStart(
       2,
@@ -890,7 +956,7 @@ export default function App() {
     const entry = {
       id: generateId('log'),
       timestamp,
-      user: (customUser || activeUserName || 'Administrador').trim(),
+      user: (activeUserName || 'Administrador').trim(),
       action,
       module,
       description
@@ -899,12 +965,12 @@ export default function App() {
   };
 
   // ==========================================================================
-  // SELECTORES Y CÁLCULOS PRINCIPALES
+  // SELECTORES Y CÁLCULOS PRINCIPALES (RESPETANDO ALCANCE POR SECTOR Y GALPÓN)
   // ==========================================================================
   const currentSector = useMemo(() => {
-    if (!sectors.length) return null;
-    return sectors.find((s) => s.id === selectedSectorId) || sectors[0] || null;
-  }, [sectors, selectedSectorId]);
+    if (!scopedSectors.length) return null;
+    return scopedSectors.find((s) => s.id === selectedSectorId) || scopedSectors[0] || null;
+  }, [scopedSectors, selectedSectorId]);
 
   const currentGalpon = useMemo(() => {
     if (!currentSector || !currentSector.galpones?.length) return null;
@@ -917,7 +983,7 @@ export default function App() {
 
   const handleSelectSector = (secId: string) => {
     setSelectedSectorId(secId);
-    const sec = sectors.find((s) => s.id === secId);
+    const sec = scopedSectors.find((s) => s.id === secId);
     if (sec && sec.galpones?.length > 0) {
       setSelectedGalponId(sec.galpones[0].id);
     } else {
@@ -925,7 +991,7 @@ export default function App() {
     }
   };
 
-  // Lista plana de todos los galpones con referencia a su sector
+  // Lista plana de todos los galpones autorizados en el alcance del usuario con referencia a su sector
   const allGalponesList = useMemo(() => {
     const list: {
       id: string;
@@ -937,7 +1003,7 @@ export default function App() {
       sectorName: string;
       areas: any[];
     }[] = [];
-    sectors.forEach((sec) => {
+    scopedSectors.forEach((sec) => {
       (sec.galpones || []).forEach((g: any) => {
         list.push({
           id: g.id,
@@ -952,7 +1018,7 @@ export default function App() {
       });
     });
     return list;
-  }, [sectors]);
+  }, [scopedSectors]);
 
   // Estructuras disponibles (del Catálogo Maestro + Galpones + Materiales)
   const allKnownStructures = useMemo(() => {
@@ -1469,6 +1535,7 @@ export default function App() {
   // ==========================================================================
   const handleAddTemplateProvider = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('catalogo', 'create')) return;
     const clean = newTemplateName.trim();
     if (!clean || technologies.includes(clean)) return;
     setTechnologies((prev) => [...prev, clean]);
@@ -1481,6 +1548,7 @@ export default function App() {
   };
 
   const handleSaveRenameTemplate = (idx: number) => {
+    if (!requirePermission('catalogo', 'edit')) return;
     const oldName = technologies[idx];
     const newName = editingTemplateValue.trim();
     if (!newName || !oldName) return;
@@ -1512,6 +1580,7 @@ export default function App() {
   };
 
   const requestDeleteTemplateProvider = (techName: string) => {
+    if (!requirePermission('catalogo', 'delete')) return;
     const catalogCount = masterCatalog.filter((c) => c.technology === techName).length;
     const galponesCount = allGalponesList.filter((g) => g.technology === techName).length;
     const materialsCount = materials.filter((m) => m.technology === techName).length;
@@ -1528,6 +1597,7 @@ export default function App() {
   };
 
   const openNewCatalogModal = () => {
+    if (!requirePermission('catalogo', 'create')) return;
     setEditingCatalogId(null);
     setFormCatalogItem({
       technology: '',
@@ -1549,6 +1619,7 @@ export default function App() {
   };
 
   const openEditCatalogModal = (item: any) => {
+    if (!requirePermission('catalogo', 'edit')) return;
     setEditingCatalogId(item.id);
     setFormCatalogItem({
       technology: item.technology || '',
@@ -1571,6 +1642,7 @@ export default function App() {
 
   const handleSaveCatalogItem = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('catalogo', editingCatalogId ? 'edit' : 'create')) return;
     if (
       !formCatalogItem.technology ||
       !formCatalogItem.code ||
@@ -1634,6 +1706,7 @@ export default function App() {
   };
 
   const requestDeleteCatalogItem = (id: string) => {
+    if (!requirePermission('catalogo', 'delete')) return;
     const targetItem = masterCatalog.find((c) => c.id === id);
     if (!targetItem) return;
     setDeleteConfirmModal({
@@ -1650,6 +1723,7 @@ export default function App() {
   // ==========================================================================
   const handleSaveNewProject = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('proyectos', 'create')) return;
     if (!formProject.name || !formProject.code) return;
 
     const newSecObj = {
@@ -1675,6 +1749,7 @@ export default function App() {
 
   const handleSaveEditProject = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('proyectos', 'edit')) return;
     if (!formProject.id || !formProject.name) return;
 
     const updatedCode = formProject.code.trim().toUpperCase();
@@ -1702,6 +1777,7 @@ export default function App() {
   };
 
   const requestDeleteSector = (secId: string) => {
+    if (!requirePermission('proyectos', 'delete')) return;
     const targetSec = sectors.find((s) => s.id === secId);
     if (!targetSec) return;
 
@@ -1753,6 +1829,7 @@ export default function App() {
 
   const handleSaveNewGalpon = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('proyectos', 'create')) return;
     const targetSecId = formGalpon.sectorId || currentSector?.id;
     if (!formGalpon.code || !formGalpon.name || !targetSecId || !formGalpon.technology)
       return;
@@ -1805,6 +1882,7 @@ export default function App() {
 
   const handleSaveEditGalpon = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('proyectos', 'edit')) return;
     if (!formGalpon.id) return;
 
     const supList = formGalpon.supervisorsStr
@@ -1858,6 +1936,7 @@ export default function App() {
   };
 
   const requestDeleteGalpon = (secId: string, galId: string) => {
+    if (!requirePermission('proyectos', 'delete')) return;
     const sec = sectors.find((s) => s.id === secId);
     const targetGal = sec?.galpones?.find((g: any) => g.id === galId);
     if (!targetGal) return;
@@ -2135,6 +2214,7 @@ export default function App() {
   };
 
   const handleReloadGalponFromCatalog = (secId: string, galponObj: any) => {
+    if (!requirePermission('proyectos', 'edit')) return;
     const cleanTech = (galponObj.technology || '').trim();
     setSectors((prev) =>
       prev.map((s) =>
@@ -2170,6 +2250,7 @@ export default function App() {
   // ==========================================================================
   const handleSaveNewActivity = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('actividades', 'create')) return;
     const primaryGalponId = formActivity.targetGalponId || currentGalpon?.id || '';
     if (!primaryGalponId) return;
     if (!formActivity.code || !formActivity.name || !formActivity.areaName) return;
@@ -2374,6 +2455,7 @@ export default function App() {
 
   const handleSaveEditedGalponActivity = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('actividades', 'edit')) return;
     if (!modalEditGalponActivity || !currentGalpon || !currentSector) return;
 
     const existingAct = evaluatedActivities.find(
@@ -2477,6 +2559,7 @@ export default function App() {
   };
 
   const requestDeleteGalponActivity = (actId: string) => {
+    if (!requirePermission('actividades', 'delete')) return;
     if (!currentGalpon || !currentSector) return;
     const targetAct = evaluatedActivities.find((a) => a.id === actId);
     if (!targetAct) return;
@@ -2506,6 +2589,7 @@ export default function App() {
     field: 'startDate' | 'dueDate',
     value: string
   ) => {
+    if (!requirePermission('gantt', 'edit')) return;
     if (!currentGalpon || !currentSector) return;
     const targetAct = evaluatedActivities.find((a) => a.id === actId);
     setSectors((prev) =>
@@ -2558,6 +2642,7 @@ export default function App() {
   // HANDLERS: MATERIALES (ASIGNAR A GALPÓN / ÁREA / SISTEMA / ESTRUCTURA)
   // ==========================================================================
   const openNewMaterialModal = () => {
+    if (!requirePermission('materiales', 'create')) return;
     setEditingMaterialId(null);
     setFormMaterial({
       sectorId: '',
@@ -2582,6 +2667,7 @@ export default function App() {
   };
 
   const openEditMaterialModal = (mat: any) => {
+    if (!requirePermission('materiales', 'edit')) return;
     setEditingMaterialId(mat.id);
     setFormMaterial({
       sectorId: mat.sectorId || '',
@@ -2607,6 +2693,7 @@ export default function App() {
 
   const handleSaveMaterial = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('materiales', editingMaterialId ? 'edit' : 'create')) return;
     const cleanCode = formMaterial.code.trim().toUpperCase();
     const cleanName = formMaterial.name.trim();
     const cleanTech = formMaterial.technology.trim();
@@ -2861,6 +2948,7 @@ export default function App() {
   };
 
   const requestDeleteMaterial = (id: string) => {
+    if (!requirePermission('materiales', 'delete')) return;
     const targetMat = materials.find((m) => m.id === id);
     if (!targetMat) return;
     const relatedAdvancesCount = dailyAdvances.filter((adv) =>
@@ -2892,6 +2980,7 @@ export default function App() {
   // HANDLERS: AVANCE DIARIO EN CASCADA + TRABAJO BIPROYECTO (C-2) + CONSUMO POR ID (C-1)
   // ==========================================================================
   const openNewAdvanceModal = (prefill?: Partial<typeof formAdvance>) => {
+    if (!requirePermission('avance_diario', 'create')) return;
     setEditingAdvanceId(null);
     setFormAdvance({
       areaName: prefill?.areaName || '',
@@ -2913,6 +3002,7 @@ export default function App() {
   };
 
   const openEditAdvanceModal = (adv: any) => {
+    if (!requirePermission('avance_diario', 'edit')) return;
     setEditingAdvanceId(adv.id);
     const act = evaluatedActivities.find(
       (a) => (adv.activityId && a.id === adv.activityId) || a.code === adv.activityCode
@@ -3002,6 +3092,7 @@ export default function App() {
 
   const handleSaveAdvance = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('avance_diario', editingAdvanceId ? 'edit' : 'create')) return;
     if (!formAdvance.activityCode || !formAdvance.quantityToday || !currentGalpon)
       return;
 
@@ -3309,6 +3400,7 @@ export default function App() {
   };
 
   const requestDeleteAdvance = (advId: string) => {
+    if (!requirePermission('avance_diario', 'delete')) return;
     const targetAdv = dailyAdvances.find((a) => a.id === advId);
     if (!targetAdv) return;
     const actObj = evaluatedActivities.find(
@@ -3335,6 +3427,7 @@ export default function App() {
   // ==========================================================================
   const handleSaveWorker = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requirePermission('personal', formWorker.id ? 'edit' : 'create')) return;
     if (
       !formWorker.name ||
       !formWorker.workerCode ||
@@ -3377,6 +3470,7 @@ export default function App() {
   };
 
   const handleWorkerFieldChange = (workerId: string, field: string, value: any) => {
+    if (!requirePermission('personal', 'edit')) return;
     const targetW = masterWorkforce.find((w) => w.id === workerId);
     setMasterWorkforce((prev) =>
       prev.map((w) => (w.id === workerId ? { ...w, [field]: value } : w))
@@ -3389,6 +3483,7 @@ export default function App() {
   };
 
   const handleWorkerSectorChange = (workerId: string, newSectorId: string) => {
+    if (!requirePermission('personal', 'edit')) return;
     const targetW = masterWorkforce.find((w) => w.id === workerId);
     const targetSector = sectors.find((s) => s.id === newSectorId);
 
@@ -3407,6 +3502,7 @@ export default function App() {
   };
 
   const requestDeleteWorker = (workerId: string) => {
+    if (!requirePermission('personal', 'delete')) return;
     const targetW = masterWorkforce.find((w) => w.id === workerId);
     if (!targetW) return;
     const attendanceDaysCount = Object.values(attendanceRecords).filter(
@@ -3426,6 +3522,7 @@ export default function App() {
   };
 
   const handleSetWorkerAttendance = (workerId: string, status: string) => {
+    if (!requirePermission('asistencia', 'edit')) return;
     const targetW = masterWorkforce.find((w) => w.id === workerId);
     setAttendanceRecords((prev) => {
       const dayMap = prev[attendanceDate] || {};
@@ -3445,6 +3542,7 @@ export default function App() {
   };
 
   const handleMarkAllAttended = () => {
+    if (!requirePermission('asistencia', 'edit')) return;
     setAttendanceRecords((prev) => {
       const dayMap = { ...(prev[attendanceDate] || {}) };
       filteredAttendanceWorkers.forEach((w) => {
@@ -3956,6 +4054,7 @@ export default function App() {
   const handleConfirmBulkUpload = (e: React.FormEvent) => {
     e.preventDefault();
     if (!modalBulkUpload) return;
+    if (!requirePermission(modalBulkUpload, 'import')) return;
     const validPayloads = bulkImportAnalysis.validRows.map((r) => r.payload);
     if (validPayloads.length === 0) return;
 
@@ -3999,6 +4098,7 @@ export default function App() {
   // EXPORTACIONES CSV COMPATIBLES CON EXCEL (UTF-8 BOM + BLOB - C-8)
   // ==========================================================================
   const handleExportGlobalCSV = () => {
+    if (!requirePermission('informes', 'export')) return;
     const headers = [
       'Sector',
       'Galpón',
@@ -4020,7 +4120,7 @@ export default function App() {
     ];
     const rows: (string | number)[][] = [];
 
-    sectors.forEach((sec) => {
+    scopedSectors.forEach((sec) => {
       (sec.galpones || []).forEach((gal: any) => {
         (gal.areas || []).forEach((area: any) => {
           const pushRow = (
@@ -4100,6 +4200,7 @@ export default function App() {
   };
 
   const handleExportMaterialsCSV = () => {
+    if (!requirePermission('materiales', 'export')) return;
     const headers = [
       'Sector',
       'Galpón',
@@ -4186,6 +4287,7 @@ export default function App() {
   };
 
   const handleExportAttendanceCSV = () => {
+    if (!requirePermission('asistencia', 'export')) return;
     const headers = [
       'Fecha',
       'Código Operario',
@@ -4223,6 +4325,7 @@ export default function App() {
   };
 
   const handleExportMovementsCSV = () => {
+    if (!requirePermission('movimientos', 'export')) return;
     const headers = [
       'Fecha y Hora',
       'Usuario',
@@ -4482,8 +4585,14 @@ export default function App() {
         </div>
 
         <div className="p-3 bg-slate-50 border-t border-slate-200 text-[11px] text-slate-500 flex items-center justify-between">
-          <span>Proyectos Automatizados</span>
-          <span className="text-[#0f6b38] font-bold">Estado Limpio</span>
+          <span>Firestore Realtime</span>
+          <span className="text-[#0f6b38] font-bold">
+            {syncStatus === 'synced'
+              ? 'Sincronizado'
+              : syncStatus === 'syncing'
+                ? 'Sincronizando...'
+                : 'Modo local'}
+          </span>
         </div>
       </aside>
 
@@ -4507,43 +4616,58 @@ export default function App() {
                   Proyectos Galpones Automatizados
                 </h1>
                 <p className="text-[11px] text-emerald-100 hidden sm:block">
-                  Actividades, materiales, asistencia e indicadores
+                  Actividades, materiales, asistencia e indicadores •{' '}
+                  <span className="font-bold text-white">
+                    {syncStatus === 'synced'
+                      ? `Firestore en vivo${lastSyncedAt ? ` (${lastSyncedAt})` : ''}`
+                      : syncStatus === 'syncing'
+                        ? 'Sincronizando Firestore...'
+                        : 'Caché local'}
+                  </span>
                 </p>
               </div>
             </div>
 
             <div className="flex items-center gap-2 flex-wrap justify-end">
-              <button
-                onClick={() => setCurrentTab('proyectos')}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-emerald-800/80 text-white hover:bg-emerald-700 transition border border-emerald-600/40"
-              >
-                <FolderPlus className="w-3.5 h-3.5" />
-                <span className="hidden md:inline">Sectores / Galpones</span>
-              </button>
+              {canDo('proyectos', 'view') && (
+                <button
+                  onClick={() => setCurrentTab('proyectos')}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-emerald-800/80 text-white hover:bg-emerald-700 transition border border-emerald-600/40"
+                >
+                  <FolderPlus className="w-3.5 h-3.5" />
+                  <span className="hidden md:inline">Sectores / Galpones</span>
+                </button>
+              )}
 
-              <button
-                onClick={() => setCurrentTab('catalogo')}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-white text-[#0f6b38] shadow-xs hover:bg-slate-50 transition"
-              >
-                <BookOpen className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Catálogo Maestro</span>
-              </button>
+              {canDo('catalogo', 'view') && (
+                <button
+                  onClick={() => setCurrentTab('catalogo')}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-white text-[#0f6b38] shadow-xs hover:bg-slate-50 transition"
+                >
+                  <BookOpen className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Catálogo Maestro</span>
+                </button>
+              )}
 
-              <button
-                onClick={() => setCurrentTab('materiales')}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-white text-[#0f6b38] shadow-xs hover:bg-slate-50 transition"
-              >
-                <Package className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Materiales</span>
-              </button>
+              {canDo('materiales', 'view') && (
+                <button
+                  onClick={() => setCurrentTab('materiales')}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-white text-[#0f6b38] shadow-xs hover:bg-slate-50 transition"
+                >
+                  <Package className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Materiales</span>
+                </button>
+              )}
 
-              <button
-                onClick={() => setCurrentTab('movimientos')}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-emerald-800/80 text-white hover:bg-emerald-700 transition border border-emerald-600/40"
-              >
-                <ClipboardList className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Movimientos</span>
-              </button>
+              {canDo('movimientos', 'view') && (
+                <button
+                  onClick={() => setCurrentTab('movimientos')}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-emerald-800/80 text-white hover:bg-emerald-700 transition border border-emerald-600/40"
+                >
+                  <ClipboardList className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Movimientos</span>
+                </button>
+              )}
             </div>
           </div>
 
@@ -4553,24 +4677,28 @@ export default function App() {
               <span className="text-[11px] uppercase tracking-wider text-emerald-200 font-bold shrink-0">
                 Sector:
               </span>
-              {sectors.length === 0 ? (
-                <button
-                  onClick={() => {
-                    setFormProject({
-                      id: '',
-                      code: '',
-                      name: '',
-                      location: '',
-                      client: ''
-                    });
-                    setModalNewProject(true);
-                  }}
-                  className="px-2.5 py-1 rounded-lg bg-amber-400 text-slate-950 font-black text-xs"
-                >
-                  + Crear Primer Sector
-                </button>
+              {scopedSectors.length === 0 ? (
+                canDo('proyectos', 'create') ? (
+                  <button
+                    onClick={() => {
+                      setFormProject({
+                        id: '',
+                        code: '',
+                        name: '',
+                        location: '',
+                        client: ''
+                      });
+                      setModalNewProject(true);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-amber-400 text-slate-950 font-black text-xs"
+                  >
+                    + Crear Primer Sector
+                  </button>
+                ) : (
+                  <span className="text-emerald-200 italic">Sin sectores asignados</span>
+                )
               ) : (
-                sectors.map((sec) => {
+                scopedSectors.map((sec) => {
                   const isSel = currentSector?.id === sec.id;
                   return (
                     <button
@@ -4588,15 +4716,17 @@ export default function App() {
                   );
                 })
               )}
-              <button
-                onClick={() => {
-                  setFormProject({ id: '', code: '', name: '', location: '', client: '' });
-                  setModalNewProject(true);
-                }}
-                className="px-2 py-1 rounded-lg bg-emerald-800/90 hover:bg-emerald-700 text-emerald-100 text-[11px] font-bold shrink-0"
-              >
-                + Nuevo Sector
-              </button>
+              {canDo('proyectos', 'create') && (
+                <button
+                  onClick={() => {
+                    setFormProject({ id: '', code: '', name: '', location: '', client: '' });
+                    setModalNewProject(true);
+                  }}
+                  className="px-2 py-1 rounded-lg bg-emerald-800/90 hover:bg-emerald-700 text-emerald-100 text-[11px] font-bold shrink-0"
+                >
+                  + Nuevo Sector
+                </button>
+              )}
             </div>
 
             <div className="flex items-center gap-2 overflow-x-auto">
@@ -4604,27 +4734,31 @@ export default function App() {
                 Galpón:
               </span>
               {!currentSector || !currentSector.galpones?.length ? (
-                <button
-                  disabled={!currentSector}
-                  onClick={() => {
-                    if (!currentSector) return;
-                    setFormGalpon({
-                      id: '',
-                      sectorId: currentSector.id,
-                      code: '',
-                      name: '',
-                      description: '',
-                      supervisorsStr: '',
-                      startDate: '',
-                      endDate: '',
-                      technology: ''
-                    });
-                    setModalNewGalpon(true);
-                  }}
-                  className="px-2.5 py-1 rounded-lg bg-amber-400 disabled:opacity-40 text-slate-950 font-black text-xs"
-                >
-                  + Crear Galpón
-                </button>
+                canDo('proyectos', 'create') ? (
+                  <button
+                    disabled={!currentSector}
+                    onClick={() => {
+                      if (!currentSector) return;
+                      setFormGalpon({
+                        id: '',
+                        sectorId: currentSector.id,
+                        code: '',
+                        name: '',
+                        description: '',
+                        supervisorsStr: '',
+                        startDate: '',
+                        endDate: '',
+                        technology: ''
+                      });
+                      setModalNewGalpon(true);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-amber-400 disabled:opacity-40 text-slate-950 font-black text-xs"
+                  >
+                    + Crear Galpón
+                  </button>
+                ) : (
+                  <span className="text-emerald-200 italic">Sin galpones asignados</span>
+                )
               ) : (
                 currentSector.galpones.map((gal: any) => {
                   const isSel = currentGalpon?.id === gal.id;
@@ -4682,14 +4816,16 @@ export default function App() {
               />
             </div>
 
-            <button
-              disabled={!currentGalpon}
-              onClick={() => openNewAdvanceModal()}
-              className="px-3 py-1.5 rounded-lg bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold text-xs shadow-xs transition flex items-center gap-1.5"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>+ Registrar Avance</span>
-            </button>
+            {canDo('avance_diario', 'create') && (
+              <button
+                disabled={!currentGalpon}
+                onClick={() => openNewAdvanceModal()}
+                className="px-3 py-1.5 rounded-lg bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold text-xs shadow-xs transition flex items-center gap-1.5"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>+ Registrar Avance</span>
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -4698,6 +4834,21 @@ export default function App() {
       {/* 4. CONTENIDO PRINCIPAL                                               */}
       {/* ==================================================================== */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 pb-24">
+        {permissionNotice && (
+          <div className="mb-4 bg-amber-50 border border-amber-300 text-amber-900 px-4 py-3 rounded-xl text-xs font-bold flex items-center justify-between shadow-xs">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>{permissionNotice}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPermissionNotice(null)}
+              className="text-amber-700 hover:text-amber-950 font-black px-2"
+            >
+              ✕
+            </button>
+          </div>
+        )}
         {/* ================================================================== */}
         {/* VISTA 1: DASHBOARD                                                 */}
         {/* ================================================================== */}
@@ -6566,23 +6717,21 @@ export default function App() {
 
               <div className="flex flex-wrap items-center gap-3 text-xs">
                 <div className="flex items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-300">
-                  <span className="font-bold text-slate-600">Usuario Activo:</span>
-                  <input
-                    type="text"
-                    value={activeUserName}
-                    onChange={(e) => setActiveUserName(e.target.value)}
-                    placeholder="Nombre del usuario..."
-                    className="bg-white px-2.5 py-1 rounded-lg border border-slate-300 font-bold text-[#0f6b38] w-40"
-                  />
+                  <span className="font-bold text-slate-600">Usuario Autenticado:</span>
+                  <span className="bg-white px-2.5 py-1 rounded-lg border border-slate-200 font-bold text-[#0f6b38]">
+                    {profile?.displayName || activeUserName} ({profile?.role || 'Autenticado'})
+                  </span>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleExportMovementsCSV}
-                  className="px-3.5 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] text-white font-bold flex items-center gap-1.5"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>Exportar Bitácora (.CSV)</span>
-                </button>
+                {canDo('movimientos', 'export') && (
+                  <button
+                    type="button"
+                    onClick={handleExportMovementsCSV}
+                    className="px-3.5 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] text-white font-bold flex items-center gap-1.5"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>Exportar Bitácora (.CSV)</span>
+                  </button>
+                )}
               </div>
             </div>
 

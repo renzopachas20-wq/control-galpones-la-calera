@@ -1,152 +1,180 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState, useEffect, createContext, useContext } from 'react';
 import {
-  Eye,
-  EyeOff,
+  Building2,
   Lock,
   Mail,
-  LogOut,
-  Shield,
-  Users,
+  KeyRound,
   AlertCircle,
   CheckCircle2,
-  ArrowLeft,
-  KeyRound,
+  Loader2,
+  ShieldCheck,
+  LogOut,
+  Users,
+  Eye,
+  EyeOff,
+  ArrowLeft
 } from 'lucide-react';
 import {
-  type UserProfile,
-  loginWithEmailAndPassword,
-  sendPasswordRecoveryEmail,
-  logoutUser,
-  subscribeToAuthChanges,
-  subscribeToCurrentUserProfile,
+  auth,
+  firebaseConfig
+} from '../firebase/config';
+import {
+  loginWithEmail,
+  loginWithGoogle,
+  logoutSession,
+  requestPasswordReset,
   fetchOrBootstrapProfile,
+  subscribeToUserProfile,
+  translateFirebaseAuthError,
+  onAuthStateChanged,
+  type UserProfile
 } from '../firebase/authService';
 import { UserAdminModal } from './UserAdminModal';
+
+interface AuthContextValue {
+  profile: UserProfile | null;
+  openUserAdminModal: () => void;
+  logout: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextValue>({
+  profile: null,
+  openUserAdminModal: () => {},
+  logout: async () => {}
+});
+
+export function useAuthProfile(): AuthContextValue {
+  return useContext(AuthContext);
+}
 
 interface AuthGateProps {
   children: React.ReactNode;
 }
 
 export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
-  const [authReady, setAuthReady] = useState<boolean>(false);
-  const [currentUserProfile, setCurrentUserProfile] = useState<UserProfile | null>(null);
+  const [initializing, setInitializing] = useState(true);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
 
-  // Estado del formulario de acceso / recuperación
-  const [mode, setMode] = useState<'login' | 'recover'>('login');
-  const [email, setEmail] = useState<string>('');
-  const [password, setPassword] = useState<string>('');
-  const [showPassword, setShowPassword] = useState<boolean>(false);
-  const [submitting, setSubmitting] = useState<boolean>(false);
-  const [errorBanner, setErrorBanner] = useState<string>('');
-  const [infoBanner, setInfoBanner] = useState<string>('');
+  // Login Form State
+  const [mode, setMode] = useState<'login' | 'reset'>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [googleSubmitting, setGoogleSubmitting] = useState(false);
+  const [resetSuccessMsg, setResetSuccessMsg] = useState<string | null>(null);
 
-  // Modal de Administración de Usuarios (solo Administrador)
-  const [isUserAdminOpen, setIsUserAdminOpen] = useState<boolean>(false);
+  // User Admin Modal State (Only for Administrador)
+  const [isUserAdminOpen, setIsUserAdminOpen] = useState(false);
 
   useEffect(() => {
-    let profileUnsub: (() => void) | null = null;
+    let unsubscribeProfile: (() => void) | null = null;
 
-    const authUnsub = subscribeToAuthChanges(async (firebaseUser) => {
-      if (profileUnsub) {
-        profileUnsub();
-        profileUnsub = null;
+    const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (unsubscribeProfile) {
+        unsubscribeProfile();
+        unsubscribeProfile = null;
       }
 
       if (!firebaseUser) {
-        setCurrentUserProfile(null);
-        setAuthReady(true);
+        setProfile(null);
+        setInitializing(false);
         return;
       }
 
       try {
-        const initialProfile = await fetchOrBootstrapProfile(firebaseUser);
-        if (!initialProfile.active) {
-          await logoutUser();
-          setCurrentUserProfile(null);
-          setErrorBanner(
-            'Tu cuenta ha sido desactivada por el Administrador y no tiene permiso para acceder al sistema.'
-          );
-          setAuthReady(true);
-          return;
-        }
+        const verifiedProfile = await fetchOrBootstrapProfile(firebaseUser);
+        setProfile(verifiedProfile);
+        setAuthError(null);
 
-        setCurrentUserProfile(initialProfile);
-        setAuthReady(true);
-
-        // Suscripción en tiempo real al perfil para cortar el acceso inmediatamente si se desactiva la cuenta
-        profileUnsub = subscribeToCurrentUserProfile(
+        // Escuchar en tiempo real si el usuario es desactivado o cambia su rol/alcance
+        unsubscribeProfile = subscribeToUserProfile(
           firebaseUser.uid,
           async (liveProfile) => {
             if (!liveProfile) {
-              await logoutUser();
-              setCurrentUserProfile(null);
-              setErrorBanner(
-                'Tu perfil de usuario ya no se encuentra disponible. Contacta al Administrador.'
-              );
+              setAuthError('Su perfil de usuario ya no se encuentra registrado en el sistema.');
+              await logoutSession();
+              setProfile(null);
               return;
             }
             if (!liveProfile.active) {
-              await logoutUser();
-              setCurrentUserProfile(null);
-              setIsUserAdminOpen(false);
-              setErrorBanner(
-                'Tu cuenta ha sido desactivada por el Administrador. Tu sesión se ha cerrado por seguridad.'
-              );
+              setAuthError('Su cuenta ha sido desactivada por el Administrador. Sesión finalizada.');
+              await logoutSession();
+              setProfile(null);
               return;
             }
-            setCurrentUserProfile(liveProfile);
-          },
-          async () => {
-            // Si el token venció o las reglas bloquean la lectura del perfil
-            await logoutUser();
-            setCurrentUserProfile(null);
-            setErrorBanner('Tu sesión ha expirado. Por favor inicia sesión nuevamente.');
+            setProfile(liveProfile);
           }
         );
-      } catch (err) {
-        await logoutUser();
-        setCurrentUserProfile(null);
-        setErrorBanner(err instanceof Error ? err.message : String(err));
-        setAuthReady(true);
+      } catch (err: any) {
+        setProfile(null);
+        setAuthError(translateFirebaseAuthError(err));
+      } finally {
+        setInitializing(false);
       }
     });
 
     return () => {
-      if (profileUnsub) profileUnsub();
-      authUnsub();
+      unsubscribeAuth();
+      if (unsubscribeProfile) unsubscribeProfile();
     };
   }, []);
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setErrorBanner('');
-    setInfoBanner('');
-    setSubmitting(true);
+    setAuthError(null);
+    setResetSuccessMsg(null);
 
+    if (!email.trim() || !password) {
+      setAuthError('Ingrese su correo electrónico y contraseña.');
+      return;
+    }
+
+    setSubmitting(true);
     try {
-      const profile = await loginWithEmailAndPassword(email, password);
-      setCurrentUserProfile(profile);
+      const { profile: loggedProfile } = await loginWithEmail(email, password);
+      setProfile(loggedProfile);
       setPassword('');
-    } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : String(err));
+    } catch (err: any) {
+      setAuthError(translateFirebaseAuthError(err));
     } finally {
       setSubmitting(false);
     }
   };
 
-  const handleRecoverSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorBanner('');
-    setInfoBanner('');
-    setSubmitting(true);
-
+  const handleGoogleLogin = async () => {
+    setAuthError(null);
+    setResetSuccessMsg(null);
+    setGoogleSubmitting(true);
     try {
-      await sendPasswordRecoveryEmail(email);
-      setInfoBanner(
-        `Se ha enviado un enlace de recuperación de contraseña a ${email.trim().toLowerCase()}. Revisa tu bandeja de entrada y correo no deseado.`
+      const { profile: loggedProfile } = await loginWithGoogle();
+      setProfile(loggedProfile);
+    } catch (err: any) {
+      setAuthError(translateFirebaseAuthError(err));
+    } finally {
+      setGoogleSubmitting(false);
+    }
+  };
+
+  const handleResetSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setResetSuccessMsg(null);
+
+    if (!email.trim()) {
+      setAuthError('Ingrese el correo electrónico asociado a su cuenta.');
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      await requestPasswordReset(email);
+      setResetSuccessMsg(
+        `Se ha enviado un enlace de recuperación a ${email.trim().toLowerCase()}. Revise su bandeja de entrada y carpeta de spam.`
       );
-    } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : String(err));
+    } catch (err: any) {
+      setAuthError(translateFirebaseAuthError(err));
     } finally {
       setSubmitting(false);
     }
@@ -154,214 +182,244 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
 
   const handleLogout = async () => {
     setIsUserAdminOpen(false);
-    await logoutUser();
-    setCurrentUserProfile(null);
-    setPassword('');
-    setInfoBanner('Has cerrado sesión correctamente.');
+    await logoutSession();
+    setProfile(null);
   };
 
-  if (!authReady) {
+  if (initializing) {
     return (
-      <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-lg border border-slate-200 p-8 max-w-md w-full text-center space-y-3">
-          <div className="w-12 h-12 rounded-2xl bg-[#0f6b38] text-white font-black text-lg flex items-center justify-center mx-auto shadow-sm">
-            PA
-          </div>
-          <h2 className="text-base font-bold text-slate-800">
-            Verificando sesión segura...
-          </h2>
-          <p className="text-xs text-slate-500">
-            Control Galpones La Calera • Proyectos Automatizados
-          </p>
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-slate-100">
+        <div className="w-16 h-16 rounded-2xl bg-emerald-600/20 border border-emerald-500/40 flex items-center justify-center mb-4 animate-pulse">
+          <Building2 className="w-8 h-8 text-emerald-400" />
+        </div>
+        <div className="flex items-center gap-2.5 text-sm font-semibold text-slate-300">
+          <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
+          <span>Verificando credenciales y permisos en Control Galpones La Calera...</span>
         </div>
       </div>
     );
   }
 
-  // Si el usuario NO está autenticado o no tiene perfil activo -> Mostrar Pantalla de Acceso
-  if (!currentUserProfile) {
+  if (!profile) {
     return (
-      <div className="min-h-screen bg-slate-100 flex flex-col justify-center items-center p-4 sm:p-6">
-        <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-slate-200 overflow-hidden">
-          {/* Cabecera con identidad visual de Control Galpones La Calera */}
-          <div className="bg-[#0f6b38] px-6 py-7 text-white text-center space-y-2">
-            <div className="w-14 h-14 rounded-2xl bg-white/15 border border-white/25 flex items-center justify-center mx-auto text-xl font-black tracking-wider shadow-xs">
-              PA
+      <div className="min-h-screen bg-slate-950 flex flex-col justify-center items-center p-4 sm:p-6 relative overflow-hidden">
+        {/* Fondo arquitectónico sutil */}
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,_rgba(16,185,129,0.12),_transparent_50%),radial-gradient(circle_at_bottom_left,_rgba(30,58,138,0.18),_transparent_55%)] pointer-events-none" />
+
+        <div className="w-full max-w-md bg-slate-900/95 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden relative z-10 backdrop-blur-md">
+          {/* Cabecera Institucional */}
+          <div className="px-6 pt-7 pb-5 bg-gradient-to-b from-slate-800/80 to-slate-900 border-b border-slate-800 text-center">
+            <div className="w-14 h-14 mx-auto mb-3 rounded-2xl bg-emerald-600/20 border border-emerald-500/40 flex items-center justify-center shadow-inner">
+              <Building2 className="w-7 h-7 text-emerald-400" />
             </div>
-            <h1 className="text-xl font-extrabold tracking-tight">
+            <h1 className="text-xl font-bold text-white tracking-tight">
               Control Galpones La Calera
             </h1>
-            <p className="text-xs text-emerald-100 font-medium">
-              Proyectos Galpones Automatizados • Acceso Corporativo
+            <p className="text-xs text-slate-400 mt-1">
+              Sistema Centralizado de Gestión Constructiva, Avances y Almacén
             </p>
+            <div className="mt-3 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-800/90 border border-slate-700 text-[11px] font-medium text-emerald-400">
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Acceso Seguro Autorizado ({firebaseConfig.projectId})</span>
+            </div>
           </div>
 
-          <div className="p-6 sm:p-7 space-y-5">
-            {errorBanner && (
-              <div
-                role="alert"
-                className="flex items-start gap-2.5 p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-800 text-xs sm:text-sm"
-              >
-                <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
-                <div className="flex-1 font-medium">{errorBanner}</div>
+          <div className="p-6">
+            {authError && (
+              <div className="mb-5 p-3.5 rounded-xl bg-red-950/60 border border-red-800/80 flex items-start gap-2.5 text-xs text-red-200">
+                <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <div className="leading-relaxed">{authError}</div>
               </div>
             )}
 
-            {infoBanner && (
-              <div
-                role="status"
-                className="flex items-start gap-2.5 p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs sm:text-sm"
-              >
-                <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-                <div className="flex-1 font-medium">{infoBanner}</div>
+            {resetSuccessMsg && (
+              <div className="mb-5 p-3.5 rounded-xl bg-emerald-950/60 border border-emerald-800/80 flex items-start gap-2.5 text-xs text-emerald-200">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                <div className="leading-relaxed">{resetSuccessMsg}</div>
               </div>
             )}
 
             {mode === 'login' ? (
-              <form onSubmit={handleLoginSubmit} className="space-y-4">
-                <div>
-                  <label
-                    htmlFor="login-email"
-                    className="block text-xs font-bold text-slate-700 uppercase mb-1.5"
+              <div className="space-y-4">
+                <form onSubmit={handleLoginSubmit} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                      Correo Electrónico Corporativo
+                    </label>
+                    <div className="relative">
+                      <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="email"
+                        required
+                        autoComplete="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="usuario@lacalera.pe"
+                        className="w-full pl-10 pr-4 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        Contraseña
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMode('reset');
+                          setAuthError(null);
+                          setResetSuccessMsg(null);
+                        }}
+                        className="text-xs text-emerald-400 hover:text-emerald-300 font-medium transition"
+                      >
+                        ¿Olvidó su contraseña?
+                      </button>
+                    </div>
+                    <div className="relative">
+                      <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        required
+                        autoComplete="current-password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="w-full pl-10 pr-10 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword((prev) => !prev)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
+                        tabIndex={-1}
+                      >
+                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={submitting || googleSubmitting}
+                    className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-800/60 text-white font-semibold text-sm rounded-xl shadow-lg shadow-emerald-950/50 flex items-center justify-center gap-2 transition cursor-pointer"
                   >
-                    Correo Electrónico
+                    {submitting ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Ingresando al sistema...</span>
+                      </>
+                    ) : (
+                      <>
+                        <KeyRound className="w-4 h-4" />
+                        <span>Iniciar Sesión</span>
+                      </>
+                    )}
+                  </button>
+                </form>
+
+                {/* Separador OAuth */}
+                <div className="relative flex py-1 items-center">
+                  <div className="flex-grow border-t border-slate-800"></div>
+                  <span className="flex-shrink mx-3 text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
+                    o ingresar con cuenta autorizada
+                  </span>
+                  <div className="flex-grow border-t border-slate-800"></div>
+                </div>
+
+                {/* Botón Oficial: Continuar con Google */}
+                <button
+                  type="button"
+                  onClick={handleGoogleLogin}
+                  disabled={submitting || googleSubmitting}
+                  className="w-full py-2.5 px-4 bg-white hover:bg-slate-100 disabled:bg-slate-300 text-slate-900 font-semibold text-sm rounded-xl shadow flex items-center justify-center gap-2.5 transition cursor-pointer border border-slate-200"
+                >
+                  {googleSubmitting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin text-slate-700" />
+                      <span>Verificando cuenta de Google...</span>
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" viewBox="0 0 24 24">
+                        <path
+                          fill="#4285F4"
+                          d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                        />
+                        <path
+                          fill="#34A853"
+                          d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                        />
+                        <path
+                          fill="#FBBC05"
+                          d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+                        />
+                        <path
+                          fill="#EA4335"
+                          d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                        />
+                      </svg>
+                      <span>Continuar con Google</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            ) : (
+              <form onSubmit={handleResetSubmit} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                    Correo Electrónico a Recuperar
                   </label>
                   <div className="relative">
-                    <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                     <input
-                      id="login-email"
-                      name="email"
                       type="email"
-                      autoComplete="email"
                       required
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       placeholder="usuario@lacalera.pe"
-                      className="w-full pl-10 pr-3.5 py-2.5 rounded-xl border border-slate-300 bg-slate-50 focus:bg-white text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-[#0f6b38] transition"
+                      className="w-full pl-10 pr-4 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500"
                     />
                   </div>
-                </div>
-
-                <div>
-                  <label
-                    htmlFor="login-password"
-                    className="block text-xs font-bold text-slate-700 uppercase mb-1.5"
-                  >
-                    Contraseña
-                  </label>
-                  <div className="relative">
-                    <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                    <input
-                      id="login-password"
-                      name="password"
-                      type={showPassword ? 'text' : 'password'}
-                      autoComplete="current-password"
-                      required
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      placeholder="Ingresa tu contraseña"
-                      className="w-full pl-10 pr-11 py-2.5 rounded-xl border border-slate-300 bg-slate-50 focus:bg-white text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-[#0f6b38] transition"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowPassword((prev) => !prev)}
-                      aria-label={showPassword ? 'Ocultar contraseña' : 'Mostrar contraseña'}
-                      title={showPassword ? 'Ocultar contraseña' : 'Mostrar contraseña'}
-                      className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-200/60 transition"
-                    >
-                      {showPassword ? (
-                        <EyeOff className="w-4 h-4" />
-                      ) : (
-                        <Eye className="w-4 h-4" />
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-end">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setErrorBanner('');
-                      setInfoBanner('');
-                      setMode('recover');
-                    }}
-                    className="text-xs font-bold text-[#0f6b38] hover:underline"
-                  >
-                    ¿Olvidaste tu contraseña? Recuperar acceso
-                  </button>
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={submitting}
-                  className="w-full py-3 px-4 rounded-xl bg-[#0f6b38] hover:bg-[#0b522a] disabled:opacity-60 text-white font-bold text-sm shadow-sm transition cursor-pointer"
-                >
-                  {submitting ? 'Verificando credenciales...' : 'Iniciar Sesión'}
-                </button>
-              </form>
-            ) : (
-              <form onSubmit={handleRecoverSubmit} className="space-y-4">
-                <div className="space-y-1">
-                  <h2 className="text-sm font-bold text-slate-900 flex items-center gap-1.5">
-                    <KeyRound className="w-4 h-4 text-[#0f6b38]" />
-                    Recuperación de Contraseña
-                  </h2>
-                  <p className="text-xs text-slate-600">
-                    Ingresa el correo electrónico de tu cuenta autorizada para enviarte un enlace de restablecimiento.
+                  <p className="text-[11px] text-slate-400 mt-1.5">
+                    Se enviará un enlace seguro de Firebase Authentication para restablecer su contraseña.
                   </p>
                 </div>
 
-                <div>
-                  <label
-                    htmlFor="recover-email"
-                    className="block text-xs font-bold text-slate-700 uppercase mb-1.5"
-                  >
-                    Correo Electrónico Registrado
-                  </label>
-                  <div className="relative">
-                    <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                    <input
-                      id="recover-email"
-                      name="recoverEmail"
-                      type="email"
-                      required
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      placeholder="usuario@lacalera.pe"
-                      className="w-full pl-10 pr-3.5 py-2.5 rounded-xl border border-slate-300 bg-slate-50 focus:bg-white text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-[#0f6b38] transition"
-                    />
-                  </div>
-                </div>
-
                 <button
                   type="submit"
                   disabled={submitting}
-                  className="w-full py-3 px-4 rounded-xl bg-[#0f6b38] hover:bg-[#0b522a] disabled:opacity-60 text-white font-bold text-sm shadow-sm transition cursor-pointer"
+                  className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-800/60 text-white font-semibold text-sm rounded-xl flex items-center justify-center gap-2 transition cursor-pointer"
                 >
-                  {submitting
-                    ? 'Enviando correo de recuperación...'
-                    : 'Enviar enlace de recuperación'}
+                  {submitting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Enviando enlace...</span>
+                    </>
+                  ) : (
+                    <span>Enviar Enlace de Recuperación</span>
+                  )}
                 </button>
 
                 <button
                   type="button"
                   onClick={() => {
-                    setErrorBanner('');
-                    setInfoBanner('');
                     setMode('login');
+                    setAuthError(null);
+                    setResetSuccessMsg(null);
                   }}
-                  className="w-full py-2.5 px-4 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 font-semibold text-xs inline-flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  className="w-full py-2 px-4 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium text-xs rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer"
                 >
                   <ArrowLeft className="w-3.5 h-3.5" />
-                  Volver a Iniciar Sesión
+                  <span>Volver al Inicio de Sesión</span>
                 </button>
               </form>
             )}
 
-            <div className="pt-3 border-t border-slate-200 text-center">
-              <p className="text-[11px] text-slate-500">
-                Acceso restringido a personal autorizado. El alta de cuentas es realizada exclusivamente por el Administrador del sistema.
+            <div className="mt-6 pt-4 border-t border-slate-800/80 text-center">
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                Acceso exclusivo para personal registrado por el Administrador de{' '}
+                <span className="text-slate-300 font-medium">La Calera</span>. El registro público se encuentra deshabilitado.
               </p>
             </div>
           </div>
@@ -370,56 +428,82 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
     );
   }
 
-  return (
-    <div className="min-h-screen flex flex-col">
-      {/* Barra superior de sesión activa e identificación de rol */}
-      <div className="bg-slate-900 text-white px-3 sm:px-6 py-2 text-xs flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 z-40">
-        <div className="flex items-center gap-2.5 flex-wrap">
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-900/70 text-emerald-200 border border-emerald-700/60 font-bold">
-            <Shield className="w-3.5 h-3.5 text-emerald-400" />
-            {currentUserProfile.role}
-          </span>
-          <span className="font-semibold text-slate-100">
-            {currentUserProfile.displayName}
-          </span>
-          <span className="text-slate-400 hidden sm:inline">
-            ({currentUserProfile.email})
-          </span>
-        </div>
+  const scopeBadgeText =
+    profile.role === 'Administrador'
+      ? 'Alcance Global'
+      : profile.assignedSectorIds.length > 0 || profile.assignedGalponIds.length > 0
+      ? `${profile.assignedSectorIds.length} sect. / ${profile.assignedGalponIds.length} galp.`
+      : profile.assignedProject && profile.assignedProject !== 'TODOS'
+      ? `Proyecto: ${profile.assignedProject}`
+      : 'Alcance Global';
 
-        <div className="flex items-center gap-2">
-          {currentUserProfile.role === 'Administrador' && (
+  return (
+    <AuthContext.Provider
+      value={{
+        profile,
+        openUserAdminModal: () => setIsUserAdminOpen(true),
+        logout: handleLogout
+      }}
+    >
+      <div className="min-h-screen flex flex-col bg-slate-100">
+        {/* Barra Superior de Sesión, Rol y Alcance */}
+        <div className="bg-slate-900 text-slate-100 border-b border-slate-800 px-3 sm:px-6 py-2 flex flex-wrap items-center justify-between gap-2 text-xs z-40">
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-semibold">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+              <span>{profile.role}</span>
+            </span>
+            <span className="text-slate-200 font-medium truncate max-w-[200px] sm:max-w-none">
+              {profile.displayName}
+            </span>
+            {profile.dni && (
+              <span className="text-slate-400 hidden md:inline">
+                (DNI: {profile.dni})
+              </span>
+            )}
+            <span className="text-slate-400 hidden lg:inline">
+              • {profile.email}
+            </span>
+            <span className="text-[11px] text-slate-300 bg-slate-800 border border-slate-700 px-2 py-0.5 rounded">
+              {scopeBadgeText}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {profile.role === 'Administrador' && (
+              <button
+                type="button"
+                onClick={() => setIsUserAdminOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold transition shadow-sm cursor-pointer"
+              >
+                <Users className="w-3.5 h-3.5" />
+                <span>Usuarios y Roles</span>
+              </button>
+            )}
+
             <button
               type="button"
-              onClick={() => setIsUserAdminOpen(true)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#0f6b38] hover:bg-[#138446] text-white font-bold text-xs transition cursor-pointer"
+              onClick={handleLogout}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-red-950/80 hover:text-red-200 hover:border-red-800 border border-slate-700 text-slate-300 font-medium transition cursor-pointer"
+              title="Cerrar sesión activa"
             >
-              <Users className="w-3.5 h-3.5" />
-              Gestión de Usuarios
+              <LogOut className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Cerrar Sesión</span>
             </button>
-          )}
-          <button
-            type="button"
-            onClick={handleLogout}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-red-900/80 text-slate-200 hover:text-white border border-slate-700 font-semibold text-xs transition cursor-pointer"
-          >
-            <LogOut className="w-3.5 h-3.5" />
-            Cerrar Sesión
-          </button>
+          </div>
         </div>
+
+        {/* Contenido Principal de la Aplicación */}
+        <div className="flex-1 flex flex-col">{children}</div>
+
+        {/* Modal de Administración de Usuarios (Exclusivo Administrador) */}
+        {profile.role === 'Administrador' && isUserAdminOpen && (
+          <UserAdminModal
+            currentUserProfile={profile}
+            onClose={() => setIsUserAdminOpen(false)}
+          />
+        )}
       </div>
-
-      {/* Aplicación principal conservada íntegramente */}
-      <div className="flex-1">{children}</div>
-
-      {/* Modal de Administración de Usuarios (Exclusivo Administrador) */}
-      {currentUserProfile.role === 'Administrador' && (
-        <UserAdminModal
-          isOpen={isUserAdminOpen}
-          onClose={() => setIsUserAdminOpen(false)}
-          currentAdmin={currentUserProfile}
-        />
-      )}
-    </div>
+    </AuthContext.Provider>
   );
 };
