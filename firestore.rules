@@ -1,10 +1,180 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Regla base de seguridad por defecto (Zero-Trust): denegar todo acceso no autorizado.
-    // Se habilitarán progresivamente las reglas por rol y colección en las Fases 4.2, 4.3 y 4.4.
+    // 1. Global Safety Net (Default Deny - Zero Trust)
     match /{document=**} {
       allow read, write: if false;
+    }
+
+    // 2. Hardened Global Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isRootAdminEmail() {
+      return isVerifiedUser() && request.auth.token.email == 'renzopachas20@gmail.com';
+    }
+
+    function hasCallerProfile() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function callerProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isActiveAdmin() {
+      return isSignedIn() && (
+        (hasCallerProfile() && callerProfile().active == true && callerProfile().role == 'Administrador') ||
+        (!hasCallerProfile() && isRootAdminEmail())
+      );
+    }
+
+    function isValidRole(role) {
+      return role is string && (
+        role == 'Administrador' ||
+        role == 'Jefe de proyecto' ||
+        role == 'Supervisor' ||
+        role == 'Auxiliar' ||
+        role == 'Almacén' ||
+        role == 'Solo lectura'
+      );
+    }
+
+    function isValidStringList(listVal, maxItems) {
+      return listVal is list &&
+        listVal.size() <= maxItems &&
+        (listVal.size() == 0 || (listVal[0] is string && listVal[0].size() <= 128));
+    }
+
+    // Blueprint Validation Helper for UserProfile (Never stores passwords)
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+          'uid',
+          'email',
+          'displayName',
+          'role',
+          'active',
+          'assignedSectorIds',
+          'assignedGalponIds',
+          'createdAt',
+          'createdBy',
+          'updatedAt',
+          'updatedBy',
+          'lastLoginAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'email',
+          'displayName',
+          'role',
+          'active',
+          'assignedSectorIds',
+          'assignedGalponIds',
+          'createdAt',
+          'createdBy',
+          'updatedAt',
+          'updatedBy',
+          'lastLoginAt'
+        ]) &&
+        isValidId(data.uid) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 150 &&
+        isValidRole(data.role) &&
+        data.active is bool &&
+        isValidStringList(data.assignedSectorIds, 100) &&
+        isValidStringList(data.assignedGalponIds, 200) &&
+        data.createdAt is string && data.createdAt.size() >= 1 && data.createdAt.size() <= 40 &&
+        data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 150 &&
+        data.updatedAt is string && data.updatedAt.size() >= 1 && data.updatedAt.size() <= 40 &&
+        data.updatedBy is string && data.updatedBy.size() >= 1 && data.updatedBy.size() <= 150 &&
+        data.lastLoginAt is string && data.lastLoginAt.size() <= 40;
+    }
+
+    // 3. Collection: /users/{userId}
+    match /users/{userId} {
+      // PII Isolation: Only the owner (to check own active status/profile) or an active Admin can read a user document
+      allow get: if isSignedIn() && isValidId(userId) && (
+        request.auth.uid == userId || isActiveAdmin()
+      );
+
+      // Query Enforcer: Only an active Admin can list user profiles
+      allow list: if isActiveAdmin() && existing().uid is string && existing().uid.size() <= 128;
+
+      // Creation: Only an active Admin can create users, OR the verified root admin email bootstrapping their own profile
+      allow create: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == userId && (
+          isActiveAdmin() ||
+          (
+            isRootAdminEmail() &&
+            request.auth.uid == userId &&
+            incoming().email == 'renzopachas20@gmail.com' &&
+            incoming().role == 'Administrador' &&
+            incoming().active == true
+          )
+        );
+
+      // Action-Based Updates: Must start with validation helper and preserve immortal fields
+      allow update: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().createdBy == existing().createdBy && (
+          // Action 1: Active Administrator managing user profile, role, active state, or assignments
+          (
+            isActiveAdmin() &&
+            !(userId == request.auth.uid && (incoming().active == false || incoming().role != 'Administrador')) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName',
+              'email',
+              'role',
+              'active',
+              'assignedSectorIds',
+              'assignedGalponIds',
+              'updatedAt',
+              'updatedBy',
+              'lastLoginAt'
+            ])
+          ) ||
+          // Action 2: Active user updating exclusively their own lastLoginAt upon sign-in
+          (
+            request.auth.uid == userId &&
+            existing().active == true &&
+            incoming().role == existing().role &&
+            incoming().active == existing().active &&
+            incoming().email == existing().email &&
+            incoming().displayName == existing().displayName &&
+            incoming().assignedSectorIds == existing().assignedSectorIds &&
+            incoming().assignedGalponIds == existing().assignedGalponIds &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'lastLoginAt',
+              'updatedAt',
+              'updatedBy'
+            ])
+          )
+        );
+
+      // Accounts are deactivated (active: false), never hard-deleted
+      allow delete: if false;
     }
   }
 }
