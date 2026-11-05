@@ -38,8 +38,8 @@ service cloud.firestore {
 
     function isActiveAdmin() {
       return isSignedIn() && (
-        (hasCallerProfile() && callerProfile().active == true && callerProfile().role == 'Administrador') ||
-        (!hasCallerProfile() && isBootstrapAdminUid())
+        isBootstrapAdminUid() ||
+        (hasCallerProfile() && callerProfile().active == true && callerProfile().role == 'Administrador')
       );
     }
 
@@ -111,8 +111,9 @@ service cloud.firestore {
         request.auth.uid == userId || isActiveAdmin()
       );
 
-      // Query Enforcer: Only an active Admin can list user profiles
-      allow list: if isActiveAdmin() && existing().uid is string && existing().uid.size() <= 128;
+      // Listado del padrón de usuarios: exclusivo para un Administrador activo.
+      // No se exige filtro sobre resource.data (existing().uid) para permitir la consulta completa de la colección /users desde UserAdminModal.
+      allow list: if isActiveAdmin();
 
       // Creation: Only an active Admin can create users, OR the exact bootstrap Admin UID registering their initial Admin profile
       allow create: if isSignedIn() &&
