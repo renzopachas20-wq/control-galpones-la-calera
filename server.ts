@@ -2,6 +2,7 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -529,6 +530,25 @@ async function getVaultedAdminIdToken(): Promise<{ idToken: string; adminUid: st
 
 async function startServer() {
   const app = express();
+
+  // Middleware CORS para soportar clientes Web y aplicaciones móviles (Capacitor / Android WebView)
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '5mb' }));
 
   // --------------------------------------------------------------------------
@@ -1259,12 +1279,120 @@ async function startServer() {
   });
 
   // --------------------------------------------------------------------------
+  // Sistema Automático de Metadatos de Versión y Despliegue (/api/version)
+  // --------------------------------------------------------------------------
+  function resolveRuntimeVersionMetadata(req: express.Request) {
+    let baseMeta: Record<string, any> = {};
+    const distMetaPath = path.resolve(__dirname, 'dist/version-metadata.json');
+    const genMetaPath = path.resolve(__dirname, 'src/generated/versionMetadata.json');
+
+    if (fs.existsSync(distMetaPath)) {
+      try {
+        baseMeta = JSON.parse(fs.readFileSync(distMetaPath, 'utf-8'));
+      } catch {
+        // ignore
+      }
+    } else if (fs.existsSync(genMetaPath)) {
+      try {
+        baseMeta = JSON.parse(fs.readFileSync(genMetaPath, 'utf-8'));
+      } catch {
+        // ignore
+      }
+    }
+
+    let pkgVersion = baseMeta.version || '3.0.0';
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'package.json'), 'utf-8'));
+      if (pkg.version) pkgVersion = String(pkg.version);
+    } catch {
+      // ignore
+    }
+
+    let liveCommit = baseMeta.commitHash || 'unknown';
+    try {
+      const gitOut = execSync('git rev-parse --short HEAD', {
+        cwd: __dirname,
+        stdio: ['ignore', 'pipe', 'ignore']
+      })
+        .toString()
+        .trim();
+      if (gitOut) liveCommit = gitOut;
+    } catch {
+      // en contenedor de producción sin carpeta .git usa el commit empaquetado en dist/version-metadata.json
+    }
+
+    const hostHeader = String(req.headers['x-forwarded-host'] || req.headers.host || req.hostname || '').toLowerCase();
+    const isDevHost =
+      hostHeader.includes('ais-dev-') ||
+      hostHeader.includes('localhost') ||
+      hostHeader.includes('127.0.0.1');
+    const isPublicProdHost =
+      hostHeader.includes('ais-pre-') ||
+      hostHeader.includes('ais-mob-') ||
+      (!isDevHost && (process.env.NODE_ENV === 'production' || Boolean(process.env.K_SERVICE)));
+
+    const distIndexExists = fs.existsSync(path.resolve(__dirname, 'dist/index.html'));
+    const bundleVerified = Boolean(baseMeta.bundleCompleted && distIndexExists);
+
+    const timeZone = 'America/Lima';
+    const refIso = baseMeta.buildTimestampIso || new Date().toISOString();
+    const refDate = new Date(refIso);
+
+    const formattedDate =
+      baseMeta.formattedDate ||
+      new Intl.DateTimeFormat('es-PE', {
+        timeZone,
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric'
+      }).format(refDate);
+
+    const formattedTime =
+      baseMeta.formattedTime ||
+      new Intl.DateTimeFormat('es-PE', {
+        timeZone,
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true
+      }).format(refDate);
+
+    const environmentLabel = isPublicProdHost ? 'PRODUCCIÓN' : 'DESARROLLO';
+    const statusLabel = isPublicProdHost
+      ? bundleVerified
+        ? 'Publicado correctamente.'
+        : 'Compilación pendiente de verificación.'
+      : 'Entorno de desarrollo activo (AI Studio Preview).';
+
+    return {
+      version: pkgVersion,
+      commitHash: liveCommit,
+      buildTimestampIso: refIso,
+      formattedDate,
+      formattedTime,
+      timeZone: 'America/Lima (UTC-5)',
+      environment: environmentLabel,
+      status: statusLabel,
+      isProduction: isPublicProdHost,
+      bundleVerified
+    };
+  }
+
+  app.get('/api/version', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.json(resolveRuntimeVersionMetadata(req));
+  });
+
+  // --------------------------------------------------------------------------
   // Healthcheck de Producción (Cloud Run / Verificación de Estado)
   // --------------------------------------------------------------------------
-  app.get('/api/health', (_req, res) => {
+  app.get('/api/health', (req, res) => {
+    const versionMeta = resolveRuntimeVersionMetadata(req);
     res.json({
       status: 'ok',
       service: 'control-galpones-la-calera',
+      version: versionMeta.version,
+      commitHash: versionMeta.commitHash,
+      environmentLabel: versionMeta.environment,
       projectId: PROJECT_ID,
       firestoreDatabaseId: DATABASE_ID,
       authDomain: firebaseConfig.authDomain,

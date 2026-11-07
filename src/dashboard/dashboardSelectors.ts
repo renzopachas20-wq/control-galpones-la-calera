@@ -9,6 +9,11 @@
  *   ubicación, actividad y responsable/supervisor para cualquier reporte actual o futuro.
  */
 
+import {
+  evaluateActivityProgress,
+  type ProgressModality
+} from '../firebase/offlineSyncEngine';
+
 export const ALL_CONSTRUCTIVE_AREAS = [
   'Obra Civil',
   'Edificio',
@@ -31,6 +36,7 @@ export interface EvaluatedActivityItem {
   id: string;
   code: string;
   name: string;
+  progressMode?: ProgressModality;
   areaId?: string;
   areaName: string;
   hasSistema?: boolean;
@@ -50,6 +56,8 @@ export interface EvaluatedActivityItem {
   accumulatedHH: number;
   pendingQty: number;
   progressPercent: number;
+  lastValidPercentage?: number;
+  conflictedLogsCount?: number;
   shouldHaveStarted: boolean;
   computedStatus: string;
   lastLog?: any;
@@ -329,24 +337,22 @@ export function filterDashboardActivities(
         return true;
       });
 
-      const accumulatedQty = matchingLogs.reduce(
-        (s, l) => s + Number(l.quantityToday || 0),
-        0
+      const evalResult = evaluateActivityProgress(
+        act,
+        matchingLogs,
+        criteria.dateTo || new Date().toISOString().split('T')[0]
       );
-      const accumulatedHH = matchingLogs.reduce(
-        (s, l) => s + Number(l.hoursWorked || 0),
-        0
-      );
-      const rawPct =
-        act.targetUnits > 0 ? (accumulatedQty / act.targetUnits) * 100 : 0;
-      const progressPercent = Math.min(100, Math.round(rawPct * 10) / 10);
 
       return {
         ...act,
-        accumulatedQty,
-        accumulatedHH,
-        pendingQty: Math.max(0, Number(act.targetUnits || 0) - accumulatedQty),
-        progressPercent
+        progressMode: evalResult.progressMode,
+        accumulatedQty: evalResult.accumulatedQty,
+        accumulatedHH: evalResult.accumulatedHH,
+        pendingQty: evalResult.pendingQty,
+        progressPercent: evalResult.progressPercent,
+        lastValidPercentage: evalResult.lastValidPercentage,
+        conflictedLogsCount: evalResult.conflictedLogsCount,
+        computedStatus: evalResult.computedStatus
       };
     });
 }

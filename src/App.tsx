@@ -26,12 +26,19 @@ import {
   Table,
   UploadCloud,
   Package,
-  BookOpen
+  BookOpen,
+  Filter,
+  ChevronLeft,
+  ChevronRight,
+  LogOut,
+  ShieldCheck
 } from 'lucide-react';
 import { useAuthProfile } from './components/AuthGate';
 import { useFirestoreOperationalSync } from './firebase/firestoreDataService';
 import {
   hasModulePermission,
+  canAccessSector,
+  canAccessGalpon,
   filterSectorsByScope,
   MODULE_LABELS,
   ACTION_LABELS,
@@ -39,11 +46,48 @@ import {
   type PermissionAction
 } from './firebase/permissions';
 import { DashboardView } from './dashboard/DashboardView';
+import { GanttView } from './gantt/GanttView';
 import {
   computeWeightedProgress,
   computeAreaProgressMetrics,
   computeSistemaProgressMetrics
 } from './dashboard/dashboardSelectors';
+import {
+  evaluateActivityProgress,
+  normalizeProgressMode,
+  getProgressModeLabel,
+  validatePercentageAdvanceRegistration,
+  canUserAuthorizePercentageCorrection,
+  createOperationId,
+  getOrCreateDeviceId,
+  recordActivityDeletionTombstone,
+  recordGalponDeletionTombstone,
+  resolveDynamicSectorGalponContext,
+  type ProgressModality
+} from './firebase/offlineSyncEngine';
+import {
+  OfflineSyncStatusBar,
+  OfflineSyncCenterModal
+} from './components/OfflineSyncCenterModal';
+import { SidebarVersionFooter } from './components/SidebarVersionBadge';
+import { GalponLogoIcon } from './components/GalponLogoIcon';
+import {
+  NO_SISTEMA_VALUE,
+  getActiveMasterCatalog,
+  getCatalogAreas,
+  getCatalogSystemsByArea,
+  getCatalogStructuresByAreaAndSystem,
+  getCatalogActivitiesByHierarchy,
+  getMasterCatalogStructuresForEditor,
+  deleteStructureFromMasterCatalog,
+  applyCatalogStepAreaChange,
+  applyCatalogStepSistemaChange,
+  applyCatalogStepEstructuraChange,
+  applyCatalogStepActivityToggle,
+  applyCatalogStepSelectAllActivities,
+  assignCatalogActivitiesToSectors,
+  type CatalogAssignmentFormState
+} from './catalog/catalogSelectorEngine';
 
 // ============================================================================
 // UTILIDADES Y CONSTANTES BASE (SIN DATOS DE DEMOSTRACIÓN)
@@ -72,7 +116,12 @@ const ALL_AREAS = [
 
 const AREAS_WITH_SISTEMAS = [
   'Sistema de Jaulas',
+  'Jaulas',
+  'Comederos',
+  'Bebederos',
+  'Climatización',
   'Sistema Eléctrico',
+  'Electricidad e Iluminación',
   'Gasfitería',
   'Soldadura'
 ];
@@ -178,16 +227,18 @@ function buildAreasFromCatalog(
         actStart.setDate(actStart.getDate() + idx * 2);
         const actEnd = new Date(actStart);
         actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 1));
+        const mode = normalizeProgressMode(item.progressMode);
 
         strObj.activities.push({
           id: generateId('act'),
           code: item.code,
           name: item.name,
+          progressMode: mode,
           locationType: locType,
           sistemaName: sisName,
           structureName: strObj.name,
-          targetUnits: Number(item.targetUnits) || 0,
-          unit: item.unit || '',
+          targetUnits: mode === 'percentage' ? 100 : Number(item.targetUnits) || 0,
+          unit: mode === 'percentage' ? item.unit || '%' : item.unit || '',
           weight: Number(item.weight) || 1.0,
           plannedHH: Number(item.plannedHH) || 0,
           startDate: actStart.toISOString().split('T')[0],
@@ -220,16 +271,18 @@ function buildAreasFromCatalog(
         actStart.setDate(actStart.getDate() + idx * 2);
         const actEnd = new Date(actStart);
         actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 1));
+        const mode = normalizeProgressMode(item.progressMode);
 
         strObj.activities.push({
           id: generateId('act'),
           code: item.code,
           name: item.name,
+          progressMode: mode,
           locationType: 'Interno',
           sistemaName: null,
           structureName: strName,
-          targetUnits: Number(item.targetUnits) || 0,
-          unit: item.unit || '',
+          targetUnits: mode === 'percentage' ? 100 : Number(item.targetUnits) || 0,
+          unit: mode === 'percentage' ? item.unit || '%' : item.unit || '',
           weight: Number(item.weight) || 1.0,
           plannedHH: Number(item.plannedHH) || 0,
           startDate: actStart.toISOString().split('T')[0],
@@ -344,16 +397,18 @@ function mergeAreasWithCatalog(
         actStart.setDate(actStart.getDate() + idx * 2);
         const actEnd = new Date(actStart);
         actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 1));
+        const mode = normalizeProgressMode(item.progressMode);
 
         strObj.activities.push({
           id: generateId('act'),
           code: cleanItemCode,
           name: item.name,
+          progressMode: mode,
           locationType: locType,
           sistemaName: sisObj.name,
           structureName: strObj.name,
-          targetUnits: Number(item.targetUnits) || 0,
-          unit: item.unit || '',
+          targetUnits: mode === 'percentage' ? 100 : Number(item.targetUnits) || 0,
+          unit: mode === 'percentage' ? item.unit || '%' : item.unit || '',
           weight: Number(item.weight) || 1.0,
           plannedHH: Number(item.plannedHH) || 0,
           startDate: actStart.toISOString().split('T')[0],
@@ -403,16 +458,18 @@ function mergeAreasWithCatalog(
         actStart.setDate(actStart.getDate() + idx * 2);
         const actEnd = new Date(actStart);
         actEnd.setDate(actEnd.getDate() + (Number(item.durationDays) || 1));
+        const mode = normalizeProgressMode(item.progressMode);
 
         strObj.activities.push({
           id: generateId('act'),
           code: cleanItemCode,
           name: item.name,
+          progressMode: mode,
           locationType: 'Interno',
           sistemaName: null,
           structureName: strObj.name,
-          targetUnits: Number(item.targetUnits) || 0,
-          unit: item.unit || '',
+          targetUnits: mode === 'percentage' ? 100 : Number(item.targetUnits) || 0,
+          unit: mode === 'percentage' ? item.unit || '%' : item.unit || '',
           weight: Number(item.weight) || 1.0,
           plannedHH: Number(item.plannedHH) || 0,
           startDate: actStart.toISOString().split('T')[0],
@@ -553,6 +610,10 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [currentTab, setCurrentTab] = useState('dashboard');
 
+  useEffect(() => {
+    setSidebarOpen(false);
+  }, [currentTab]);
+
   // Plantillas / Proveedores (Inician vacíos)
   const [technologies, setTechnologies] = useState<string[]>(() => {
     try {
@@ -563,15 +624,20 @@ export default function App() {
     }
   });
 
-  // Catálogo Maestro de Actividades (Inicia vacío)
+  // Catálogo Maestro de Actividades (Inicia vacío y filtra únicamente registros activos)
   const [masterCatalog, setMasterCatalog] = useState<any[]>(() => {
     try {
       const s = localStorage.getItem('calera_master_catalog_clean');
-      return s ? JSON.parse(s) : [];
+      return s ? getActiveMasterCatalog(JSON.parse(s)) : [];
     } catch {
       return [];
     }
   });
+
+  const activeMasterCatalog = useMemo(
+    () => getActiveMasterCatalog(masterCatalog),
+    [masterCatalog]
+  );
 
   // Sectores y Galpones (Inician vacíos)
   const [sectors, setSectors] = useState<any[]>(() => {
@@ -583,8 +649,31 @@ export default function App() {
     }
   });
 
-  const [selectedSectorId, setSelectedSectorId] = useState<string>('');
-  const [selectedGalponId, setSelectedGalponId] = useState<string>('');
+  const [selectedSectorId, setSelectedSectorId] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem('calera_active_selection_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return typeof parsed?.sectorId === 'string' ? parsed.sectorId : '';
+      }
+    } catch {
+      // ignore
+    }
+    return '';
+  });
+  const [selectedGalponId, setSelectedGalponId] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem('calera_active_selection_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return typeof parsed?.galponId === 'string' ? parsed.galponId : '';
+      }
+    } catch {
+      // ignore
+    }
+    return '';
+  });
+  const hasInitializedSelectionRef = React.useRef<boolean>(false);
 
   // Avances Diarios (Inician vacíos)
   const [dailyAdvances, setDailyAdvances] = useState<any[]>(() => {
@@ -707,6 +796,17 @@ export default function App() {
   const [bulkRawRows, setBulkRawRows] = useState<string[][]>([]);
   const [bulkFileName, setBulkFileName] = useState<string>('');
   const [bulkTargetGalponId, setBulkTargetGalponId] = useState<string>('');
+
+  // Estados de Filtros y Paginación para Informes Globales (Etapa 3.1)
+  const [filterInformesSectorId, setFilterInformesSectorId] = useState<string>('ALL');
+  const [filterInformesGalponId, setFilterInformesGalponId] = useState<string>('ALL');
+  const [filterInformesAreaName, setFilterInformesAreaName] = useState<string>('ALL');
+  const [filterInformesSistemaName, setFilterInformesSistemaName] = useState<string>('ALL');
+  const [filterInformesMode, setFilterInformesMode] = useState<string>('ALL');
+  const [filterInformesStatus, setFilterInformesStatus] = useState<string>('ALL');
+  const [searchInformesText, setSearchInformesText] = useState<string>('');
+  const [informesPage, setInformesPage] = useState<number>(1);
+  const [informesPageSize, setInformesPageSize] = useState<number>(50);
   const [deleteConfirmModal, setDeleteConfirmModal] = useState<{
     type:
       | 'sector'
@@ -716,22 +816,30 @@ export default function App() {
       | 'worker'
       | 'advance'
       | 'catalog_item'
+      | 'catalog_structure'
       | 'template_provider';
+    entityId?: string;
     sectorId?: string;
     galponId?: string;
     targetId?: string;
+    areaName?: string;
+    sistemaName?: string | null;
+    structureName?: string;
     code: string;
     name: string;
     subtitle?: string;
-    stats: {
-      galpones: number;
-      activities: number;
-      advances: number;
-      materials: number;
-      workers: number;
+    extraDetails?: string;
+    stats?: {
+      galpones?: number;
+      activities?: number;
+      advances?: number;
+      materials?: number;
+      workers?: number;
+      attendanceDays?: number;
+      catalogItems?: number;
       extraInfo?: string;
     };
-    mode: 'preserve_unassign' | 'cascade_delete';
+    mode?: 'preserve_unassign' | 'cascade_delete';
     deleteLinkedSharedAdvance?: boolean;
   } | null>(null);
 
@@ -756,6 +864,11 @@ export default function App() {
     technology: ''
   });
 
+  const [modalSyncCenterOpen, setModalSyncCenterOpen] = useState(false);
+  const [advanceValidationError, setAdvanceValidationError] = useState<string | null>(
+    null
+  );
+
   const [formAdvance, setFormAdvance] = useState({
     areaName: '',
     locationType: 'Todos',
@@ -767,18 +880,22 @@ export default function App() {
     hoursWorked: '',
     supervisor: '',
     note: '',
+    isAuthorizedCorrection: false,
+    correctionReason: '',
     sharedAcrossTwoGalpones: false,
     secondGalponId: '',
     splitMode: '100_both' as '100_both' | '50_50',
     manualMaterialInputs: {} as Record<string, string>
   });
 
-  const [formActivity, setFormActivity] = useState({
+  const [formActivity, setFormActivity] = useState<CatalogAssignmentFormState>({
     useCatalog: true,
     targetGalponId: '',
     catalogItemId: '',
+    selectedCatalogItemIds: [],
     code: '',
     name: '',
+    progressMode: 'quantity' as ProgressModality,
     areaName: '',
     locationType: '',
     sistemaName: '',
@@ -797,6 +914,7 @@ export default function App() {
   const [formCatalogItem, setFormCatalogItem] = useState({
     technology: '',
     code: '',
+    progressMode: 'quantity' as ProgressModality,
     areaName: '',
     locationType: '',
     sistemaName: '',
@@ -847,10 +965,24 @@ export default function App() {
   const [editingTemplateValue, setEditingTemplateValue] = useState('');
 
   // Contexto de Autenticación, Matriz de Roles y Sincronización Firestore en Tiempo Real
-  const { profile } = useAuthProfile();
+  const { profile, openUserAdminModal, logout } = useAuthProfile();
   const [permissionNotice, setPermissionNotice] = useState<string | null>(null);
 
-  const { syncStatus, lastSyncedAt, recordAuditMovement } = useFirestoreOperationalSync({
+  const {
+    syncStatus,
+    lastSyncedAt,
+    isNetworkOnline,
+    connectionIndicatorState,
+    pendingOperations,
+    activePendingCount,
+    syncConflicts,
+    unresolvedConflictCount,
+    lastSyncSummary,
+    isManualSyncing,
+    triggerManualSync,
+    resolveSyncConflict,
+    recordAuditMovement
+  } = useFirestoreOperationalSync({
     profile,
     technologies,
     setTechnologies,
@@ -909,14 +1041,63 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem('calera_sectors_clean', JSON.stringify(sectors));
-    if (scopedSectors.length > 0 && !scopedSectors.some((s) => s.id === selectedSectorId)) {
-      setSelectedSectorId(scopedSectors[0].id);
-      setSelectedGalponId(scopedSectors[0].galpones?.[0]?.id || '');
-    } else if (scopedSectors.length === 0) {
-      setSelectedSectorId('');
+    if (scopedSectors.length === 0) {
+      if (selectedSectorId !== '') setSelectedSectorId('');
+      if (selectedGalponId !== '') setSelectedGalponId('');
+      return;
+    }
+
+    const existingSector = scopedSectors.find((s) => s.id === selectedSectorId);
+    if (!existingSector) {
+      if (!hasInitializedSelectionRef.current) {
+        hasInitializedSelectionRef.current = true;
+        const firstSec = scopedSectors[0];
+        setSelectedSectorId(firstSec.id);
+        const galStillValid = firstSec.galpones?.some(
+          (g: any) => g.id === selectedGalponId
+        );
+        setSelectedGalponId(
+          galStillValid
+            ? selectedGalponId
+            : firstSec.galpones?.[0]?.id || ''
+        );
+      } else {
+        // Si el sector seleccionado fue eliminado o dejó de estar autorizado, seleccionar el primero válido pero limpiar galpón inválido
+        const fallbackSec = scopedSectors[0];
+        setSelectedSectorId(fallbackSec.id);
+        const galValidInFallback = fallbackSec.galpones?.some(
+          (g: any) => g.id === selectedGalponId
+        );
+        if (!galValidInFallback) {
+          setSelectedGalponId('');
+        }
+      }
+      return;
+    }
+
+    hasInitializedSelectionRef.current = true;
+    if (
+      selectedGalponId &&
+      !existingSector.galpones?.some((g: any) => g.id === selectedGalponId)
+    ) {
+      // El galpón seleccionado ya no pertenece al sector actual: limpiar sin elegir otro silenciosamente
       setSelectedGalponId('');
     }
-  }, [sectors, scopedSectors, selectedSectorId]);
+  }, [sectors, scopedSectors, selectedSectorId, selectedGalponId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'calera_active_selection_v1',
+        JSON.stringify({
+          sectorId: selectedSectorId,
+          galponId: selectedGalponId
+        })
+      );
+    } catch {
+      // ignore
+    }
+  }, [selectedSectorId, selectedGalponId]);
 
   useEffect(() => {
     localStorage.setItem('calera_advances_clean', JSON.stringify(dailyAdvances));
@@ -973,26 +1154,32 @@ export default function App() {
   // ==========================================================================
   // SELECTORES Y CÁLCULOS PRINCIPALES (RESPETANDO ALCANCE POR SECTOR Y GALPÓN)
   // ==========================================================================
-  const currentSector = useMemo(() => {
-    if (!scopedSectors.length) return null;
-    return scopedSectors.find((s) => s.id === selectedSectorId) || scopedSectors[0] || null;
-  }, [scopedSectors, selectedSectorId]);
+  const dynamicContext = useMemo(
+    () =>
+      resolveDynamicSectorGalponContext(
+        scopedSectors,
+        selectedSectorId,
+        selectedGalponId
+      ),
+    [scopedSectors, selectedSectorId, selectedGalponId]
+  );
 
-  const currentGalpon = useMemo(() => {
-    if (!currentSector || !currentSector.galpones?.length) return null;
-    return (
-      currentSector.galpones.find((g: any) => g.id === selectedGalponId) ||
-      currentSector.galpones[0] ||
-      null
-    );
-  }, [currentSector, selectedGalponId]);
+  const currentSector = dynamicContext.currentSector;
+  const currentGalpon = dynamicContext.currentGalpon;
+  const requiresGalponSelection = dynamicContext.requiresGalponSelection;
 
   const handleSelectSector = (secId: string) => {
+    hasInitializedSelectionRef.current = true;
     setSelectedSectorId(secId);
     const sec = scopedSectors.find((s) => s.id === secId);
-    if (sec && sec.galpones?.length > 0) {
-      setSelectedGalponId(sec.galpones[0].id);
-    } else {
+    const isStillValid = Boolean(
+      sec &&
+        selectedGalponId &&
+        Array.isArray(sec.galpones) &&
+        sec.galpones.some((g: any) => g.id === selectedGalponId)
+    );
+    if (!isStillValid) {
+      // Limpiar selección y solicitar al usuario elegir un galpón válido del nuevo sector
       setSelectedGalponId('');
     }
   };
@@ -1026,36 +1213,47 @@ export default function App() {
     return list;
   }, [scopedSectors]);
 
-  // Estructuras disponibles (del Catálogo Maestro + Galpones + Materiales)
-  const allKnownStructures = useMemo(() => {
-    const setStr = new Set<string>();
-    masterCatalog.forEach((item) => {
-      if (item.structureName) setStr.add(item.structureName);
-    });
-    sectors.forEach((sec) => {
-      sec.galpones?.forEach((g: any) => {
-        g.areas?.forEach((a: any) => {
-          if (a.hasSistemas && a.sistemas) {
-            a.sistemas.forEach((sis: any) => {
-              sis.structures?.forEach((st: any) => {
-                if (st.name) setStr.add(st.name);
-              });
-            });
-          } else {
-            a.structures?.forEach((st: any) => {
-              if (st.name) setStr.add(st.name);
-            });
-          }
-        });
-      });
-    });
-    materials.forEach((m) => {
-      if (m.structureName) setStr.add(m.structureName);
-    });
-    return Array.from(setStr);
-  }, [masterCatalog, sectors, materials]);
+  // Estructuras activas en el Catálogo Maestro según el Área y Sistema del editor del catálogo
+  const availableCatalogEditorStructures = useMemo(() => {
+    return getMasterCatalogStructuresForEditor(
+      activeMasterCatalog,
+      formCatalogItem.areaName,
+      formCatalogItem.sistemaName
+    );
+  }, [activeMasterCatalog, formCatalogItem.areaName, formCatalogItem.sistemaName]);
 
-  // Sistemas disponibles para el formulario de Materiales (según Galpón y Área elegidos + Catálogo)
+  // Selectores progresivos en cascada para el flujo "Agregar Actividad a Galpón" (Paso 1 -> Paso 4)
+  const availableAssignCatalogAreas = useMemo(() => {
+    return getCatalogAreas(activeMasterCatalog, ALL_AREAS);
+  }, [activeMasterCatalog]);
+
+  const availableAssignCatalogSystems = useMemo(() => {
+    return getCatalogSystemsByArea(activeMasterCatalog, formActivity.areaName);
+  }, [activeMasterCatalog, formActivity.areaName]);
+
+  const availableAssignCatalogStructures = useMemo(() => {
+    return getCatalogStructuresByAreaAndSystem(
+      activeMasterCatalog,
+      formActivity.areaName,
+      formActivity.sistemaName
+    );
+  }, [activeMasterCatalog, formActivity.areaName, formActivity.sistemaName]);
+
+  const availableAssignCatalogActivities = useMemo(() => {
+    return getCatalogActivitiesByHierarchy(
+      activeMasterCatalog,
+      formActivity.areaName,
+      formActivity.sistemaName,
+      formActivity.structureName
+    );
+  }, [
+    activeMasterCatalog,
+    formActivity.areaName,
+    formActivity.sistemaName,
+    formActivity.structureName
+  ]);
+
+  // Sistemas disponibles para el formulario de Materiales (según Galpón y Área elegidos + Catálogo activo)
   const availableMaterialSystems = useMemo(() => {
     const mapSis = new Map<string, { id: string; name: string; locationType: string }>();
     const targetGalpon = allGalponesList.find((g) => g.id === formMaterial.galponId);
@@ -1083,7 +1281,7 @@ export default function App() {
       }
     }
 
-    masterCatalog.forEach((item) => {
+    activeMasterCatalog.forEach((item) => {
       if (formMaterial.areaName && item.areaName !== formMaterial.areaName) return;
       if (
         formMaterial.technology &&
@@ -1130,11 +1328,11 @@ export default function App() {
     formMaterial.areaName,
     formMaterial.technology,
     formMaterial.locationType,
-    masterCatalog,
+    activeMasterCatalog,
     materials
   ]);
 
-  // Estructuras disponibles para el formulario de Materiales (según Galpón, Área y Sistema + Catálogo)
+  // Estructuras disponibles para el formulario de Materiales (según Galpón, Área y Sistema + Catálogo activo)
   const availableMaterialStructures = useMemo(() => {
     const mapStr = new Map<string, { id: string; name: string }>();
     const targetGalpon = allGalponesList.find((g) => g.id === formMaterial.galponId);
@@ -1167,7 +1365,7 @@ export default function App() {
       }
     }
 
-    masterCatalog.forEach((item) => {
+    activeMasterCatalog.forEach((item) => {
       if (formMaterial.areaName && item.areaName !== formMaterial.areaName) return;
       if (
         formMaterial.technology &&
@@ -1190,12 +1388,6 @@ export default function App() {
       }
     });
 
-    allKnownStructures.forEach((stName) => {
-      if (stName && !mapStr.has(stName.toLowerCase())) {
-        mapStr.set(stName.toLowerCase(), { id: '', name: stName });
-      }
-    });
-
     return Array.from(mapStr.values());
   }, [
     allGalponesList,
@@ -1203,11 +1395,10 @@ export default function App() {
     formMaterial.areaName,
     formMaterial.technology,
     formMaterial.sistemaName,
-    masterCatalog,
-    allKnownStructures
+    activeMasterCatalog
   ]);
 
-  // Actividades evaluadas del galpón activo
+  // Actividades evaluadas del galpón activo (Unificando modalidad por Cantidades y por Porcentaje)
   const evaluatedActivities = useMemo(() => {
     if (!currentGalpon || !currentGalpon.areas) return [];
     const list: any[] = [];
@@ -1224,31 +1415,7 @@ export default function App() {
                   ((l.activityId && l.activityId === act.id) ||
                     l.activityCode === act.code)
               );
-              const accumulatedQty = logsForAct.reduce(
-                (sum, item) => sum + Number(item.quantityToday || 0),
-                0
-              );
-              const accumulatedHH = logsForAct.reduce(
-                (sum, item) => sum + Number(item.hoursWorked || 0),
-                0
-              );
-              const rawPct =
-                act.targetUnits > 0 ? (accumulatedQty / act.targetUnits) * 100 : 0;
-              const progressPercent = Math.min(100, Math.round(rawPct * 10) / 10);
-              const lastLog =
-                [...logsForAct].sort(
-                  (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
-                )[0] || null;
-
-              const shouldHaveStarted =
-                Boolean(act.startDate) &&
-                act.startDate <= todayStr &&
-                progressPercent === 0;
-
-              let computedStatus = act.status || 'Pendiente';
-              if (progressPercent >= 100) computedStatus = 'Completada';
-              else if (progressPercent > 0) computedStatus = 'En proceso';
-              else if (shouldHaveStarted) computedStatus = 'No iniciada (Alerta)';
+              const evalRes = evaluateActivityProgress(act, logsForAct, todayStr);
 
               // Asociación inequívoca: Galpón + Área + Sistema + Estructura (por ID único cuando está disponible)
               const linkedMaterials = materials
@@ -1281,6 +1448,15 @@ export default function App() {
 
               list.push({
                 ...act,
+                progressMode: evalRes.progressMode,
+                targetUnits:
+                  evalRes.progressMode === 'percentage'
+                    ? 100
+                    : Number(act.targetUnits || 0),
+                unit:
+                  evalRes.progressMode === 'percentage'
+                    ? act.unit || '%'
+                    : act.unit || '',
                 areaId: area.id,
                 areaName: area.name,
                 hasSistema: true,
@@ -1289,13 +1465,15 @@ export default function App() {
                 sistemaName: act.sistemaName || sis.name,
                 structureId: str.id,
                 structureName: str.name,
-                accumulatedQty,
-                accumulatedHH,
-                pendingQty: Math.max(0, Number(act.targetUnits || 0) - accumulatedQty),
-                progressPercent,
-                shouldHaveStarted,
-                computedStatus,
-                lastLog,
+                accumulatedQty: evalRes.accumulatedQty,
+                accumulatedHH: evalRes.accumulatedHH,
+                pendingQty: evalRes.pendingQty,
+                progressPercent: evalRes.progressPercent,
+                lastValidPercentage: evalRes.lastValidPercentage,
+                conflictedLogsCount: evalRes.conflictedLogsCount,
+                shouldHaveStarted: evalRes.shouldHaveStarted,
+                computedStatus: evalRes.computedStatus,
+                lastLog: evalRes.lastLog,
                 linkedMaterials
               });
             });
@@ -1310,31 +1488,7 @@ export default function App() {
                 ((l.activityId && l.activityId === act.id) ||
                   l.activityCode === act.code)
             );
-            const accumulatedQty = logsForAct.reduce(
-              (sum, item) => sum + Number(item.quantityToday || 0),
-              0
-            );
-            const accumulatedHH = logsForAct.reduce(
-              (sum, item) => sum + Number(item.hoursWorked || 0),
-              0
-            );
-            const rawPct =
-              act.targetUnits > 0 ? (accumulatedQty / act.targetUnits) * 100 : 0;
-            const progressPercent = Math.min(100, Math.round(rawPct * 10) / 10);
-            const lastLog =
-              [...logsForAct].sort(
-                (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
-              )[0] || null;
-
-            const shouldHaveStarted =
-              Boolean(act.startDate) &&
-              act.startDate <= todayStr &&
-              progressPercent === 0;
-
-            let computedStatus = act.status || 'Pendiente';
-            if (progressPercent >= 100) computedStatus = 'Completada';
-            else if (progressPercent > 0) computedStatus = 'En proceso';
-            else if (shouldHaveStarted) computedStatus = 'No iniciada (Alerta)';
+            const evalRes = evaluateActivityProgress(act, logsForAct, todayStr);
 
             // Asociación inequívoca: Galpón + Área + Estructura (por ID único cuando está disponible)
             const linkedMaterials = materials
@@ -1362,6 +1516,15 @@ export default function App() {
 
             list.push({
               ...act,
+              progressMode: evalRes.progressMode,
+              targetUnits:
+                evalRes.progressMode === 'percentage'
+                  ? 100
+                  : Number(act.targetUnits || 0),
+              unit:
+                evalRes.progressMode === 'percentage'
+                  ? act.unit || '%'
+                  : act.unit || '',
               areaId: area.id,
               areaName: area.name,
               hasSistema: false,
@@ -1369,13 +1532,15 @@ export default function App() {
               sistemaName: null,
               structureId: str.id,
               structureName: str.name,
-              accumulatedQty,
-              accumulatedHH,
-              pendingQty: Math.max(0, Number(act.targetUnits || 0) - accumulatedQty),
-              progressPercent,
-              shouldHaveStarted,
-              computedStatus,
-              lastLog,
+              accumulatedQty: evalRes.accumulatedQty,
+              accumulatedHH: evalRes.accumulatedHH,
+              pendingQty: evalRes.pendingQty,
+              progressPercent: evalRes.progressPercent,
+              lastValidPercentage: evalRes.lastValidPercentage,
+              conflictedLogsCount: evalRes.conflictedLogsCount,
+              shouldHaveStarted: evalRes.shouldHaveStarted,
+              computedStatus: evalRes.computedStatus,
+              lastLog: evalRes.lastLog,
               linkedMaterials
             });
           });
@@ -1542,6 +1707,7 @@ export default function App() {
     setFormCatalogItem({
       technology: '',
       code: '',
+      progressMode: 'quantity',
       areaName: '',
       locationType: '',
       sistemaName: '',
@@ -1561,9 +1727,11 @@ export default function App() {
   const openEditCatalogModal = (item: any) => {
     if (!requirePermission('catalogo', 'edit')) return;
     setEditingCatalogId(item.id);
+    const mode = normalizeProgressMode(item.progressMode);
     setFormCatalogItem({
       technology: item.technology || '',
       code: item.code || '',
+      progressMode: mode,
       areaName: item.areaName || '',
       locationType: item.locationType || '',
       sistemaName: item.sistemaName || '',
@@ -1571,8 +1739,8 @@ export default function App() {
       structureName: item.structureName || '',
       customStructureName: '',
       name: item.name || '',
-      targetUnits: String(item.targetUnits ?? ''),
-      unit: item.unit || '',
+      targetUnits: String(mode === 'percentage' ? 100 : item.targetUnits ?? ''),
+      unit: mode === 'percentage' ? item.unit || '%' : item.unit || '',
       weight: String(item.weight ?? ''),
       plannedHH: String(item.plannedHH ?? ''),
       durationDays: String(item.durationDays ?? '')
@@ -1603,10 +1771,13 @@ export default function App() {
 
     if (!finalStructure) return;
 
+    const mode = normalizeProgressMode(formCatalogItem.progressMode);
+
     const payload = {
       id: editingCatalogId || generateId('cat'),
       technology: formCatalogItem.technology.trim(),
       code: formCatalogItem.code.trim().toUpperCase(),
+      progressMode: mode,
       areaName: formCatalogItem.areaName,
       locationType: AREAS_WITH_SISTEMAS.includes(formCatalogItem.areaName)
         ? formCatalogItem.locationType || 'Interno'
@@ -1616,8 +1787,8 @@ export default function App() {
         : null,
       structureName: finalStructure,
       name: formCatalogItem.name.trim(),
-      targetUnits: Number(formCatalogItem.targetUnits) || 0,
-      unit: formCatalogItem.unit.trim(),
+      targetUnits: mode === 'percentage' ? 100 : Number(formCatalogItem.targetUnits) || 0,
+      unit: mode === 'percentage' ? formCatalogItem.unit.trim() || '%' : formCatalogItem.unit.trim(),
       weight: Number(formCatalogItem.weight) || 1.0,
       plannedHH: Number(formCatalogItem.plannedHH) || 0,
       durationDays: Number(formCatalogItem.durationDays) || 1
@@ -1630,14 +1801,14 @@ export default function App() {
       recordUserMovement(
         'MODIFICACIÓN',
         'Catálogo Maestro',
-        `Modificó actividad maestra [${payload.code}] ${payload.name} (${payload.technology} • ${payload.areaName} • ${payload.structureName})`
+        `Modificó actividad maestra [${payload.code}] ${payload.name} (${getProgressModeLabel(mode)} • ${payload.technology} • ${payload.areaName})`
       );
     } else {
       setMasterCatalog((prev) => [...prev, payload]);
       recordUserMovement(
         'REGISTRO',
         'Catálogo Maestro',
-        `Registró actividad maestra [${payload.code}] ${payload.name} (${payload.technology} • ${payload.areaName} • ${payload.structureName})`
+        `Registró actividad maestra [${payload.code}] ${payload.name} (${getProgressModeLabel(mode)} • ${payload.technology} • ${payload.areaName})`
       );
     }
 
@@ -1647,7 +1818,7 @@ export default function App() {
 
   const requestDeleteCatalogItem = (id: string) => {
     if (!requirePermission('catalogo', 'delete')) return;
-    const targetItem = masterCatalog.find((c) => c.id === id);
+    const targetItem = activeMasterCatalog.find((c) => c.id === id);
     if (!targetItem) return;
     setDeleteConfirmModal({
       type: 'catalog_item',
@@ -1655,6 +1826,32 @@ export default function App() {
       code: targetItem.code,
       name: targetItem.name,
       extraDetails: `Proveedor: ${targetItem.technology || 'Sin proveedor'} • Área: ${targetItem.areaName} • Estructura: ${targetItem.structureName}`
+    });
+  };
+
+  const requestDeleteCatalogStructure = (
+    areaName: string,
+    sistemaName: string | null | undefined,
+    structureName: string
+  ) => {
+    if (!requirePermission('catalogo', 'delete')) return;
+    const { removedItems } = deleteStructureFromMasterCatalog(activeMasterCatalog, {
+      areaName,
+      sistemaName,
+      structureName
+    });
+    if (removedItems.length === 0) return;
+    setDeleteConfirmModal({
+      type: 'catalog_structure',
+      areaName,
+      sistemaName: sistemaName || null,
+      structureName,
+      code: areaName.toUpperCase(),
+      name: structureName,
+      extraDetails: `Se eliminará la estructura "${structureName}" (${areaName}${sistemaName ? ` • ${sistemaName}` : ''}) y todas sus actividades maestras vinculadas (${removedItems.length}) del Catálogo Maestro.`,
+      stats: {
+        catalogItems: removedItems.length
+      }
     });
   };
 
@@ -1691,6 +1888,8 @@ export default function App() {
     e.preventDefault();
     if (!requirePermission('proyectos', 'edit')) return;
     if (!formProject.id || !formProject.name) return;
+    const targetSec = sectors.find((s) => s.id === formProject.id);
+    if (!targetSec || !canAccessSector(profile, targetSec)) return;
 
     const updatedCode = formProject.code.trim().toUpperCase();
     const updatedName = formProject.name.trim().toUpperCase();
@@ -1719,7 +1918,7 @@ export default function App() {
   const requestDeleteSector = (secId: string) => {
     if (!requirePermission('proyectos', 'delete')) return;
     const targetSec = sectors.find((s) => s.id === secId);
-    if (!targetSec) return;
+    if (!targetSec || !canAccessSector(profile, targetSec)) return;
 
     const galponIds = new Set<string>(
       (targetSec.galpones || []).map((g: any) => g.id)
@@ -1773,10 +1972,12 @@ export default function App() {
     const targetSecId = formGalpon.sectorId || currentSector?.id;
     if (!formGalpon.code || !formGalpon.name || !targetSecId || !formGalpon.technology)
       return;
+    const targetSecObj = sectors.find((s) => s.id === targetSecId);
+    if (!targetSecObj || !canAccessSector(profile, targetSecObj)) return;
 
     const chosenTech = formGalpon.technology.trim();
     const generatedAreas = buildAreasFromCatalog(
-      masterCatalog,
+      activeMasterCatalog,
       chosenTech,
       formGalpon.startDate
     );
@@ -1802,7 +2003,6 @@ export default function App() {
       areas: generatedAreas
     };
 
-    const targetSecObj = sectors.find((s) => s.id === targetSecId);
     setSectors((prev) =>
       prev.map((s) =>
         s.id === targetSecId
@@ -1824,6 +2024,12 @@ export default function App() {
     e.preventDefault();
     if (!requirePermission('proyectos', 'edit')) return;
     if (!formGalpon.id) return;
+    const parentSec = sectors.find((s) =>
+      (s.galpones || []).some((g: any) => g.id === formGalpon.id)
+    );
+    const targetGalObj = parentSec?.galpones?.find((g: any) => g.id === formGalpon.id);
+    if (!parentSec || !targetGalObj || !canAccessGalpon(profile, targetGalObj, parentSec.id))
+      return;
 
     const supList = formGalpon.supervisorsStr
       ? formGalpon.supervisorsStr
@@ -1857,7 +2063,7 @@ export default function App() {
               techChanged && cleanTech
                 ? mergeAreasWithCatalog(
                     g.areas || [],
-                    masterCatalog,
+                    activeMasterCatalog,
                     cleanTech,
                     formGalpon.startDate
                   )
@@ -1879,7 +2085,7 @@ export default function App() {
     if (!requirePermission('proyectos', 'delete')) return;
     const sec = sectors.find((s) => s.id === secId);
     const targetGal = sec?.galpones?.find((g: any) => g.id === galId);
-    if (!targetGal) return;
+    if (!sec || !targetGal || !canAccessGalpon(profile, targetGal, secId)) return;
 
     let activitiesCount = 0;
     (targetGal.areas || []).forEach((area: any) => {
@@ -1975,7 +2181,7 @@ export default function App() {
         const next = prev.filter((s) => s.id !== sectorId);
         if (selectedSectorId === sectorId) {
           setSelectedSectorId(next[0]?.id || '');
-          setSelectedGalponId(next[0]?.galpones?.[0]?.id || '');
+          setSelectedGalponId('');
         }
         return next;
       });
@@ -2021,9 +2227,13 @@ export default function App() {
           if (s.id !== sectorId) return s;
           const nextGals = (s.galpones || []).filter((g: any) => g.id !== galponId);
           if (selectedGalponId === galponId) {
-            setSelectedGalponId(nextGals[0]?.id || '');
+            setSelectedGalponId('');
           }
-          return { ...s, galpones: nextGals };
+          return recordGalponDeletionTombstone(
+            { ...s, galpones: nextGals },
+            galponId,
+            activeUserName
+          );
         })
       );
 
@@ -2041,34 +2251,38 @@ export default function App() {
             ...s,
             galpones: s.galpones.map((g: any) => {
               if (g.id !== galponId) return g;
-              return {
-                ...g,
-                areas: (g.areas || []).map((area: any) => {
-                  if (area.hasSistemas && area.sistemas) {
+              return recordActivityDeletionTombstone(
+                {
+                  ...g,
+                  areas: (g.areas || []).map((area: any) => {
+                    if (area.hasSistemas && area.sistemas) {
+                      return {
+                        ...area,
+                        sistemas: area.sistemas.map((sis: any) => ({
+                          ...sis,
+                          structures: (sis.structures || []).map((str: any) => ({
+                            ...str,
+                            activities: (str.activities || []).filter(
+                              (a: any) => a.id !== entityId
+                            )
+                          }))
+                        }))
+                      };
+                    }
                     return {
                       ...area,
-                      sistemas: area.sistemas.map((sis: any) => ({
-                        ...sis,
-                        structures: (sis.structures || []).map((str: any) => ({
-                          ...str,
-                          activities: (str.activities || []).filter(
-                            (a: any) => a.id !== entityId
-                          )
-                        }))
+                      structures: (area.structures || []).map((str: any) => ({
+                        ...str,
+                        activities: (str.activities || []).filter(
+                          (a: any) => a.id !== entityId
+                        )
                       }))
                     };
-                  }
-                  return {
-                    ...area,
-                    structures: (area.structures || []).map((str: any) => ({
-                      ...str,
-                      activities: (str.activities || []).filter(
-                        (a: any) => a.id !== entityId
-                      )
-                    }))
-                  };
-                })
-              };
+                  })
+                },
+                entityId,
+                activeUserName
+              );
             })
           };
         })
@@ -2134,15 +2348,36 @@ export default function App() {
         );
       }
     } else if (type === 'catalog_item' && entityId) {
-      setMasterCatalog((prev) => prev.filter((c) => c.id !== entityId));
+      setMasterCatalog((prev) => getActiveMasterCatalog(prev).filter((c) => c.id !== entityId));
       recordUserMovement(
         'ELIMINACIÓN',
         'Catálogo Maestro',
         `Eliminó actividad maestra [${code}] ${name}`
       );
+    } else if (
+      type === 'catalog_structure' &&
+      deleteConfirmModal.areaName &&
+      deleteConfirmModal.structureName
+    ) {
+      const { remainingCatalog, removedItems } = deleteStructureFromMasterCatalog(
+        masterCatalog,
+        {
+          areaName: deleteConfirmModal.areaName,
+          sistemaName: deleteConfirmModal.sistemaName,
+          structureName: deleteConfirmModal.structureName
+        }
+      );
+      setMasterCatalog(remainingCatalog);
+      recordUserMovement(
+        'ELIMINACIÓN',
+        'Catálogo Maestro',
+        `Eliminó estructura "${deleteConfirmModal.structureName}" (${deleteConfirmModal.areaName}${deleteConfirmModal.sistemaName ? ` • ${deleteConfirmModal.sistemaName}` : ''}) y sus ${removedItems.length} actividad(es) maestra(s)`
+      );
     } else if (type === 'template_provider' && code) {
       setTechnologies((prev) => prev.filter((t) => t !== code));
-      setMasterCatalog((prev) => prev.filter((item) => item.technology !== code));
+      setMasterCatalog((prev) =>
+        getActiveMasterCatalog(prev).filter((item) => item.technology !== code)
+      );
       recordUserMovement(
         'ELIMINACIÓN',
         'Catálogo Maestro',
@@ -2155,6 +2390,7 @@ export default function App() {
 
   const handleReloadGalponFromCatalog = (secId: string, galponObj: any) => {
     if (!requirePermission('proyectos', 'edit')) return;
+    if (!canAccessGalpon(profile, galponObj, secId)) return;
     const cleanTech = (galponObj.technology || '').trim();
     setSectors((prev) =>
       prev.map((s) =>
@@ -2167,7 +2403,7 @@ export default function App() {
                       ...g,
                       areas: mergeAreasWithCatalog(
                         g.areas || [],
-                        masterCatalog,
+                        activeMasterCatalog,
                         cleanTech,
                         galponObj.startDate || getSystemToday()
                       )
@@ -2186,48 +2422,49 @@ export default function App() {
   };
 
   // ==========================================================================
-  // HANDLERS: GESTIÓN DE ACTIVIDADES EN EL GALPÓN (CUALQUIER SECTOR Y GALPÓN)
+  // HANDLERS: GESTIÓN DE ACTIVIDADES EN EL GALPÓN (SELECCIÓN PROGRESIVA DESDE CATÁLOGO)
   // ==========================================================================
+  const openNewActivityModal = () => {
+    if (!requirePermission('actividades', 'create')) return;
+    const today = getSystemToday();
+    setFormActivity({
+      useCatalog: true,
+      targetGalponId: currentGalpon?.id || '',
+      catalogItemId: '',
+      selectedCatalogItemIds: [],
+      code: '',
+      name: '',
+      areaName: '',
+      locationType: '',
+      sistemaName: '',
+      customSistemaName: '',
+      structureName: '',
+      customStructureName: '',
+      progressMode: 'quantity',
+      targetUnits: '',
+      unit: '',
+      weight: '',
+      plannedHH: '',
+      startDate: today,
+      dueDate: today,
+      sharedWithGalponId: ''
+    });
+    setModalNewActivity(true);
+  };
+
   const handleSaveNewActivity = (e: React.FormEvent) => {
     e.preventDefault();
     if (!requirePermission('actividades', 'create')) return;
     const primaryGalponId = formActivity.targetGalponId || currentGalpon?.id || '';
     if (!primaryGalponId) return;
-    if (!formActivity.code || !formActivity.name || !formActivity.areaName) return;
+    if (!formActivity.areaName || !formActivity.sistemaName || !formActivity.structureName) {
+      return;
+    }
 
-    const finalSistema =
-      formActivity.sistemaName === '__NEW__'
-        ? formActivity.customSistemaName.trim()
-        : formActivity.sistemaName.trim();
-
-    const finalStructure =
-      formActivity.structureName === '__NEW__'
-        ? formActivity.customStructureName.trim()
-        : formActivity.structureName.trim();
-
-    if (!finalStructure) return;
-
-    if (AREAS_WITH_SISTEMAS.includes(formActivity.areaName) && !finalSistema) return;
-
-    const newActObj = {
-      id: generateId('act'),
-      code: formActivity.code.trim().toUpperCase(),
-      name: formActivity.name.trim(),
-      locationType: AREAS_WITH_SISTEMAS.includes(formActivity.areaName)
-        ? formActivity.locationType || 'Interno'
-        : 'Interno',
-      sistemaName: AREAS_WITH_SISTEMAS.includes(formActivity.areaName)
-        ? finalSistema
-        : null,
-      structureName: finalStructure,
-      targetUnits: Number(formActivity.targetUnits) || 0,
-      unit: formActivity.unit.trim(),
-      weight: Number(formActivity.weight) || 1.0,
-      plannedHH: Number(formActivity.plannedHH) || 0,
-      startDate: formActivity.startDate || getSystemToday(),
-      dueDate: formActivity.dueDate || getSystemToday(),
-      status: 'Pendiente'
-    };
+    const selectedCatalogItems = availableAssignCatalogActivities.filter((a) =>
+      (formActivity.selectedCatalogItemIds || []).includes(a.id)
+    );
+    if (selectedCatalogItems.length === 0) return;
 
     const targetGalponIds = [primaryGalponId];
     if (
@@ -2237,127 +2474,38 @@ export default function App() {
       targetGalponIds.push(formActivity.sharedWithGalponId);
     }
 
-    // Actualizar galpones en TODOS los sectores donde se encuentre cualquiera de los galpones destino
-    setSectors((prev) =>
-      prev.map((s) => {
-        const hasTargetInSector = (s.galpones || []).some((g: any) =>
-          targetGalponIds.includes(g.id)
-        );
-        if (!hasTargetInSector) return s;
+    const nowIso = new Date().toISOString();
+    const today = getSystemToday();
+    const startDate = formActivity.startDate || today;
+    const dueDate = formActivity.dueDate || startDate;
 
-        return {
-          ...s,
-          galpones: (s.galpones || []).map((g: any) => {
-            if (!targetGalponIds.includes(g.id)) return g;
-            const currentAreas =
-              g.areas && g.areas.length > 0
-                ? g.areas
-                : ALL_AREAS.map((aName, idx) => ({
-                    id: generateId(`area_${idx}`),
-                    name: aName,
-                    hasSistemas: AREAS_WITH_SISTEMAS.includes(aName),
-                    sistemas: [],
-                    structures: []
-                  }));
+    const assignmentResult = assignCatalogActivitiesToSectors({
+      sectors,
+      catalogItemsToAssign: selectedCatalogItems,
+      targetGalponIds,
+      startDate,
+      dueDate,
+      updatedBy: activeUserName,
+      nowIso,
+      allAreas: ALL_AREAS,
+      areasWithSistemas: AREAS_WITH_SISTEMAS,
+      generateIdFn: generateId,
+      singleItemOverrides:
+        selectedCatalogItems.length === 1
+          ? {
+              code: formActivity.code,
+              name: formActivity.name,
+              progressMode: formActivity.progressMode,
+              targetUnits: formActivity.targetUnits,
+              unit: formActivity.unit,
+              weight: formActivity.weight,
+              plannedHH: formActivity.plannedHH,
+              locationType: formActivity.locationType
+            }
+          : undefined
+    });
 
-            const updatedAreas = currentAreas.map((area: any) => {
-              if (area.name !== formActivity.areaName) return area;
-
-              if (AREAS_WITH_SISTEMAS.includes(area.name)) {
-                const sisList = [...(area.sistemas || [])];
-                const targetSisName = newActObj.sistemaName || '';
-                if (!targetSisName) return area;
-                let sisIdx = sisList.findIndex(
-                  (sis) =>
-                    (sis.name || '').toLowerCase() === targetSisName.toLowerCase() &&
-                    (sis.locationType || 'Interno') === newActObj.locationType
-                );
-                let sisObj =
-                  sisIdx >= 0
-                    ? { ...sisList[sisIdx] }
-                    : {
-                        id: generateId('sis'),
-                        name: targetSisName,
-                        locationType: newActObj.locationType,
-                        structures: []
-                      };
-                const strList = [...(sisObj.structures || [])];
-                let strObj = strList.find(
-                  (st: any) =>
-                    (st.name || '').toLowerCase() ===
-                    newActObj.structureName.toLowerCase()
-                );
-                if (!strObj) {
-                  strObj = {
-                    id: generateId('str'),
-                    name: newActObj.structureName,
-                    activities: [
-                      { ...newActObj, id: generateId('act'), sistemaName: targetSisName }
-                    ]
-                  };
-                  strList.push(strObj);
-                } else {
-                  const alreadyExists = (strObj.activities || []).some(
-                    (ex: any) => ex.code === newActObj.code
-                  );
-                  strObj = {
-                    ...strObj,
-                    activities: alreadyExists
-                      ? strObj.activities
-                      : [
-                          ...(strObj.activities || []),
-                          { ...newActObj, id: generateId('act'), sistemaName: targetSisName }
-                        ]
-                  };
-                  const strIdx = strList.findIndex((st: any) => st.id === strObj.id);
-                  if (strIdx >= 0) strList[strIdx] = strObj;
-                }
-                sisObj = { ...sisObj, structures: strList };
-                if (sisIdx >= 0) {
-                  sisList[sisIdx] = sisObj;
-                } else {
-                  sisList.push(sisObj);
-                }
-                return { ...area, hasSistemas: true, sistemas: sisList };
-              } else {
-                const strList = [...(area.structures || [])];
-                let strObj = strList.find(
-                  (st: any) =>
-                    (st.name || '').toLowerCase() ===
-                    newActObj.structureName.toLowerCase()
-                );
-                if (!strObj) {
-                  strObj = {
-                    id: generateId('str'),
-                    name: newActObj.structureName,
-                    activities: [{ ...newActObj, id: generateId('act') }]
-                  };
-                  strList.push(strObj);
-                } else {
-                  const alreadyExists = (strObj.activities || []).some(
-                    (ex: any) => ex.code === newActObj.code
-                  );
-                  strObj = {
-                    ...strObj,
-                    activities: alreadyExists
-                      ? strObj.activities
-                      : [
-                          ...(strObj.activities || []),
-                          { ...newActObj, id: generateId('act') }
-                        ]
-                  };
-                  const strIdx = strList.findIndex((st: any) => st.id === strObj.id);
-                  if (strIdx >= 0) strList[strIdx] = strObj;
-                }
-                return { ...area, hasSistemas: false, structures: strList };
-              }
-            });
-
-            return { ...g, areas: updatedAreas };
-          })
-        };
-      })
-    );
+    setSectors(assignmentResult.updatedSectors);
 
     // Si el usuario eligió otro galpón destino en el modal, cambiamos a ese galpón y sector para que vea su actividad de inmediato
     const targetGalInfo = allGalponesList.find((g) => g.id === primaryGalponId);
@@ -2373,17 +2521,21 @@ export default function App() {
       })
       .join(', ');
 
+    const assignedSummary = assignmentResult.assignedActivities
+      .map((a) => `[${a.code}] ${a.name}`)
+      .join(', ');
+
     recordUserMovement(
       'REGISTRO',
       'Actividades',
-      `Registró actividad [${newActObj.code}] ${newActObj.name} (${formActivity.areaName} • ${newActObj.structureName}) en ${targetGalLabels}`
+      `Asignó ${assignmentResult.assignedActivities.length} actividad(es) del Catálogo Maestro (${assignedSummary} • ${formActivity.areaName} • ${formActivity.structureName}) en ${targetGalLabels}`
     );
 
     // Sincronizar filtros de la tabla de actividades para que siempre sea visible inmediatamente
     if (filterActArea !== 'Todas' && filterActArea !== formActivity.areaName) {
       setFilterActArea('Todas');
     }
-    if (filterActLocation !== 'Todos' && filterActLocation !== newActObj.locationType) {
+    if (filterActLocation !== 'Todos') {
       setFilterActLocation('Todos');
     }
     if (searchActText.trim()) {
@@ -2404,6 +2556,8 @@ export default function App() {
     const oldCode = existingAct?.code || '';
     const newCode = modalEditGalponActivity.code.trim().toUpperCase();
     const newName = modalEditGalponActivity.name.trim();
+    const mode = normalizeProgressMode(modalEditGalponActivity.progressMode);
+    const editNowIso = new Date().toISOString();
 
     setSectors((prev) =>
       prev.map((s) => {
@@ -2414,6 +2568,7 @@ export default function App() {
             if (g.id !== currentGalpon.id) return g;
             return {
               ...g,
+              updatedAt: editNowIso,
               areas: (g.areas || []).map((area: any) => {
                 if (area.hasSistemas && area.sistemas) {
                   return {
@@ -2428,14 +2583,23 @@ export default function App() {
                                 ...act,
                                 code: newCode,
                                 name: newName,
+                                progressMode: mode,
                                 targetUnits:
-                                  Number(modalEditGalponActivity.targetUnits) || 0,
-                                unit: (modalEditGalponActivity.unit || '').trim(),
+                                  mode === 'percentage'
+                                    ? 100
+                                    : Number(modalEditGalponActivity.targetUnits) || 0,
+                                unit:
+                                  mode === 'percentage'
+                                    ? (modalEditGalponActivity.unit || '').trim() || '%'
+                                    : (modalEditGalponActivity.unit || '').trim(),
                                 weight: Number(modalEditGalponActivity.weight) || 1.0,
                                 plannedHH:
                                   Number(modalEditGalponActivity.plannedHH) || 0,
                                 startDate: modalEditGalponActivity.startDate,
-                                dueDate: modalEditGalponActivity.dueDate
+                                dueDate: modalEditGalponActivity.dueDate,
+                                baseUpdatedAt: act.updatedAt || act.createdAt,
+                                updatedAt: editNowIso,
+                                updatedBy: activeUserName
                               }
                             : act
                         )
@@ -2453,13 +2617,22 @@ export default function App() {
                             ...act,
                             code: newCode,
                             name: newName,
+                            progressMode: mode,
                             targetUnits:
-                              Number(modalEditGalponActivity.targetUnits) || 0,
-                            unit: (modalEditGalponActivity.unit || '').trim(),
+                              mode === 'percentage'
+                                ? 100
+                                : Number(modalEditGalponActivity.targetUnits) || 0,
+                            unit:
+                              mode === 'percentage'
+                                ? (modalEditGalponActivity.unit || '').trim() || '%'
+                                : (modalEditGalponActivity.unit || '').trim(),
                             weight: Number(modalEditGalponActivity.weight) || 1.0,
                             plannedHH: Number(modalEditGalponActivity.plannedHH) || 0,
                             startDate: modalEditGalponActivity.startDate,
-                            dueDate: modalEditGalponActivity.dueDate
+                            dueDate: modalEditGalponActivity.dueDate,
+                            baseUpdatedAt: act.updatedAt || act.createdAt,
+                            updatedAt: editNowIso,
+                            updatedBy: activeUserName
                           }
                         : act
                     )
@@ -2493,7 +2666,7 @@ export default function App() {
     recordUserMovement(
       'MODIFICACIÓN',
       'Actividades',
-      `Modificó actividad [${oldCode && oldCode !== newCode ? `${oldCode} → ${newCode}` : newCode}] ${newName} en galpón ${currentGalpon.code}`
+      `Modificó actividad [${oldCode && oldCode !== newCode ? `${oldCode} → ${newCode}` : newCode}] ${newName} (${getProgressModeLabel(mode)}) en galpón ${currentGalpon.code}`
     );
     setModalEditGalponActivity(null);
   };
@@ -2532,6 +2705,7 @@ export default function App() {
     if (!requirePermission('gantt', 'edit')) return;
     if (!currentGalpon || !currentSector) return;
     const targetAct = evaluatedActivities.find((a) => a.id === actId);
+    const ganttNowIso = new Date().toISOString();
     setSectors((prev) =>
       prev.map((s) => {
         if (s.id !== currentSector.id) return s;
@@ -2541,6 +2715,7 @@ export default function App() {
             if (g.id !== currentGalpon.id) return g;
             return {
               ...g,
+              updatedAt: ganttNowIso,
               areas: (g.areas || []).map((area: any) => {
                 if (area.hasSistemas && area.sistemas) {
                   return {
@@ -2550,7 +2725,15 @@ export default function App() {
                       structures: (sis.structures || []).map((str: any) => ({
                         ...str,
                         activities: (str.activities || []).map((a: any) =>
-                          a.id === actId ? { ...a, [field]: value } : a
+                          a.id === actId
+                            ? {
+                                ...a,
+                                [field]: value,
+                                baseUpdatedAt: a.updatedAt || a.createdAt,
+                                updatedAt: ganttNowIso,
+                                updatedBy: activeUserName
+                              }
+                            : a
                         )
                       }))
                     }))
@@ -2561,7 +2744,15 @@ export default function App() {
                   structures: (area.structures || []).map((str: any) => ({
                     ...str,
                     activities: (str.activities || []).map((a: any) =>
-                      a.id === actId ? { ...a, [field]: value } : a
+                      a.id === actId
+                        ? {
+                            ...a,
+                            [field]: value,
+                            baseUpdatedAt: a.updatedAt || a.createdAt,
+                            updatedAt: ganttNowIso,
+                            updatedBy: activeUserName
+                          }
+                        : a
                     )
                   }))
                 };
@@ -2922,6 +3113,7 @@ export default function App() {
   const openNewAdvanceModal = (prefill?: Partial<typeof formAdvance>) => {
     if (!requirePermission('avance_diario', 'create')) return;
     setEditingAdvanceId(null);
+    setAdvanceValidationError(null);
     setFormAdvance({
       areaName: prefill?.areaName || '',
       locationType: prefill?.locationType || 'Todos',
@@ -2936,7 +3128,9 @@ export default function App() {
       sharedAcrossTwoGalpones: false,
       secondGalponId: '',
       splitMode: '100_both',
-      manualMaterialInputs: {}
+      manualMaterialInputs: {},
+      isAuthorizedCorrection: false,
+      correctionReason: ''
     });
     setModalNewAdvance(true);
   };
@@ -2944,6 +3138,7 @@ export default function App() {
   const openEditAdvanceModal = (adv: any) => {
     if (!requirePermission('avance_diario', 'edit')) return;
     setEditingAdvanceId(adv.id);
+    setAdvanceValidationError(null);
     const act = evaluatedActivities.find(
       (a) => (adv.activityId && a.id === adv.activityId) || a.code === adv.activityCode
     );
@@ -2993,7 +3188,9 @@ export default function App() {
         ? primarySharedLog.rawInputQty
         : adv.sharedGroupId && savedSplitMode === '50_50'
           ? Math.round(Number(adv.quantityToday || 0) * 2 * 100) / 100
-          : adv.quantityToday;
+          : adv.percentageReached !== undefined
+            ? adv.percentageReached
+            : adv.quantityToday;
 
     const rawTotalHH =
       adv.sharedGroupId && primarySharedLog.rawInputHH !== undefined
@@ -3025,7 +3222,9 @@ export default function App() {
           : secondarySharedLog.galponId
         : '',
       splitMode: savedSplitMode,
-      manualMaterialInputs: manualInputs
+      manualMaterialInputs: manualInputs,
+      isAuthorizedCorrection: Boolean(adv.isAuthorizedCorrection),
+      correctionReason: adv.correctionReason || ''
     });
     setModalNewAdvance(true);
   };
@@ -3033,23 +3232,69 @@ export default function App() {
   const handleSaveAdvance = (e: React.FormEvent) => {
     e.preventDefault();
     if (!requirePermission('avance_diario', editingAdvanceId ? 'edit' : 'create')) return;
-    if (!formAdvance.activityCode || !formAdvance.quantityToday || !currentGalpon)
+    if (!formAdvance.activityCode || formAdvance.quantityToday === '' || !currentGalpon)
       return;
 
-    const rawQty = Number(formAdvance.quantityToday) || 0;
+    const rawQty = Number(formAdvance.quantityToday);
+    if (!Number.isFinite(rawQty)) {
+      setAdvanceValidationError('Ingresa un valor numérico válido.');
+      return;
+    }
+
+    const selectedAct = evaluatedActivities.find(
+      (a) => a.code === formAdvance.activityCode
+    );
+    const actMode = normalizeProgressMode(selectedAct?.progressMode);
+
+    // Si es modalidad Porcentaje, validar rango 0% - 100% y que no disminuya salvo corrección histórica autorizada
+    if (actMode === 'percentage') {
+      // Calcular el último porcentaje válido excluyendo el registro que se está editando (si aplica)
+      const logsForValidation = dailyAdvances.filter(
+        (l) =>
+          l.galponId === currentGalpon.id &&
+          ((l.activityId && l.activityId === selectedAct?.id) ||
+            l.activityCode === formAdvance.activityCode)
+      );
+
+      const validation = validatePercentageAdvanceRegistration({
+        newPercentage: rawQty,
+        existingLogsForActivity: logsForValidation,
+        editingAdvanceId,
+        isAuthorizedCorrection: formAdvance.isAuthorizedCorrection,
+        correctionReason: formAdvance.correctionReason,
+        userRole: profile?.role
+      });
+
+      if (!validation.valid) {
+        setAdvanceValidationError(
+          validation.error || 'Porcentaje inválido para esta actividad.'
+        );
+        return;
+      }
+    } else if (rawQty < 0) {
+      setAdvanceValidationError('La cantidad ejecutada no puede ser negativa.');
+      return;
+    }
+
+    setAdvanceValidationError(null);
+
     const rawHH = Number(formAdvance.hoursWorked) || 0;
     const isShared =
       formAdvance.sharedAcrossTwoGalpones &&
       Boolean(formAdvance.secondGalponId) &&
       formAdvance.secondGalponId !== currentGalpon.id;
-    const factor = isShared && formAdvance.splitMode === '50_50' ? 0.5 : 1;
+    const factor =
+      actMode === 'percentage'
+        ? 1
+        : isShared && formAdvance.splitMode === '50_50'
+          ? 0.5
+          : 1;
 
     const qtyPerGalpon = Math.round(rawQty * factor * 100) / 100;
-    const hhPerGalpon = Math.round(rawHH * factor * 100) / 100;
+    const hhPerGalpon = Math.round(
+      rawHH * (isShared && formAdvance.splitMode === '50_50' ? 0.5 : 1) * 100
+    ) / 100;
 
-    const selectedAct = evaluatedActivities.find(
-      (a) => a.code === formAdvance.activityCode
-    );
     const secondGalponObj = isShared
       ? allGalponesList.find((g) => g.id === formAdvance.secondGalponId)
       : null;
@@ -3117,8 +3362,6 @@ export default function App() {
           });
 
           if (isShared && secondGalponObj) {
-            // Si existe un material homólogo asignado específicamente al segundo galpón, repartimos 50/50 entre ambos inventarios;
-            // si el material pertenece solo al galpón actual o es global, descontamos una única vez sobre su materialId sin duplicar descuento.
             const counterpartMat = materials.find(
               (m) =>
                 m.id !== mat.id &&
@@ -3173,11 +3416,14 @@ export default function App() {
       .replace(/^\[Trabajo Biproyecto[^\]]*\]\s*/i, '')
       .trim();
 
+    const nowIso = new Date().toISOString();
+    const deviceId = getOrCreateDeviceId();
+    const opId = createOperationId('op_adv');
+
     if (editingAdvanceId) {
       const oldAdv = dailyAdvances.find((a) => a.id === editingAdvanceId);
       const oldGroupId = oldAdv?.sharedGroupId;
 
-      // Removemos el avance anterior (y su par biproyecto si pertenecía a un grupo compartido) para reemplazarlo limpiamente
       const baseAdvances = oldGroupId
         ? dailyAdvances.filter((a) => a.sharedGroupId !== oldGroupId)
         : dailyAdvances.filter((a) => a.id !== editingAdvanceId);
@@ -3197,17 +3443,36 @@ export default function App() {
         rawInputQty: rawQty,
         rawInputHH: rawHH,
         sharedTotalMaterialsUsed: totalUsedMatsList,
+        sectorId: currentSector?.id,
         galponId: currentGalpon.id,
         activityId: selectedAct?.id || oldAdv?.activityId,
         activityCode: formAdvance.activityCode,
         date: formAdvance.date || getSystemToday(),
+        progressMode: actMode,
+        percentageReached: actMode === 'percentage' ? qtyPerGalpon : undefined,
         quantityToday: qtyPerGalpon,
         hoursWorked: hhPerGalpon,
         supervisor: finalSupervisor,
         note: isShared
           ? `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${secondGalponObj?.code || formAdvance.secondGalponId}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`
           : cleanUserNote,
-        materialsUsedToday: primaryGalponMatsList
+        materialsUsedToday: primaryGalponMatsList,
+        isAuthorizedCorrection: formAdvance.isAuthorizedCorrection || undefined,
+        correctionReason: formAdvance.correctionReason?.trim() || undefined,
+        createdAt: oldAdv?.createdAt || nowIso,
+        updatedAt: nowIso,
+        baseTimestamp: oldAdv?.updatedAt || oldAdv?.createdAt || nowIso,
+        basePercentage: selectedAct?.lastValidPercentage ?? 0,
+        operationId: opId,
+        deviceId,
+        userId: oldAdv?.userId || profile?.uid || 'local_user',
+        userDisplayName:
+          oldAdv?.userDisplayName ||
+          oldAdv?.supervisor ||
+          profile?.displayName ||
+          activeUserName,
+        lastEditedBy: profile?.uid || 'local_user',
+        syncState: isNetworkOnline ? 'synced' : 'pending_sync'
       };
 
       const replacementLogs: any[] = [updatedPrimaryLog];
@@ -3222,15 +3487,29 @@ export default function App() {
           splitMode: formAdvance.splitMode,
           rawInputQty: rawQty,
           rawInputHH: rawHH,
+          sectorId: secondGalponObj.sectorId,
           galponId: secondGalponObj.id,
           activityId: secondGalponActId,
           activityCode: formAdvance.activityCode,
           date: formAdvance.date || getSystemToday(),
+          progressMode: actMode,
+          percentageReached: actMode === 'percentage' ? qtyPerGalpon : undefined,
           quantityToday: qtyPerGalpon,
           hoursWorked: hhPerGalpon,
           supervisor: finalSupervisor,
           note: `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${currentGalpon.code}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`,
-          materialsUsedToday: secondaryGalponMatsList
+          materialsUsedToday: secondaryGalponMatsList,
+          isAuthorizedCorrection: formAdvance.isAuthorizedCorrection || undefined,
+          correctionReason: formAdvance.correctionReason?.trim() || undefined,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          baseTimestamp: nowIso,
+          basePercentage: 0,
+          operationId: createOperationId('op_adv_sec'),
+          deviceId,
+          userId: profile?.uid || 'local_user',
+          userDisplayName: profile?.displayName || activeUserName,
+          syncState: isNetworkOnline ? 'synced' : 'pending_sync'
         });
       }
 
@@ -3244,11 +3523,15 @@ export default function App() {
         totalUsedMatsList.length > 0
           ? ` | Materiales: ${totalUsedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
           : '';
+      const modeDetail =
+        actMode === 'percentage'
+          ? `Porcentaje Total Alcanzado: ${qtyPerGalpon}%${formAdvance.isAuthorizedCorrection ? ` [Corrección histórica autorizada: ${formAdvance.correctionReason}]` : ''}`
+          : `+${qtyPerGalpon} ${selectedAct?.unit || ''} c/u`;
 
       recordUserMovement(
         'MODIFICACIÓN',
         'Avance Diario',
-        `Modificó parte diario${isShared ? ` Biproyecto (${currentGalpon.code} + ${secondGalponObj?.code || ''})` : ''} de [${formAdvance.activityCode}] ${selectedAct?.name || ''}: +${qtyPerGalpon} ${selectedAct?.unit || ''} c/u, ${hhPerGalpon} HH c/u (Fecha: ${updatedPrimaryLog.date})${matsSummary}`,
+        `Modificó parte diario${isShared ? ` Biproyecto (${currentGalpon.code} + ${secondGalponObj?.code || ''})` : ''} de [${formAdvance.activityCode}] ${selectedAct?.name || ''}: ${modeDetail}, ${hhPerGalpon} HH c/u (Fecha: ${updatedPrimaryLog.date})${matsSummary}`,
         finalSupervisor || activeUserName
       );
     } else {
@@ -3264,17 +3547,31 @@ export default function App() {
           rawInputQty: rawQty,
           rawInputHH: rawHH,
           sharedTotalMaterialsUsed: totalUsedMatsList,
+          sectorId: currentSector?.id,
           galponId: currentGalpon.id,
           activityId: selectedAct?.id,
           activityCode: formAdvance.activityCode,
           date: formAdvance.date || getSystemToday(),
+          progressMode: actMode,
+          percentageReached: actMode === 'percentage' ? qtyPerGalpon : undefined,
           quantityToday: qtyPerGalpon,
           hoursWorked: hhPerGalpon,
           supervisor: finalSupervisor,
           note: isShared
             ? `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${secondGalponObj?.code || formAdvance.secondGalponId}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`
             : cleanUserNote,
-          materialsUsedToday: primaryGalponMatsList
+          materialsUsedToday: primaryGalponMatsList,
+          isAuthorizedCorrection: formAdvance.isAuthorizedCorrection || undefined,
+          correctionReason: formAdvance.correctionReason?.trim() || undefined,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          baseTimestamp: nowIso,
+          basePercentage: selectedAct?.lastValidPercentage ?? 0,
+          operationId: opId,
+          deviceId,
+          userId: profile?.uid || 'local_user',
+          userDisplayName: profile?.displayName || activeUserName,
+          syncState: isNetworkOnline ? 'synced' : 'pending_sync'
         }
       ];
 
@@ -3288,15 +3585,29 @@ export default function App() {
           splitMode: formAdvance.splitMode,
           rawInputQty: rawQty,
           rawInputHH: rawHH,
+          sectorId: secondGalponObj.sectorId,
           galponId: secondGalponObj.id,
           activityId: secondGalponActId,
           activityCode: formAdvance.activityCode,
           date: formAdvance.date || getSystemToday(),
+          progressMode: actMode,
+          percentageReached: actMode === 'percentage' ? qtyPerGalpon : undefined,
           quantityToday: qtyPerGalpon,
           hoursWorked: hhPerGalpon,
           supervisor: finalSupervisor,
           note: `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${currentGalpon.code}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`,
-          materialsUsedToday: secondaryGalponMatsList
+          materialsUsedToday: secondaryGalponMatsList,
+          isAuthorizedCorrection: formAdvance.isAuthorizedCorrection || undefined,
+          correctionReason: formAdvance.correctionReason?.trim() || undefined,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          baseTimestamp: nowIso,
+          basePercentage: 0,
+          operationId: createOperationId('op_adv_sec'),
+          deviceId,
+          userId: profile?.uid || 'local_user',
+          userDisplayName: profile?.displayName || activeUserName,
+          syncState: isNetworkOnline ? 'synced' : 'pending_sync'
         });
       }
 
@@ -3310,17 +3621,22 @@ export default function App() {
         totalUsedMatsList.length > 0
           ? ` | Materiales: ${totalUsedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
           : '';
+      const modeDetail =
+        actMode === 'percentage'
+          ? `Porcentaje Total Alcanzado: ${qtyPerGalpon}%${formAdvance.isAuthorizedCorrection ? ` [Corrección histórica autorizada: ${formAdvance.correctionReason}]` : ''}`
+          : `+${qtyPerGalpon} ${selectedAct?.unit || ''} c/u`;
 
       recordUserMovement(
         'REGISTRO',
         'Avance Diario',
-        `Registró parte diario${isShared ? ` Biproyecto (${currentGalpon.code} + ${secondGalponObj?.code || ''})` : ''} de [${formAdvance.activityCode}] ${selectedAct?.name || ''}: +${qtyPerGalpon} ${selectedAct?.unit || ''} c/u, ${hhPerGalpon} HH c/u (Fecha: ${newLogs[0].date})${matsSummary}`,
+        `Registró parte diario${isShared ? ` Biproyecto (${currentGalpon.code} + ${secondGalponObj?.code || ''})` : ''} de [${formAdvance.activityCode}] ${selectedAct?.name || ''}: ${modeDetail}, ${hhPerGalpon} HH c/u (Fecha: ${newLogs[0].date})${matsSummary}`,
         finalSupervisor || activeUserName
       );
     }
 
     setModalNewAdvance(false);
     setEditingAdvanceId(null);
+    setAdvanceValidationError(null);
     setFormAdvance({
       areaName: '',
       locationType: 'Todos',
@@ -3335,7 +3651,9 @@ export default function App() {
       sharedAcrossTwoGalpones: false,
       secondGalponId: '',
       splitMode: '100_both',
-      manualMaterialInputs: {}
+      manualMaterialInputs: {},
+      isAuthorizedCorrection: false,
+      correctionReason: ''
     });
   };
 
@@ -3627,6 +3945,7 @@ export default function App() {
       const idxUnit = findColIndex(['unidad', 'und', 'medida'], 8);
       const idxWeight = findColIndex(['peso', 'ponderacion'], 9);
       const idxHH = findColIndex(['hh', 'horas'], 10);
+      const idxMode = findColIndex(['modalidad', 'mode', 'tipo_avance', 'tipoavance', 'metodo_avance', 'metodo'], -1);
 
       const existingCodes = new Set(
         masterCatalog.map((c) => `${(c.technology || '').toLowerCase()}::${(c.code || '').toUpperCase()}`)
@@ -3642,9 +3961,33 @@ export default function App() {
         const structureName = (cols[idxStr] || '').trim();
         const name = (cols[idxName] || '').trim();
         const rawTarget = (cols[idxTarget] || '').trim();
-        const unit = (cols[idxUnit] || '').trim();
+        const rawUnit = (cols[idxUnit] || '').trim();
         const rawWeight = (cols[idxWeight] || '').trim();
         const rawHH = (cols[idxHH] || '').trim();
+        const rawMode = idxMode >= 0 ? (cols[idxMode] || '').trim().toLowerCase() : '';
+
+        // Parsing y normalización de Modalidad (Cantidades vs Porcentaje)
+        let progressMode: 'quantity' | 'percentage' = 'quantity';
+        let modeInvalid = false;
+        if (rawMode) {
+          if (
+            rawMode.includes('porcent') ||
+            rawMode.includes('percent') ||
+            rawMode === '%' ||
+            rawMode === 'p'
+          ) {
+            progressMode = 'percentage';
+          } else if (
+            rawMode.includes('cant') ||
+            rawMode.includes('quant') ||
+            rawMode.includes('qty') ||
+            rawMode === 'c'
+          ) {
+            progressMode = 'quantity';
+          } else {
+            modeInvalid = true;
+          }
+        }
 
         const matchedArea = ALL_AREAS.find(
           (a) => normalizeHeaderKey(a) === normalizeHeaderKey(rawArea)
@@ -3670,13 +4013,25 @@ export default function App() {
         }
         if (!structureName) errors.push('Falta Estructura');
         if (!name) errors.push('Falta Nombre de Actividad');
-        if (!rawTarget || isNaN(targetUnits) || targetUnits <= 0) {
-          errors.push('Meta debe ser mayor a 0');
+
+        if (modeInvalid) {
+          errors.push(`Modalidad inválida ("${cols[idxMode]}"). Debe ser "Cantidades" o "Porcentaje".`);
         }
-        if (!unit) errors.push('Falta Unidad');
+
+        if (progressMode === 'percentage') {
+          // Modalidad Porcentaje: Meta de referencia es 100% y unidad por defecto es '%'
+        } else {
+          // Modalidad Cantidades: Requiere meta numérica positiva > 0 y unidad de medida
+          if (!rawTarget || isNaN(targetUnits) || targetUnits <= 0) {
+            errors.push('Meta debe ser mayor a 0 para avance por Cantidades');
+          }
+          if (!rawUnit) errors.push('Falta Unidad');
+        }
 
         let status: 'valid' | 'duplicate' | 'rejected' = 'valid';
-        let statusReason = 'Fila válida lista para importar';
+        let statusReason = progressMode === 'percentage'
+          ? 'Fila válida lista para importar (Modalidad: Porcentaje 100%)'
+          : 'Fila válida lista para importar (Modalidad: Cantidades)';
 
         const compositeKey = `${technology.toLowerCase()}::${code}`;
         if (errors.length > 0) {
@@ -3695,6 +4050,9 @@ export default function App() {
         const cleanLoc =
           rawLoc.toLowerCase() === 'externo' ? 'Externo' : 'Interno';
 
+        const finalTargetUnits = progressMode === 'percentage' ? 100 : (isNaN(targetUnits) ? 0 : targetUnits);
+        const finalUnit = progressMode === 'percentage' ? (rawUnit || '%') : rawUnit;
+
         allRows.push({
           rowNumber,
           status,
@@ -3708,8 +4066,9 @@ export default function App() {
             sistemaName: areaRequiresSistema ? sistemaName : null,
             structureName,
             name,
-            targetUnits: isNaN(targetUnits) ? 0 : targetUnits,
-            unit,
+            progressMode,
+            targetUnits: finalTargetUnits,
+            unit: finalUnit,
             weight: isNaN(weight) || weight <= 0 ? 1.0 : weight,
             plannedHH: isNaN(plannedHH) || plannedHH < 0 ? 0 : plannedHH,
             durationDays: 5
@@ -4037,28 +4396,43 @@ export default function App() {
   // ==========================================================================
   // EXPORTACIONES CSV COMPATIBLES CON EXCEL (UTF-8 BOM + BLOB - C-8)
   // ==========================================================================
-  const handleExportGlobalCSV = () => {
-    if (!requirePermission('informes', 'export')) return;
-    const headers = [
-      'Sector',
-      'Galpón',
-      'Proveedor',
-      'Área',
-      'Ubicación',
-      'Sistema',
-      'Estructura',
-      'Código',
-      'Actividad',
-      'Meta',
-      'Unidad',
-      'Peso',
-      'Ejecutado',
-      'Avance %',
-      'HH Plan',
-      'HH Ejec',
-      'Estado'
-    ];
-    const rows: (string | number)[][] = [];
+  // ==========================================================================
+  // INFORMES GLOBALES: SELECTOR UNIFICADO, FILTROS Y EXPORTACIÓN COMPATIBLE
+  // Utiliza el mismo evaluador oficial de avances (evaluateActivityProgress)
+  // que el Dashboard y el Gantt, garantizando paridad matemática exacta.
+  // ==========================================================================
+
+  interface GlobalReportRowItem {
+    id: string;
+    projectName: string;
+    sectorId: string;
+    sectorName: string;
+    galponId: string;
+    galponCode: string;
+    galponName: string;
+    technology: string;
+    areaName: string;
+    locationType: string;
+    sistemaName: string;
+    structureName: string;
+    activityId: string;
+    activityCode: string;
+    activityName: string;
+    progressMode: 'quantity' | 'percentage';
+    progressModeLabel: string;
+    targetUnits: number;
+    unit: string;
+    weight: number;
+    accumulatedQty: number;
+    progressPercent: number;
+    plannedHH: number;
+    accumulatedHH: number;
+    computedStatus: 'Completado' | 'En proceso' | 'No iniciado' | 'Atrasado';
+  }
+
+  const allGlobalReportRows = useMemo<GlobalReportRowItem[]>(() => {
+    const list: GlobalReportRowItem[] = [];
+    const today = getSystemToday();
 
     scopedSectors.forEach((sec) => {
       (sec.galpones || []).forEach((gal: any) => {
@@ -4075,37 +4449,35 @@ export default function App() {
                 ((l.activityId && l.activityId === act.id) ||
                   l.activityCode === act.code)
             );
-            const execQty = logs.reduce(
-              (s, i) => s + Number(i.quantityToday || 0),
-              0
-            );
-            const execHH = logs.reduce(
-              (s, i) => s + Number(i.hoursWorked || 0),
-              0
-            );
-            const pct =
-              act.targetUnits > 0
-                ? Math.min(100, Math.round((execQty / act.targetUnits) * 1000) / 10)
-                : 0;
-            rows.push([
-              sec.name || '',
-              gal.code || '',
-              gal.technology || 'Sin proveedor',
-              area.name || '',
-              locType || 'Interno',
-              sisName || '-',
-              strName || '',
-              act.code || '',
-              act.name || '',
-              act.targetUnits ?? 0,
-              act.unit || '',
-              act.weight ?? 1,
-              execQty,
-              `${pct}%`,
-              act.plannedHH || 0,
-              execHH,
-              pct >= 100 ? 'Completada' : pct > 0 ? 'En proceso' : 'Pendiente'
-            ]);
+            const evaluated = evaluateActivityProgress(act, logs, today);
+            const isPct = evaluated.progressMode === 'percentage';
+            list.push({
+              id: `${gal.id}_${act.id || act.code}_${list.length}`,
+              projectName: sec.projectName || 'Proyecto La Calera',
+              sectorId: sec.id,
+              sectorName: sec.name || '',
+              galponId: gal.id,
+              galponCode: gal.code || '',
+              galponName: gal.name || '',
+              technology: gal.technology || 'Sin proveedor',
+              areaName: area.name || '',
+              locationType: locType || 'Interno',
+              sistemaName: sisName || '-',
+              structureName: strName || '',
+              activityId: act.id,
+              activityCode: act.code || '',
+              activityName: act.name || '',
+              progressMode: evaluated.progressMode,
+              progressModeLabel: isPct ? 'Porcentaje' : 'Cantidades',
+              targetUnits: isPct ? 100 : (act.targetUnits ?? 0),
+              unit: isPct ? '%' : (act.unit || ''),
+              weight: act.weight ?? 1,
+              accumulatedQty: evaluated.accumulatedQty,
+              progressPercent: evaluated.progressPercent,
+              plannedHH: act.plannedHH || 0,
+              accumulatedHH: evaluated.accumulatedHH,
+              computedStatus: evaluated.computedStatus as any
+            });
           };
 
           if (area.hasSistemas && area.sistemas) {
@@ -4132,11 +4504,251 @@ export default function App() {
       });
     });
 
+    return list;
+  }, [scopedSectors, dailyAdvances]);
+
+  const uniqueInformesAreas = useMemo(() => {
+    const set = new Set<string>();
+    allGlobalReportRows.forEach((r) => {
+      if (r.areaName) set.add(r.areaName);
+    });
+    return Array.from(set).sort();
+  }, [allGlobalReportRows]);
+
+  const uniqueInformesSistemas = useMemo(() => {
+    const set = new Set<string>();
+    allGlobalReportRows.forEach((r) => {
+      if (r.sistemaName && r.sistemaName !== '-') set.add(r.sistemaName);
+    });
+    return Array.from(set).sort();
+  }, [allGlobalReportRows]);
+
+  const informesGalponesOptions = useMemo(() => {
+    if (filterInformesSectorId === 'ALL') {
+      const list: any[] = [];
+      scopedSectors.forEach((s) => {
+        (s.galpones || []).forEach((g: any) => {
+          list.push({ ...g, sectorName: s.name });
+        });
+      });
+      return list;
+    }
+    const sec = scopedSectors.find((s) => s.id === filterInformesSectorId);
+    return sec ? (sec.galpones || []).map((g: any) => ({ ...g, sectorName: sec.name })) : [];
+  }, [scopedSectors, filterInformesSectorId]);
+
+  const filteredGlobalReportRows = useMemo(() => {
+    return allGlobalReportRows.filter((row) => {
+      if (filterInformesSectorId !== 'ALL' && row.sectorId !== filterInformesSectorId) {
+        return false;
+      }
+      if (filterInformesGalponId !== 'ALL' && row.galponId !== filterInformesGalponId) {
+        return false;
+      }
+      if (filterInformesAreaName !== 'ALL' && row.areaName !== filterInformesAreaName) {
+        return false;
+      }
+      if (filterInformesSistemaName !== 'ALL' && row.sistemaName !== filterInformesSistemaName) {
+        return false;
+      }
+      if (filterInformesMode !== 'ALL' && row.progressMode !== filterInformesMode) {
+        return false;
+      }
+      if (filterInformesStatus !== 'ALL') {
+        const statusNorm = row.computedStatus.toLowerCase();
+        const filterNorm = filterInformesStatus.toLowerCase();
+        if (filterNorm === 'completado' || filterNorm === 'completada') {
+          if (!statusNorm.includes('completa')) return false;
+        } else if (filterNorm === 'en proceso') {
+          if (!statusNorm.includes('proceso')) return false;
+        } else if (filterNorm === 'no iniciado' || filterNorm === 'pendiente') {
+          if (!statusNorm.includes('pendiente') && !statusNorm.includes('no iniciad')) return false;
+        } else if (filterNorm === 'atrasado' || filterNorm === 'alerta') {
+          if (!statusNorm.includes('alerta') && !statusNorm.includes('atrasad')) return false;
+        } else if (row.computedStatus !== filterInformesStatus) {
+          return false;
+        }
+      }
+      if (searchInformesText.trim()) {
+        const query = searchInformesText.trim().toLowerCase();
+        const matches =
+          row.activityCode.toLowerCase().includes(query) ||
+          row.activityName.toLowerCase().includes(query) ||
+          row.sectorName.toLowerCase().includes(query) ||
+          row.galponCode.toLowerCase().includes(query) ||
+          row.structureName.toLowerCase().includes(query) ||
+          row.sistemaName.toLowerCase().includes(query) ||
+          row.technology.toLowerCase().includes(query);
+        if (!matches) return false;
+      }
+      return true;
+    });
+  }, [
+    allGlobalReportRows,
+    filterInformesSectorId,
+    filterInformesGalponId,
+    filterInformesAreaName,
+    filterInformesSistemaName,
+    filterInformesMode,
+    filterInformesStatus,
+    searchInformesText
+  ]);
+
+  const informesMetrics = useMemo(() => {
+    const total = filteredGlobalReportRows.length;
+    const completed = filteredGlobalReportRows.filter((r) =>
+      r.computedStatus.toLowerCase().includes('completa')
+    ).length;
+    const inProgress = filteredGlobalReportRows.filter((r) =>
+      r.computedStatus.toLowerCase().includes('proceso')
+    ).length;
+    const notStarted = filteredGlobalReportRows.filter(
+      (r) =>
+        r.computedStatus.toLowerCase().includes('pendiente') ||
+        (r.computedStatus.toLowerCase().includes('no iniciad') && !r.computedStatus.includes('Alerta'))
+    ).length;
+    const delayed = filteredGlobalReportRows.filter(
+      (r) =>
+        r.computedStatus.toLowerCase().includes('alerta') ||
+        r.computedStatus.toLowerCase().includes('atrasad')
+    ).length;
+    const totalWeight = filteredGlobalReportRows.reduce((acc, r) => acc + (r.weight || 1), 0);
+    const weightedProgress =
+      totalWeight > 0
+        ? filteredGlobalReportRows.reduce((acc, r) => acc + r.progressPercent * (r.weight || 1), 0) /
+          totalWeight
+        : 0;
+    const plannedHH = filteredGlobalReportRows.reduce((acc, r) => acc + (r.plannedHH || 0), 0);
+    const accumulatedHH = filteredGlobalReportRows.reduce((acc, r) => acc + (r.accumulatedHH || 0), 0);
+
+    return {
+      total,
+      completed,
+      inProgress,
+      notStarted,
+      delayed,
+      weightedProgress: Number(weightedProgress.toFixed(1)),
+      plannedHH: Number(plannedHH.toFixed(1)),
+      accumulatedHH: Number(accumulatedHH.toFixed(1))
+    };
+  }, [filteredGlobalReportRows]);
+
+  const paginatedInformesRows = useMemo(() => {
+    if (informesPageSize <= 0) return filteredGlobalReportRows;
+    const start = (informesPage - 1) * informesPageSize;
+    return filteredGlobalReportRows.slice(start, start + informesPageSize);
+  }, [filteredGlobalReportRows, informesPage, informesPageSize]);
+
+  const totalInformesPages = useMemo(() => {
+    if (informesPageSize <= 0 || filteredGlobalReportRows.length === 0) return 1;
+    return Math.ceil(filteredGlobalReportRows.length / informesPageSize);
+  }, [filteredGlobalReportRows.length, informesPageSize]);
+
+  const handleExportGlobalCSV = (exportFiltered: boolean = false) => {
+    if (!requirePermission('informes', 'export')) return;
+    const headers = [
+      'Proyecto',
+      'Sector',
+      'Galpón',
+      'Proveedor',
+      'Área',
+      'Ubicación',
+      'Sistema',
+      'Estructura',
+      'Código',
+      'Actividad',
+      'Modalidad',
+      'Meta',
+      'Unidad',
+      'Peso',
+      'Ejecutado',
+      'Avance %',
+      'HH Plan',
+      'HH Ejec',
+      'Estado'
+    ];
+    const sourceRows = exportFiltered ? filteredGlobalReportRows : allGlobalReportRows;
+    const rows: (string | number)[][] = sourceRows.map((r) => [
+      r.projectName,
+      r.sectorName,
+      r.galponCode,
+      r.technology,
+      r.areaName,
+      r.locationType,
+      r.sistemaName,
+      r.structureName,
+      r.activityCode,
+      r.activityName,
+      r.progressMode === 'percentage' ? 'Porcentaje (0%-100%)' : 'Cantidades',
+      r.targetUnits,
+      r.unit,
+      r.weight,
+      r.accumulatedQty,
+      `${r.progressPercent}%`,
+      r.plannedHH,
+      r.accumulatedHH,
+      r.computedStatus
+    ]);
+
+    const prefix = exportFiltered ? 'Reporte_Global_Filtrado' : 'Reporte_Global_Galpones';
     downloadCsvFile(
-      `Reporte_Global_Galpones_${getSystemToday()}.csv`,
+      `${prefix}_${getSystemToday()}.csv`,
       headers,
       rows
     );
+  };
+
+  const handleExportGlobalXLSX = (exportFiltered: boolean = false) => {
+    if (!requirePermission('informes', 'export')) return;
+    const headers = [
+      'Proyecto',
+      'Sector',
+      'Galpón',
+      'Proveedor',
+      'Área',
+      'Ubicación',
+      'Sistema',
+      'Estructura',
+      'Código',
+      'Actividad',
+      'Modalidad',
+      'Meta',
+      'Unidad',
+      'Peso',
+      'Ejecutado',
+      'Avance %',
+      'HH Plan',
+      'HH Ejec',
+      'Estado'
+    ];
+    const sourceRows = exportFiltered ? filteredGlobalReportRows : allGlobalReportRows;
+    const rows: (string | number)[][] = sourceRows.map((r) => [
+      r.projectName,
+      r.sectorName,
+      r.galponCode,
+      r.technology,
+      r.areaName,
+      r.locationType,
+      r.sistemaName,
+      r.structureName,
+      r.activityCode,
+      r.activityName,
+      r.progressMode === 'percentage' ? 'Porcentaje (0%-100%)' : 'Cantidades',
+      r.targetUnits,
+      r.unit,
+      r.weight,
+      r.accumulatedQty,
+      r.progressPercent,
+      r.plannedHH,
+      r.accumulatedHH,
+      r.computedStatus
+    ]);
+
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Informe Global');
+    const prefix = exportFiltered ? 'Reporte_Global_Filtrado' : 'Reporte_Global_Galpones';
+    XLSX.writeFile(workbook, `${prefix}_${getSystemToday()}.xlsx`);
   };
 
   const handleExportMaterialsCSV = () => {
@@ -4324,402 +4936,542 @@ export default function App() {
     return evaluatedActivities.find((a) => a.code === formAdvance.activityCode) || null;
   }, [evaluatedActivities, formAdvance.activityCode]);
 
+  const adminSidebarModules: Array<{
+    id: AppModuleId;
+    tab: string;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+  }> = [
+    { id: 'proyectos', tab: 'proyectos', label: 'Proyectos y Galpones', icon: Building2 },
+    { id: 'catalogo', tab: 'catalogo', label: 'Catálogo Maestro y Plantillas', icon: BookOpen },
+    { id: 'actividades', tab: 'actividades', label: 'Gestión de Actividades', icon: Table },
+    { id: 'materiales', tab: 'materiales', label: 'Control de Materiales', icon: Package },
+    { id: 'personal', tab: 'personal', label: 'Planilla de Personal', icon: Users },
+    { id: 'informes', tab: 'informes', label: 'Informes Globales', icon: FileSpreadsheet },
+    { id: 'movimientos', tab: 'movimientos', label: 'Historial de Movimientos', icon: ClipboardList }
+  ];
+
+  const renderGalponHorizontalTabs = (testIdPrefix: string) => {
+    if (!currentSector) {
+      return (
+        <span className="text-xs text-emerald-200 italic py-1">
+          Seleccione un sector para ver sus galpones
+        </span>
+      );
+    }
+
+    const sectorGalpones = Array.isArray(currentSector.galpones)
+      ? currentSector.galpones
+      : [];
+
+    return (
+      <div className="flex items-center gap-1.5 overflow-x-auto py-0.5 min-w-0 max-w-full">
+        {sectorGalpones.length === 0 ? (
+          <span className="text-xs text-emerald-200 italic whitespace-nowrap">
+            Sin galpones en este sector
+          </span>
+        ) : (
+          sectorGalpones.map((gal: any) => {
+            const isSelected = currentGalpon?.id === gal.id;
+            return (
+              <button
+                key={gal.id}
+                type="button"
+                data-testid={`${testIdPrefix}-${gal.code || gal.id}`}
+                onClick={() => setSelectedGalponId(gal.id)}
+                title={`${gal.code} - ${gal.name}${gal.technology ? ` (${gal.technology})` : ''}`}
+                className={`px-2.5 py-1 rounded-lg text-xs font-bold transition whitespace-nowrap shrink-0 cursor-pointer border ${
+                  isSelected
+                    ? 'bg-white text-[#0f6b38] border-white shadow-xs ring-2 ring-white/40'
+                    : 'bg-emerald-900/75 hover:bg-emerald-800 text-emerald-50 border-emerald-600/50'
+                }`}
+              >
+                {gal.code || gal.name}
+              </button>
+            );
+          })
+        )}
+
+        {canDo('proyectos', 'create') && (
+          <button
+            type="button"
+            data-testid={`${testIdPrefix}-add-galpon`}
+            onClick={() => {
+              if (!currentSector) return;
+              setFormGalpon({
+                id: '',
+                sectorId: currentSector.id,
+                code: '',
+                name: '',
+                description: '',
+                supervisorsStr: '',
+                startDate: '',
+                endDate: '',
+                technology: ''
+              });
+              setModalNewGalpon(true);
+            }}
+            title="Agregar Galpón"
+            aria-label="Agregar Galpón"
+            className="px-2 py-1 rounded-lg bg-emerald-800/90 hover:bg-amber-400 hover:text-slate-950 text-emerald-100 border border-emerald-500/50 text-xs font-bold transition shrink-0 cursor-pointer flex items-center justify-center"
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="min-h-screen bg-slate-100 text-slate-900 font-sans flex flex-col antialiased selection:bg-emerald-100 selection:text-emerald-900">
       {/* ==================================================================== */}
-      {/* 1. BARRA LATERAL (SIDEBAR)                                           */}
+      {/* 1. BARRA LATERAL DESPLEGABLE (DRAWER OVERLAY EN PC Y MÓVIL)          */}
+      {/*    Oculta por defecto; contiene únicamente los 7 módulos admin       */}
       {/* ==================================================================== */}
-      {sidebarOpen && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-950/50 backdrop-blur-xs transition-opacity"
-          onClick={() => setSidebarOpen(false)}
-        />
-      )}
+      <div
+        data-testid="sidebar-backdrop-overlay"
+        aria-hidden={!sidebarOpen}
+        onClick={() => setSidebarOpen(false)}
+        className={`fixed inset-0 z-50 bg-slate-950/50 backdrop-blur-xs transition-opacity duration-300 ${
+          sidebarOpen
+            ? 'opacity-100 pointer-events-auto'
+            : 'opacity-0 pointer-events-none'
+        }`}
+      />
 
       <aside
-        className={`fixed top-0 bottom-0 left-0 z-50 w-72 sm:w-80 bg-white border-r border-slate-200 shadow-2xl flex flex-col transform transition-transform duration-300 ease-in-out ${
+        data-testid="app-sidebar"
+        aria-hidden={!sidebarOpen}
+        className={`fixed top-0 bottom-0 left-0 z-50 w-72 bg-white border-r border-slate-200 shadow-2xl flex flex-col transform transition-transform duration-300 ease-in-out ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
-        <div className="p-4 bg-[#0f6b38] text-white flex items-center justify-between border-b border-[#0a4e28]">
-          <div className="flex items-center gap-2.5">
-            <div className="w-9 h-9 rounded-xl bg-white text-[#0f6b38] flex items-center justify-center font-black text-sm shadow-sm">
-              PA
+        {/* Encabezado de Barra Lateral */}
+        <div className="px-4 py-3.5 bg-white border-b border-slate-200 flex items-center justify-between">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-[#0f6b38] flex items-center justify-center shrink-0">
+              <GalponLogoIcon variant="inline" size="sm" className="text-white" />
             </div>
-            <div>
-              <h2 className="text-sm font-extrabold uppercase tracking-tight">
-                Proyectos Automatizados
+            <div className="min-w-0">
+              <h2 className="text-xs font-extrabold text-slate-900 tracking-tight truncate">
+                Control Galpones La Calera
               </h2>
-              <p className="text-[11px] text-emerald-100">Menú de control</p>
+              <p className="text-[10px] font-medium text-slate-500 truncate">
+                Administración
+              </p>
             </div>
           </div>
           <button
+            type="button"
             onClick={() => setSidebarOpen(false)}
-            className="p-1.5 rounded-lg text-emerald-100 hover:bg-emerald-800 transition"
+            aria-label="Cerrar menú lateral"
+            data-testid="btn-close-sidebar"
+            className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-900 transition cursor-pointer shrink-0"
+            title="Cerrar menú"
           >
-            <X className="w-5 h-5" />
+            <X className="w-4 h-4" />
           </button>
         </div>
 
-        <div className="p-3 bg-slate-50 border-b border-slate-200 text-xs">
-          <span className="text-[10px] uppercase font-bold text-slate-400 block mb-0.5">
-            Contexto Activo:
-          </span>
-          <div className="font-bold text-[#0f6b38] truncate">
-            {currentSector ? currentSector.name : 'Sin Sector creado'}
-          </div>
-          <div className="font-extrabold text-slate-800 flex items-center gap-1.5 mt-0.5">
-            <Building2 className="w-3.5 h-3.5 text-[#0f6b38]" />
-            <span>
-              {currentGalpon
-                ? `${currentGalpon.code} - ${currentGalpon.name} (${currentGalpon.technology || 'Sin proveedor'})`
-                : 'Sin Galpón seleccionado'}
-            </span>
-          </div>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-3 space-y-1 text-xs font-semibold">
-          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 px-3 py-1">
-            Módulos de Administración
+        {/* Lista de los 7 Módulos Administrativos (Sin Dashboard, Gantt, Avance ni Asistencia) */}
+        <nav
+          data-testid="sidebar-admin-nav"
+          className="flex-1 overflow-y-auto px-3 py-3 space-y-1 text-xs"
+        >
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 px-2.5 pb-1.5">
+            Módulos Administrativos
           </div>
 
-          <button
-            onClick={() => {
-              setCurrentTab('proyectos');
-              setSidebarOpen(false);
-            }}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition ${
-              currentTab === 'proyectos'
-                ? 'bg-emerald-50 text-[#0f6b38] font-bold border border-emerald-200'
-                : 'text-slate-700 hover:bg-slate-100'
-            }`}
+          {adminSidebarModules
+            .filter((mod) => canDo(mod.id, 'view'))
+            .map((mod) => {
+              const IconComp = mod.icon;
+              const isActive = currentTab === mod.tab;
+              return (
+                <button
+                  key={mod.id}
+                  type="button"
+                  data-testid={`sidebar-link-${mod.tab}`}
+                  onClick={() => {
+                    setCurrentTab(mod.tab as any);
+                    setSidebarOpen(false);
+                  }}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-left transition cursor-pointer ${
+                    isActive
+                      ? 'bg-emerald-50 text-[#0f6b38] font-bold border border-emerald-200/80 shadow-2xs'
+                      : 'text-slate-700 hover:bg-slate-100 font-medium'
+                  }`}
+                >
+                  <IconComp
+                    className={`w-4 h-4 shrink-0 ${
+                      isActive ? 'text-[#0f6b38]' : 'text-slate-500'
+                    }`}
+                  />
+                  <span className="truncate leading-snug">{mod.label}</span>
+                </button>
+              );
+            })}
+        </nav>
+
+        {/* Bloque Inferior de Usuario, Rol y Controles de Sesión */}
+        {profile && (
+          <div
+            data-testid="sidebar-user-card"
+            className="px-3.5 py-3 bg-slate-50/80 border-t border-slate-200 text-xs space-y-2"
           >
-            <Building2 className="w-4 h-4 text-[#0f6b38]" />
-            <div className="text-left">
-              <span className="block font-bold">Proyectos y Galpones</span>
-              <span className="text-[10px] text-slate-500 font-normal">
-                Crear, editar y eliminar sectores y galpones
-              </span>
-            </div>
-          </button>
-
-          <button
-            onClick={() => {
-              setCurrentTab('catalogo');
-              setSidebarOpen(false);
-            }}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition ${
-              currentTab === 'catalogo'
-                ? 'bg-emerald-50 text-[#0f6b38] font-bold border border-emerald-200'
-                : 'text-slate-700 hover:bg-slate-100'
-            }`}
-          >
-            <BookOpen className="w-4 h-4 text-[#0f6b38]" />
-            <div className="text-left">
-              <span className="block font-bold">Catálogo Maestro y Plantillas</span>
-              <span className="text-[10px] text-slate-500 font-normal">
-                Proveedores, estructuras y actividades base
-              </span>
-            </div>
-          </button>
-
-          <button
-            onClick={() => {
-              setCurrentTab('actividades');
-              setSidebarOpen(false);
-            }}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition ${
-              currentTab === 'actividades'
-                ? 'bg-emerald-50 text-[#0f6b38] font-bold border border-emerald-200'
-                : 'text-slate-700 hover:bg-slate-100'
-            }`}
-          >
-            <Table className="w-4 h-4 text-[#0f6b38]" />
-            <div className="text-left">
-              <span className="block font-bold">Gestión de Actividades</span>
-              <span className="text-[10px] text-slate-500 font-normal">
-                Actividades del galpón (6 áreas)
-              </span>
-            </div>
-          </button>
-
-          <button
-            onClick={() => {
-              setCurrentTab('materiales');
-              setSidebarOpen(false);
-            }}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition ${
-              currentTab === 'materiales'
-                ? 'bg-emerald-50 text-[#0f6b38] font-bold border border-emerald-200'
-                : 'text-slate-700 hover:bg-slate-100'
-            }`}
-          >
-            <Package className="w-4 h-4 text-[#0f6b38]" />
-            <div className="text-left">
-              <span className="block font-bold">Control de Materiales</span>
-              <span className="text-[10px] text-slate-500 font-normal">
-                Materiales vinculados por estructura
-              </span>
-            </div>
-          </button>
-
-          <button
-            onClick={() => {
-              setCurrentTab('personal');
-              setSidebarOpen(false);
-            }}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition ${
-              currentTab === 'personal'
-                ? 'bg-emerald-50 text-[#0f6b38] font-bold border border-emerald-200'
-                : 'text-slate-700 hover:bg-slate-100'
-            }`}
-          >
-            <Users className="w-4 h-4 text-[#0f6b38]" />
-            <div className="text-left">
-              <span className="block font-bold">Planilla de Personal</span>
-              <span className="text-[10px] text-slate-500 font-normal">
-                Código manual, área y asignación
-              </span>
-            </div>
-          </button>
-
-          <button
-            onClick={() => {
-              setCurrentTab('informes');
-              setSidebarOpen(false);
-            }}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition ${
-              currentTab === 'informes'
-                ? 'bg-emerald-50 text-[#0f6b38] font-bold border border-emerald-200'
-                : 'text-slate-700 hover:bg-slate-100'
-            }`}
-          >
-            <FileSpreadsheet className="w-4 h-4 text-[#0f6b38]" />
-            <div className="text-left">
-              <span className="block font-bold">Informes Globales</span>
-              <span className="text-[10px] text-slate-500 font-normal">
-                Sábana multiproyecto y exportación CSV
-              </span>
-            </div>
-          </button>
-
-          <button
-            onClick={() => {
-              setCurrentTab('movimientos');
-              setSidebarOpen(false);
-            }}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition ${
-              currentTab === 'movimientos'
-                ? 'bg-emerald-50 text-[#0f6b38] font-bold border border-emerald-200'
-                : 'text-slate-700 hover:bg-slate-100'
-            }`}
-          >
-            <ClipboardList className="w-4 h-4 text-[#0f6b38]" />
-            <div className="text-left">
-              <span className="block font-bold">Historial de Movimientos</span>
-              <span className="text-[10px] text-slate-500 font-normal">
-                Registros, modificaciones y eliminaciones ({auditLogs.length})
-              </span>
-            </div>
-          </button>
-        </div>
-
-        <div className="p-3 bg-slate-50 border-t border-slate-200 text-[11px] text-slate-500 flex items-center justify-between">
-          <span>Firestore Realtime</span>
-          <span className="text-[#0f6b38] font-bold">
-            {syncStatus === 'synced'
-              ? 'Sincronizado'
-              : syncStatus === 'syncing'
-                ? 'Sincronizando...'
-                : 'Modo local'}
-          </span>
-        </div>
-      </aside>
-
-      {/* ==================================================================== */}
-      {/* 2. CABECERA SUPERIOR                                                 */}
-      {/* ==================================================================== */}
-      <header className="bg-[#0f6b38] text-white shadow-md sticky top-0 z-40 border-b border-[#0a4e28]">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6">
-          <div className="flex items-center justify-between py-2.5 border-b border-white/10 gap-2">
-            <div className="flex items-center gap-3">
-              <button
-                onClick={() => setSidebarOpen(true)}
-                className="p-2 rounded-xl bg-emerald-800/80 hover:bg-emerald-700 text-white transition ring-1 ring-emerald-500/40"
-                title="Abrir Menú de Control"
-              >
-                <Menu className="w-5 h-5" />
-              </button>
-
-              <div>
-                <h1 className="text-sm sm:text-base font-extrabold tracking-tight uppercase">
-                  Proyectos Galpones Automatizados
-                </h1>
-                <p className="text-[11px] text-emerald-100 hidden sm:block">
-                  Actividades, materiales, asistencia e indicadores •{' '}
-                  <span className="font-bold text-white">
-                    {syncStatus === 'synced'
-                      ? `Firestore en vivo${lastSyncedAt ? ` (${lastSyncedAt})` : ''}`
-                      : syncStatus === 'syncing'
-                        ? 'Sincronizando Firestore...'
-                        : 'Caché local'}
-                  </span>
-                </p>
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-emerald-100 text-[#0f6b38] flex items-center justify-center shrink-0 font-bold text-xs">
+                <ShieldCheck className="w-4 h-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div
+                  data-testid="sidebar-user-name"
+                  className="font-bold text-slate-900 truncate leading-tight"
+                >
+                  {profile.displayName}
+                </div>
+                <div
+                  data-testid="sidebar-user-role"
+                  className="text-[11px] font-medium text-[#0f6b38] truncate"
+                >
+                  {profile.role}
+                </div>
               </div>
             </div>
 
-            <div className="flex items-center gap-2 flex-wrap justify-end">
-              {canDo('proyectos', 'view') && (
+            <div className="flex items-center gap-1.5 pt-0.5">
+              {profile.role === 'Administrador' && (
                 <button
-                  onClick={() => setCurrentTab('proyectos')}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-emerald-800/80 text-white hover:bg-emerald-700 transition border border-emerald-600/40"
+                  type="button"
+                  onClick={() => {
+                    setSidebarOpen(false);
+                    openUserAdminModal();
+                  }}
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-slate-700 font-semibold text-[11px] border border-slate-200 transition cursor-pointer"
                 >
-                  <FolderPlus className="w-3.5 h-3.5" />
-                  <span className="hidden md:inline">Sectores / Galpones</span>
+                  <Users className="w-3.5 h-3.5 text-[#0f6b38]" />
+                  <span>Usuarios</span>
                 </button>
               )}
+              <button
+                type="button"
+                data-testid="sidebar-btn-logout"
+                onClick={logout}
+                className="flex-1 inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white hover:bg-rose-50 text-slate-700 hover:text-rose-700 font-semibold text-[11px] border border-slate-200 hover:border-rose-200 transition cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Cerrar sesión</span>
+              </button>
+            </div>
+          </div>
+        )}
 
-              {canDo('catalogo', 'view') && (
-                <button
-                  onClick={() => setCurrentTab('catalogo')}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-white text-[#0f6b38] shadow-xs hover:bg-slate-50 transition"
-                >
-                  <BookOpen className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Catálogo Maestro</span>
-                </button>
-              )}
+        {/* Pie de Barra Lateral: Versión 3.0.0 y Estado: Actualizado */}
+        <SidebarVersionFooter />
+      </aside>
 
-              {canDo('materiales', 'view') && (
-                <button
-                  onClick={() => setCurrentTab('materiales')}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-white text-[#0f6b38] shadow-xs hover:bg-slate-50 transition"
-                >
-                  <Package className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Materiales</span>
-                </button>
-              )}
+      {/* ==================================================================== */}
+      {/* 2. BARRA SUPERIOR (DISTRIBUCIÓN DIFERENCIADA PARA PC Y MÓVIL)        */}
+      {/* ==================================================================== */}
+      <header
+        data-testid="app-top-header"
+        className="bg-[#0f6b38] text-white shadow-sm sticky top-0 z-30 border-b border-[#0a4e28]"
+      >
+        {/* Selector oculto sincronizado para compatibilidad de pruebas automatizadas */}
+        {currentSector && Array.isArray(currentSector.galpones) && currentSector.galpones.length > 0 && (
+          <select
+            data-testid="selector-galpon"
+            aria-label="Selector técnico de Galpón"
+            value={currentGalpon?.id || ''}
+            onChange={(e) => setSelectedGalponId(e.target.value)}
+            className="sr-only"
+          >
+            <option value="">Seleccione un galpón...</option>
+            {currentSector.galpones.map((gal: any) => (
+              <option key={gal.id} value={gal.id}>
+                {gal.code} - {gal.name}
+              </option>
+            ))}
+          </select>
+        )}
 
-              {canDo('movimientos', 'view') && (
-                <button
-                  onClick={() => setCurrentTab('movimientos')}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold bg-emerald-800/80 text-white hover:bg-emerald-700 transition border border-emerald-600/40"
+        {/* ------------------------------------------------------------------ */}
+        {/* A. VERSIÓN WEB PARA PC (lg:flex en DOS FILAS)                      */}
+        {/* ------------------------------------------------------------------ */}
+        <div
+          data-testid="header-pc-layout"
+          className="hidden lg:flex lg:flex-col max-w-[1600px] mx-auto px-5 py-2.5 gap-2"
+        >
+          {/* PRIMERA FILA (PC): Izquierda (Hamburguesa + Logo + Nombre + Sector) | Derecha (Conexión + Sincronizar [N] + Usuario + Cerrar sesión) */}
+          <div className="flex items-center justify-between gap-4">
+            {/* Lado izquierdo */}
+            <div className="flex items-center gap-2.5 min-w-0">
+              <button
+                type="button"
+                onClick={() => setSidebarOpen(true)}
+                aria-label="Abrir menú administrativo"
+                data-testid="btn-open-sidebar-pc"
+                className="p-1.5 rounded-lg bg-emerald-800/90 hover:bg-emerald-700 text-white transition border border-emerald-600/50 cursor-pointer shrink-0"
+                title="Abrir menú administrativo"
+              >
+                <Menu className="w-4 h-4" />
+              </button>
+              <GalponLogoIcon variant="header" size="sm" />
+              <h1 className="text-base font-bold tracking-tight whitespace-nowrap">
+                Control Galpones La Calera
+              </h1>
+
+              <div className="h-4 w-px bg-white/20 mx-0.5" />
+
+              {/* Selector de Sector junto al nombre de la aplicación */}
+              <div className="flex items-center gap-1.5">
+                <label
+                  htmlFor="header-sector-select"
+                  className="text-xs font-semibold text-emerald-100 whitespace-nowrap"
                 >
-                  <ClipboardList className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Movimientos</span>
-                </button>
+                  Sector:
+                </label>
+                {scopedSectors.length === 0 ? (
+                  canDo('proyectos', 'create') ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFormProject({
+                          id: '',
+                          code: '',
+                          name: '',
+                          location: '',
+                          client: ''
+                        });
+                        setModalNewProject(true);
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-amber-400 text-slate-950 font-bold text-xs cursor-pointer whitespace-nowrap"
+                    >
+                      + Crear Sector
+                    </button>
+                  ) : (
+                    <span className="text-xs text-emerald-200 italic">Sin sectores</span>
+                  )
+                ) : (
+                  <div className="flex items-center gap-1">
+                    <select
+                      id="header-sector-select"
+                      data-testid="selector-sector"
+                      aria-label="Selector de Sector"
+                      value={currentSector?.id || ''}
+                      onChange={(e) => handleSelectSector(e.target.value)}
+                      className="bg-emerald-900/90 hover:bg-emerald-900 text-white text-xs font-semibold rounded-lg px-2.5 py-1.5 border border-emerald-600/60 focus:outline-none focus:ring-1 focus:ring-white cursor-pointer max-w-[200px] truncate"
+                    >
+                      {!currentSector && (
+                        <option value="">Seleccione sector...</option>
+                      )}
+                      {scopedSectors.map((sec) => (
+                        <option key={sec.id} value={sec.id} className="bg-slate-900 text-white">
+                          {sec.name}
+                        </option>
+                      ))}
+                    </select>
+                    {canDo('proyectos', 'create') && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFormProject({
+                            id: '',
+                            code: '',
+                            name: '',
+                            location: '',
+                            client: ''
+                          });
+                          setModalNewProject(true);
+                        }}
+                        title="Nuevo Sector"
+                        aria-label="Nuevo Sector"
+                        className="p-1.5 rounded-lg bg-emerald-800/80 hover:bg-emerald-700 text-emerald-100 border border-emerald-600/40 transition cursor-pointer shrink-0"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Lado derecho: Indicador de conexión + Botón SINCRONIZAR DATOS [N] + Menú de usuario + Cerrar sesión */}
+            <div className="flex items-center gap-2 shrink-0">
+              <OfflineSyncStatusBar
+                connectionIndicatorState={connectionIndicatorState}
+                isNetworkOnline={isNetworkOnline}
+                activePendingCount={activePendingCount}
+                unresolvedConflictCount={unresolvedConflictCount}
+                pendingOperations={pendingOperations}
+                syncConflicts={syncConflicts}
+                isManualSyncing={isManualSyncing}
+                onTriggerManualSync={async () => {
+                  const res = await triggerManualSync();
+                  if (res.conflictCount > 0 || res.errorCount > 0 || !isNetworkOnline) {
+                    setModalSyncCenterOpen(true);
+                  }
+                  return res;
+                }}
+                onOpenSyncModal={() => setModalSyncCenterOpen(true)}
+              />
+
+              {profile && (
+                <div className="flex items-center gap-1.5 border-l border-white/20 pl-2">
+                  {profile.role === 'Administrador' ? (
+                    <button
+                      type="button"
+                      data-testid="header-btn-user-menu"
+                      onClick={openUserAdminModal}
+                      title={`Gestión de Usuarios (${profile.displayName} · ${profile.role})`}
+                      aria-label="Menú de usuario y roles"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-emerald-800/90 hover:bg-emerald-700 text-white text-xs font-semibold border border-emerald-600/50 transition cursor-pointer whitespace-nowrap"
+                    >
+                      <Users className="w-3.5 h-3.5 text-emerald-200" />
+                      <span>Usuarios</span>
+                    </button>
+                  ) : (
+                    <div
+                      data-testid="header-btn-user-menu"
+                      title={`${profile.displayName} (${profile.role})`}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-emerald-900/70 text-emerald-50 text-xs font-semibold border border-emerald-700/50 whitespace-nowrap"
+                    >
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-300" />
+                      <span>{profile.role}</span>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    data-testid="header-btn-logout"
+                    onClick={logout}
+                    title="Cerrar sesión"
+                    aria-label="Cerrar sesión"
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-950/70 hover:bg-rose-700 text-emerald-100 hover:text-white text-xs font-semibold border border-emerald-700/50 transition cursor-pointer whitespace-nowrap"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    <span>Cerrar sesión</span>
+                  </button>
+                </div>
               )}
             </div>
           </div>
 
-          {/* Fila 2: Selectores de Sector y Galpón */}
-          <div className="py-2 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
-            <div className="flex items-center gap-2 overflow-x-auto">
-              <span className="text-[11px] uppercase tracking-wider text-emerald-200 font-bold shrink-0">
-                Sector:
-              </span>
-              {scopedSectors.length === 0 ? (
-                canDo('proyectos', 'create') ? (
-                  <button
-                    onClick={() => {
-                      setFormProject({
-                        id: '',
-                        code: '',
-                        name: '',
-                        location: '',
-                        client: ''
-                      });
-                      setModalNewProject(true);
-                    }}
-                    className="px-2.5 py-1 rounded-lg bg-amber-400 text-slate-950 font-black text-xs"
-                  >
-                    + Crear Primer Sector
-                  </button>
-                ) : (
-                  <span className="text-emerald-200 italic">Sin sectores asignados</span>
-                )
-              ) : (
-                scopedSectors.map((sec) => {
-                  const isSel = currentSector?.id === sec.id;
-                  return (
-                    <button
-                      key={sec.id}
-                      onClick={() => handleSelectSector(sec.id)}
-                      className={`px-3 py-1 rounded-lg text-xs font-bold shrink-0 transition flex items-center gap-1 ${
-                        isSel
-                          ? 'bg-white text-[#0f6b38] shadow-sm'
-                          : 'bg-emerald-800/80 text-emerald-100 hover:bg-emerald-700 border border-emerald-700'
-                      }`}
-                    >
-                      {isSel && <Check className="w-3 h-3 text-[#0f6b38]" />}
-                      <span className="truncate max-w-[160px]">{sec.name}</span>
-                    </button>
-                  );
-                })
-              )}
-              {canDo('proyectos', 'create') && (
-                <button
-                  onClick={() => {
-                    setFormProject({ id: '', code: '', name: '', location: '', client: '' });
-                    setModalNewProject(true);
-                  }}
-                  className="px-2 py-1 rounded-lg bg-emerald-800/90 hover:bg-emerald-700 text-emerald-100 text-[11px] font-bold shrink-0"
-                >
-                  + Nuevo Sector
-                </button>
-              )}
-            </div>
+          {/* SEGUNDA FILA (PC): Pestañas/Botones Horizontales de Galpones del Sector Seleccionado */}
+          <div
+            data-testid="header-pc-galpones-row"
+            className="flex items-center gap-2 pt-1.5 border-t border-white/15 min-w-0"
+          >
+            <span className="text-xs font-bold text-emerald-100 whitespace-nowrap shrink-0">
+              Galpones:
+            </span>
+            {renderGalponHorizontalTabs('pc-galpon-tab')}
+          </div>
+        </div>
 
-            <div className="flex items-center gap-2 overflow-x-auto">
-              <span className="text-[11px] uppercase tracking-wider text-emerald-200 font-bold shrink-0">
-                Galpón:
-              </span>
-              {!currentSector || !currentSector.galpones?.length ? (
-                canDo('proyectos', 'create') ? (
-                  <button
-                    disabled={!currentSector}
-                    onClick={() => {
-                      if (!currentSector) return;
-                      setFormGalpon({
-                        id: '',
-                        sectorId: currentSector.id,
-                        code: '',
-                        name: '',
-                        description: '',
-                        supervisorsStr: '',
-                        startDate: '',
-                        endDate: '',
-                        technology: ''
-                      });
-                      setModalNewGalpon(true);
-                    }}
-                    className="px-2.5 py-1 rounded-lg bg-amber-400 disabled:opacity-40 text-slate-950 font-black text-xs"
-                  >
-                    + Crear Galpón
-                  </button>
-                ) : (
-                  <span className="text-emerald-200 italic">Sin galpones asignados</span>
-                )
-              ) : (
-                currentSector.galpones.map((gal: any) => {
-                  const isSel = currentGalpon?.id === gal.id;
-                  return (
-                    <button
-                      key={gal.id}
-                      onClick={() => setSelectedGalponId(gal.id)}
-                      className={`px-2.5 py-1 rounded-md text-xs font-bold shrink-0 transition flex items-center gap-1 ${
-                        isSel
-                          ? 'bg-amber-400 text-slate-950 font-black shadow-sm ring-1 ring-amber-300'
-                          : 'bg-emerald-900/60 text-emerald-100 hover:bg-emerald-800 border border-emerald-700/50'
-                      }`}
-                    >
-                      <Building2 className="w-3 h-3" />
-                      <span>{gal.code}</span>
-                      <span className="text-[10px] opacity-75">({gal.technology})</span>
-                    </button>
-                  );
-                })
-              )}
-            </div>
+        {/* ------------------------------------------------------------------ */}
+        {/* B. VERSIÓN WEB MÓVIL (< lg: CUATRO FILAS ORDENADAS)                */}
+        {/* ------------------------------------------------------------------ */}
+        <div
+          data-testid="header-mobile-layout"
+          className="flex lg:hidden flex-col px-3 py-2.5 gap-2"
+        >
+          {/* Fila 1 Móvil: Menú Hamburguesa + Logotipo Industrial + Nombre Compacto */}
+          <div className="flex items-center gap-2.5 min-w-0">
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(true)}
+              aria-label="Abrir menú lateral"
+              data-testid="btn-open-sidebar"
+              className="p-1.5 rounded-lg bg-emerald-800/90 hover:bg-emerald-700 text-white transition border border-emerald-600/50 cursor-pointer shrink-0"
+              title="Abrir menú"
+            >
+              <Menu className="w-4 h-4" />
+            </button>
+            <GalponLogoIcon variant="header" size="sm" />
+            <h1 className="text-sm font-bold tracking-tight truncate">
+              Control Galpones La Calera
+            </h1>
+          </div>
+
+          {/* Fila 2 Móvil: Selector de Sector + Botón [+] */}
+          <div className="flex items-center gap-2 min-w-0">
+            <label
+              htmlFor="mobile-sector-select"
+              className="text-xs font-bold text-emerald-100 whitespace-nowrap shrink-0"
+            >
+              Sector:
+            </label>
+            <select
+              id="mobile-sector-select"
+              data-testid="selector-sector-mobile"
+              aria-label="Selector de Sector Móvil"
+              value={currentSector?.id || ''}
+              onChange={(e) => handleSelectSector(e.target.value)}
+              className="flex-1 min-w-0 bg-emerald-900/90 text-white text-xs font-semibold rounded-lg px-2.5 py-1.5 border border-emerald-600/60 focus:outline-none focus:ring-1 focus:ring-white"
+            >
+              {!currentSector && <option value="">Seleccione sector...</option>}
+              {scopedSectors.map((sec) => (
+                <option key={sec.id} value={sec.id} className="bg-slate-900 text-white">
+                  {sec.name}
+                </option>
+              ))}
+            </select>
+            {canDo('proyectos', 'create') && (
+              <button
+                type="button"
+                onClick={() => {
+                  setFormProject({
+                    id: '',
+                    code: '',
+                    name: '',
+                    location: '',
+                    client: ''
+                  });
+                  setModalNewProject(true);
+                }}
+                title="Nuevo Sector"
+                aria-label="Nuevo Sector"
+                className="p-1.5 rounded-lg bg-emerald-800/90 hover:bg-emerald-700 text-emerald-100 border border-emerald-600/50 transition cursor-pointer shrink-0"
+              >
+                <Plus className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+
+          {/* Fila 3 Móvil: Etiqueta Galpones + Botones Horizontales Desplazables + Botón [+] */}
+          <div
+            data-testid="header-mobile-galpones-row"
+            className="flex items-center gap-2 min-w-0 pt-0.5"
+          >
+            <span className="text-xs font-bold text-emerald-100 whitespace-nowrap shrink-0">
+              Galpones:
+            </span>
+            {renderGalponHorizontalTabs('mobile-galpon-tab')}
+          </div>
+
+          {/* Fila 4 Móvil: Indicador de Conexión + Botón SINCRONIZAR DATOS con contador */}
+          <div
+            data-testid="header-mobile-sync-row"
+            className="flex items-center justify-between gap-2 pt-1 border-t border-white/15"
+          >
+            <OfflineSyncStatusBar
+              connectionIndicatorState={connectionIndicatorState}
+              isNetworkOnline={isNetworkOnline}
+              activePendingCount={activePendingCount}
+              unresolvedConflictCount={unresolvedConflictCount}
+              pendingOperations={pendingOperations}
+              syncConflicts={syncConflicts}
+              isManualSyncing={isManualSyncing}
+              onTriggerManualSync={async () => {
+                const res = await triggerManualSync();
+                if (res.conflictCount > 0 || res.errorCount > 0 || !isNetworkOnline) {
+                  setModalSyncCenterOpen(true);
+                }
+                return res;
+              }}
+              onOpenSyncModal={() => setModalSyncCenterOpen(true)}
+            />
           </div>
         </div>
       </header>
@@ -4760,7 +5512,7 @@ export default function App() {
               <button
                 disabled={!currentGalpon}
                 onClick={() => openNewAdvanceModal()}
-                className="px-3 py-1.5 rounded-lg bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold text-xs shadow-xs transition flex items-center gap-1.5"
+                className="px-3 py-1.5 rounded-lg bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold text-xs shadow-xs transition flex items-center gap-1.5 cursor-pointer"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>+ Registrar Avance</span>
@@ -4773,7 +5525,11 @@ export default function App() {
       {/* ==================================================================== */}
       {/* 4. CONTENIDO PRINCIPAL                                               */}
       {/* ==================================================================== */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 pb-24">
+      <main
+        className={`flex-1 w-full mx-auto p-3 sm:p-5 pb-28 ${
+          currentTab === 'gantt' ? 'max-w-[1600px]' : 'max-w-7xl'
+        }`}
+      >
         {permissionNotice && (
           <div className="mb-4 bg-amber-50 border border-amber-300 text-amber-900 px-4 py-3 rounded-xl text-xs font-bold flex items-center justify-between shadow-xs">
             <div className="flex items-center gap-2">
@@ -4813,118 +5569,20 @@ export default function App() {
         )}
 
         {/* ================================================================== */}
-        {/* VISTA 2: CRONOGRAMA GANTT                                          */}
+        {/* VISTA 2: CRONOGRAMA GANTT DINÁMICO (OPCIÓN C: PLANIFICACIÓN + REAL) */}
         {/* ================================================================== */}
         {currentTab === 'gantt' && (
-          <div className="space-y-4">
-            <div className="bg-white p-4 rounded-2xl border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div>
-                <h2 className="text-base font-extrabold text-slate-900">
-                  Cronograma Gantt por Estructura y Actividad
-                </h2>
-                <p className="text-xs text-slate-500">
-                  Puedes editar las fechas de inicio y fin directamente en cada fila
-                </p>
-              </div>
-              <button
-                disabled={!currentGalpon}
-                onClick={() => setModalNewActivity(true)}
-                className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white text-xs font-bold"
-              >
-                + Nueva Actividad
-              </button>
-            </div>
-
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs border-collapse">
-                  <thead>
-                    <tr className="bg-[#0f6b38] text-white font-bold uppercase text-[11px]">
-                      <th className="py-3 px-3">Código</th>
-                      <th className="py-3 px-3">Área / Sistema</th>
-                      <th className="py-3 px-3">Estructura / Actividad</th>
-                      <th className="py-3 px-2 text-right">Meta</th>
-                      <th className="py-3 px-2 text-right">Ejecutado</th>
-                      <th className="py-3 px-2 text-right">% Real</th>
-                      <th className="py-3 px-2 text-center">Inicio</th>
-                      <th className="py-3 px-2 text-center">Fin</th>
-                      <th className="py-3 px-3 min-w-[140px]">Progreso</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-200 font-medium">
-                    {evaluatedActivities.length === 0 ? (
-                      <tr>
-                        <td colSpan={9} className="py-8 text-center text-slate-400">
-                          No hay actividades registradas en este galpón.
-                        </td>
-                      </tr>
-                    ) : (
-                      evaluatedActivities.map((act) => (
-                        <tr key={act.id} className="hover:bg-slate-50">
-                          <td className="py-2 px-3 font-mono font-bold text-slate-700">
-                            {act.code}
-                          </td>
-                          <td className="py-2 px-3">
-                            <span className="font-bold text-[#0f6b38] block">
-                              {act.areaName}
-                            </span>
-                            {act.sistemaName && (
-                              <span className="text-[10px] text-slate-500">
-                                {act.locationType} • {act.sistemaName}
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-2 px-3">
-                            <span className="text-[11px] font-bold text-slate-600 block">
-                              Estructura: {act.structureName}
-                            </span>
-                            <span className="font-bold text-slate-900">{act.name}</span>
-                          </td>
-                          <td className="py-2 px-2 text-right font-mono">
-                            {act.targetUnits} {act.unit}
-                          </td>
-                          <td className="py-2 px-2 text-right font-mono font-bold text-[#0f6b38]">
-                            {act.accumulatedQty}
-                          </td>
-                          <td className="py-2 px-2 text-right font-mono font-black">
-                            {act.progressPercent}%
-                          </td>
-                          <td className="py-2 px-2 text-center">
-                            <input
-                              type="date"
-                              value={act.startDate || ''}
-                              onChange={(e) =>
-                                handleGanttDateChange(act.id, 'startDate', e.target.value)
-                              }
-                              className="px-2 py-1 border border-slate-300 rounded text-[11px] font-mono bg-slate-50"
-                            />
-                          </td>
-                          <td className="py-2 px-2 text-center">
-                            <input
-                              type="date"
-                              value={act.dueDate || ''}
-                              onChange={(e) =>
-                                handleGanttDateChange(act.id, 'dueDate', e.target.value)
-                              }
-                              className="px-2 py-1 border border-slate-300 rounded text-[11px] font-mono bg-slate-50"
-                            />
-                          </td>
-                          <td className="py-2 px-3">
-                            <div className="w-full bg-slate-200 rounded-full h-2.5 overflow-hidden">
-                              <div
-                                className="bg-[#0f6b38] h-full rounded-full"
-                                style={{ width: `${act.progressPercent}%` }}
-                              />
-                            </div>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
+          <GanttView
+            currentSector={currentSector}
+            currentGalpon={currentGalpon}
+            rawActivities={evaluatedActivities}
+            dailyAdvances={dailyAdvances}
+            todayStr={getSystemToday()}
+            canCreateActivity={canDo('actividades', 'create')}
+            canEditGantt={canDo('gantt', 'edit')}
+            onOpenNewActivity={openNewActivityModal}
+            onDateChange={handleGanttDateChange}
+          />
         )}
 
         {/* ================================================================== */}
@@ -4938,8 +5596,8 @@ export default function App() {
                   Control de Avance Diario de Obra
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Registro guiado en cascada con horas hombre, consumo manual de
-                  materiales, edición y eliminación con recálculo automático de stock
+                  Registro guiado en cascada por Cantidades o Porcentaje Total Alcanzado (0%-100%),
+                  con soporte Offline, sincronización multiusuario y recálculo automático de stock
                 </p>
               </div>
               <button
@@ -4968,6 +5626,12 @@ export default function App() {
                     const act = evaluatedActivities.find(
                       (a) => a.code === adv.activityCode
                     );
+                    const isPctMode =
+                      adv.progressMode === 'percentage' ||
+                      act?.progressMode === 'percentage';
+                    const isPendingLocal = adv.syncState === 'pending_sync' || !isNetworkOnline;
+                    const isConflict = adv.syncState === 'conflict';
+
                     return (
                       <div
                         key={adv.id}
@@ -4981,12 +5645,41 @@ export default function App() {
                             <span className="text-xs font-extrabold text-slate-900">
                               {act?.name || 'Actividad'}
                             </span>
+                            <span
+                              className={`text-[10px] px-2 py-0.5 rounded font-bold border ${
+                                isPctMode
+                                  ? 'bg-blue-50 text-blue-800 border-blue-200'
+                                  : 'bg-emerald-50 text-[#0f6b38] border-emerald-200'
+                              }`}
+                            >
+                              {isPctMode ? 'Modalidad: Porcentaje (%)' : 'Modalidad: Cantidades'}
+                            </span>
                             <span className="text-xs font-mono font-black text-[#0f6b38]">
-                              +{adv.quantityToday} {act?.unit || ''}
+                              {isPctMode
+                                ? `Total alcanzado: ${adv.percentageReached ?? adv.quantityToday}%`
+                                : `+${adv.quantityToday} ${act?.unit || ''}`}
                             </span>
                             {adv.hoursWorked > 0 && (
                               <span className="text-[11px] px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-bold">
                                 {adv.hoursWorked} HH
+                              </span>
+                            )}
+                            {adv.isAuthorizedCorrection && (
+                              <span className="text-[10px] px-2 py-0.5 rounded bg-purple-100 text-purple-800 border border-purple-300 font-bold">
+                                Corrección histórica autorizada
+                              </span>
+                            )}
+                            {isConflict ? (
+                              <span className="text-[10px] px-2 py-0.5 rounded bg-rose-100 text-rose-800 border border-rose-300 font-bold">
+                                En conflicto multiusuario
+                              </span>
+                            ) : adv.syncState === 'pending_sync' ? (
+                              <span className="text-[10px] px-2 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300 font-bold">
+                                Pendiente de sincronización
+                              </span>
+                            ) : (
+                              <span className="text-[10px] px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-bold">
+                                {isPendingLocal ? 'Guardado localmente' : 'Sincronizado'}
                               </span>
                             )}
                             {adv.sharedGroupId && (
@@ -5002,6 +5695,9 @@ export default function App() {
                             Fecha: <strong>{adv.date}</strong> • Supervisor:{' '}
                             <strong>{adv.supervisor || 'Sin especificar'}</strong>
                             {adv.note ? ` • Nota: ${adv.note}` : ''}
+                            {adv.correctionReason
+                              ? ` • Motivo corrección: ${adv.correctionReason}`
+                              : ''}
                           </p>
                           {adv.materialsUsedToday?.length > 0 && (
                             <div className="mt-1.5 flex flex-wrap gap-1.5">
@@ -5020,8 +5716,9 @@ export default function App() {
                         <div className="flex items-center justify-between sm:justify-end gap-4 shrink-0">
                           <div className="text-right">
                             <span className="text-xs text-slate-500 block">
-                              Acumulado: {act?.accumulatedQty || 0} /{' '}
-                              {act?.targetUnits || 0}
+                              {isPctMode
+                                ? `Último % válido: ${act?.progressPercent || 0}% / 100%`
+                                : `Acumulado: ${act?.accumulatedQty || 0} / ${act?.targetUnits || 0}`}
                             </span>
                             <span className="text-sm font-black text-[#0f6b38] font-mono">
                               {act?.progressPercent || 0}%
@@ -5264,7 +5961,7 @@ export default function App() {
         )}
 
         {/* ================================================================== */}
-        {/* VISTA 5: PROYECTOS / SECTORES Y GALPONES                           */}
+        {/* VISTA 5: PROYECTOS / SECTORES Y GALPONES (C-5: Alcance y Permisos) */}
         {/* ================================================================== */}
         {currentTab === 'proyectos' && (
           <div className="space-y-6">
@@ -5278,56 +5975,58 @@ export default function App() {
                   proveedor
                 </p>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    setFormProject({
-                      id: '',
-                      code: '',
-                      name: '',
-                      location: '',
-                      client: ''
-                    });
-                    setModalNewProject(true);
-                  }}
-                  className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold flex items-center gap-1.5"
-                >
-                  <FolderPlus className="w-4 h-4" />
-                  <span>+ Nuevo Proyecto / Sector</span>
-                </button>
-                <button
-                  disabled={sectors.length === 0}
-                  onClick={() => {
-                    setFormGalpon({
-                      id: '',
-                      sectorId: '',
-                      code: '',
-                      name: '',
-                      description: '',
-                      supervisorsStr: '',
-                      startDate: '',
-                      endDate: '',
-                      technology: ''
-                    });
-                    setModalNewGalpon(true);
-                  }}
-                  className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white text-xs font-bold flex items-center gap-1.5"
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>+ Crear Galpón</span>
-                </button>
-              </div>
+              {canDo('proyectos', 'create') && (
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      setFormProject({
+                        id: '',
+                        code: '',
+                        name: '',
+                        location: '',
+                        client: ''
+                      });
+                      setModalNewProject(true);
+                    }}
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold flex items-center gap-1.5"
+                  >
+                    <FolderPlus className="w-4 h-4" />
+                    <span>+ Nuevo Proyecto / Sector</span>
+                  </button>
+                  <button
+                    disabled={scopedSectors.length === 0}
+                    onClick={() => {
+                      setFormGalpon({
+                        id: '',
+                        sectorId: '',
+                        code: '',
+                        name: '',
+                        description: '',
+                        supervisorsStr: '',
+                        startDate: '',
+                        endDate: '',
+                        technology: ''
+                      });
+                      setModalNewGalpon(true);
+                    }}
+                    className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white text-xs font-bold flex items-center gap-1.5"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>+ Crear Galpón</span>
+                  </button>
+                </div>
+              )}
             </div>
 
-            {sectors.length === 0 ? (
+            {scopedSectors.length === 0 ? (
               <div className="bg-white rounded-2xl p-8 text-center border border-slate-200">
                 <p className="text-sm font-bold text-slate-700">
-                  Aún no has creado ningún Sector / Proyecto.
+                  No existen Sectores / Galpones asignados a su alcance actual.
                 </p>
               </div>
             ) : (
               <div className="space-y-4">
-                {sectors.map((sec) => (
+                {scopedSectors.map((sec) => (
                   <div
                     key={sec.id}
                     className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs"
@@ -5349,51 +6048,57 @@ export default function App() {
                       </div>
 
                       <div className="flex items-center gap-2 flex-wrap">
-                        <button
-                          onClick={() => {
-                            setFormProject({
-                              id: sec.id,
-                              code: sec.code,
-                              name: sec.name,
-                              location: sec.location || '',
-                              client: sec.client || ''
-                            });
-                            setModalEditProject(true);
-                          }}
-                          className="px-3 py-1.5 rounded-lg border border-slate-300 hover:bg-slate-100 text-slate-700 text-xs font-bold flex items-center gap-1"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                          <span>Editar Sector</span>
-                        </button>
+                        {canDo('proyectos', 'edit') && (
+                          <button
+                            onClick={() => {
+                              setFormProject({
+                                id: sec.id,
+                                code: sec.code,
+                                name: sec.name,
+                                location: sec.location || '',
+                                client: sec.client || ''
+                              });
+                              setModalEditProject(true);
+                            }}
+                            className="px-3 py-1.5 rounded-lg border border-slate-300 hover:bg-slate-100 text-slate-700 text-xs font-bold flex items-center gap-1"
+                          >
+                            <Edit2 className="w-3.5 h-3.5" />
+                            <span>Editar Sector</span>
+                          </button>
+                        )}
 
-                        <button
-                          onClick={() => requestDeleteSector(sec.id)}
-                          className="px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold flex items-center gap-1"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                          <span>Eliminar Sector</span>
-                        </button>
+                        {canDo('proyectos', 'delete') && (
+                          <button
+                            onClick={() => requestDeleteSector(sec.id)}
+                            className="px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold flex items-center gap-1"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Eliminar Sector</span>
+                          </button>
+                        )}
 
-                        <button
-                          onClick={() => {
-                            setFormGalpon({
-                              id: '',
-                              sectorId: sec.id,
-                              code: '',
-                              name: '',
-                              description: '',
-                              supervisorsStr: '',
-                              startDate: '',
-                              endDate: '',
-                              technology: ''
-                            });
-                            setModalNewGalpon(true);
-                          }}
-                          className="px-3 py-1.5 rounded-lg bg-[#0f6b38] hover:bg-[#0a4e28] text-white text-xs font-bold flex items-center gap-1"
-                        >
-                          <Plus className="w-3.5 h-3.5" />
-                          <span>+ Agregar Galpón aquí</span>
-                        </button>
+                        {canDo('proyectos', 'create') && (
+                          <button
+                            onClick={() => {
+                              setFormGalpon({
+                                id: '',
+                                sectorId: sec.id,
+                                code: '',
+                                name: '',
+                                description: '',
+                                supervisorsStr: '',
+                                startDate: '',
+                                endDate: '',
+                                technology: ''
+                              });
+                              setModalNewGalpon(true);
+                            }}
+                            className="px-3 py-1.5 rounded-lg bg-[#0f6b38] hover:bg-[#0a4e28] text-white text-xs font-bold flex items-center gap-1"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>+ Agregar Galpón aquí</span>
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -5427,46 +6132,56 @@ export default function App() {
                             </div>
 
                             <div className="flex items-center gap-1">
-                              <button
-                                onClick={() => {
-                                  setFormGalpon({
-                                    id: gal.id,
-                                    sectorId: sec.id,
-                                    code: gal.code,
-                                    name: gal.name,
-                                    description: gal.description || '',
-                                    supervisorsStr: gal.supervisors
-                                      ? gal.supervisors.join(', ')
-                                      : '',
-                                    startDate: gal.startDate || getSystemToday(),
-                                    endDate: gal.endDate || getSystemToday(),
-                                    technology: gal.technology || ''
-                                  });
-                                  setModalEditGalpon(true);
-                                }}
-                                className="p-1.5 rounded-lg text-slate-600 hover:bg-slate-200"
-                                title="Editar Galpón y Plantilla"
-                              >
-                                <Edit2 className="w-3.5 h-3.5" />
-                              </button>
-                              <button
-                                onClick={() => requestDeleteGalpon(sec.id, gal.id)}
-                                className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
-                                title="Eliminar Galpón"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+                              {canDo('proyectos', 'edit') && (
+                                <button
+                                  onClick={() => {
+                                    setFormGalpon({
+                                      id: gal.id,
+                                      sectorId: sec.id,
+                                      code: gal.code,
+                                      name: gal.name,
+                                      description: gal.description || '',
+                                      supervisorsStr: gal.supervisors
+                                        ? gal.supervisors.join(', ')
+                                        : '',
+                                      startDate: gal.startDate || getSystemToday(),
+                                      endDate: gal.endDate || getSystemToday(),
+                                      technology: gal.technology || ''
+                                    });
+                                    setModalEditGalpon(true);
+                                  }}
+                                  className="p-1.5 rounded-lg text-slate-600 hover:bg-slate-200"
+                                  title="Editar Galpón y Plantilla"
+                                >
+                                  <Edit2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                              {canDo('proyectos', 'delete') && (
+                                <button
+                                  onClick={() => requestDeleteGalpon(sec.id, gal.id)}
+                                  className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
+                                  title="Eliminar Galpón"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
                             </div>
                           </div>
 
                           <div className="flex items-center justify-between pt-2 border-t border-slate-200 gap-2">
-                            <button
-                              onClick={() => handleReloadGalponFromCatalog(sec.id, gal)}
-                              className="text-[11px] font-bold text-[#0f6b38] hover:underline flex items-center gap-1"
-                            >
-                              <RefreshCw className="w-3 h-3" />
-                              <span>Sincronizar con Plantilla ({gal.technology || 'Sin proveedor'})</span>
-                            </button>
+                            {canDo('proyectos', 'edit') ? (
+                              <button
+                                onClick={() => handleReloadGalponFromCatalog(sec.id, gal)}
+                                className="text-[11px] font-bold text-[#0f6b38] hover:underline flex items-center gap-1"
+                              >
+                                <RefreshCw className="w-3 h-3" />
+                                <span>Sincronizar con Plantilla ({gal.technology || 'Sin proveedor'})</span>
+                              </button>
+                            ) : (
+                              <span className="text-[11px] text-slate-400">
+                                Plantilla: {gal.technology || 'Sin proveedor'}
+                              </span>
+                            )}
                             <button
                               onClick={() => {
                                 setSelectedSectorId(sec.id);
@@ -5564,75 +6279,108 @@ export default function App() {
                       <th className="py-3 px-3">Ubicación / Sistema</th>
                       <th className="py-3 px-3">Estructura</th>
                       <th className="py-3 px-3">Actividad</th>
+                      <th className="py-3 px-2 text-center">Modalidad</th>
                       <th className="py-3 px-2 text-right">Meta</th>
                       <th className="py-3 px-2 text-right">Peso</th>
                       <th className="py-3 px-3 text-center">Acciones</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200 font-medium">
-                    {masterCatalog.filter(
+                    {activeMasterCatalog.filter(
                       (c) =>
                         selectedCatalogTech === 'Todas' ||
                         c.technology === selectedCatalogTech
                     ).length === 0 ? (
                       <tr>
-                        <td colSpan={9} className="py-8 text-center text-slate-400">
+                        <td colSpan={10} className="py-8 text-center text-slate-400">
                           No hay actividades en el Catálogo Maestro para este filtro.
                         </td>
                       </tr>
                     ) : (
-                      masterCatalog
+                      activeMasterCatalog
                         .filter(
                           (c) =>
                             selectedCatalogTech === 'Todas' ||
                             c.technology === selectedCatalogTech
                         )
-                        .map((item) => (
-                          <tr key={item.id} className="hover:bg-slate-50">
-                            <td className="py-2.5 px-3 font-bold text-[#0f6b38]">
-                              {item.technology}
-                            </td>
-                            <td className="py-2.5 px-3 font-mono font-bold">
-                              {item.code}
-                            </td>
-                            <td className="py-2.5 px-3">{item.areaName}</td>
-                            <td className="py-2.5 px-3">
-                              {item.sistemaName
-                                ? `${item.locationType} • ${item.sistemaName}`
-                                : '-'}
-                            </td>
-                            <td className="py-2.5 px-3 font-bold text-slate-700">
-                              {item.structureName}
-                            </td>
-                            <td className="py-2.5 px-3 font-bold text-slate-900">
-                              {item.name}
-                            </td>
-                            <td className="py-2.5 px-2 text-right font-mono">
-                              {item.targetUnits} {item.unit}
-                            </td>
-                            <td className="py-2.5 px-2 text-right font-mono">
-                              {item.weight}x
-                            </td>
-                            <td className="py-2.5 px-3 text-center">
-                              <div className="flex items-center justify-center gap-1">
-                                <button
-                                  onClick={() => openEditCatalogModal(item)}
-                                  className="p-1.5 rounded-lg text-slate-600 hover:bg-slate-200"
-                                  title="Editar actividad maestra"
+                        .map((item) => {
+                          const isPct = normalizeProgressMode(item.progressMode) === 'percentage';
+                          return (
+                            <tr key={item.id} className="hover:bg-slate-50">
+                              <td className="py-2.5 px-3 font-bold text-[#0f6b38]">
+                                {item.technology}
+                              </td>
+                              <td className="py-2.5 px-3 font-mono font-bold">
+                                {item.code}
+                              </td>
+                              <td className="py-2.5 px-3">{item.areaName}</td>
+                              <td className="py-2.5 px-3">
+                                {item.sistemaName
+                                  ? `${item.locationType} • ${item.sistemaName}`
+                                  : '-'}
+                              </td>
+                              <td className="py-2.5 px-3 font-bold text-slate-700">
+                                <div className="flex items-center justify-between gap-1.5">
+                                  <span>{item.structureName}</span>
+                                  {canDo('catalogo', 'delete') && (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        requestDeleteCatalogStructure(
+                                          item.areaName,
+                                          item.sistemaName,
+                                          item.structureName
+                                        )
+                                      }
+                                      className="px-1.5 py-0.5 rounded text-[10px] font-bold text-rose-600 hover:bg-rose-50 border border-rose-200 transition shrink-0"
+                                      title={`Eliminar estructura "${item.structureName}" y sus actividades maestras`}
+                                    >
+                                      Eliminar estructura
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="py-2.5 px-3 font-bold text-slate-900">
+                                {item.name}
+                              </td>
+                              <td className="py-2.5 px-2 text-center">
+                                <span
+                                  className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                    isPct
+                                      ? 'bg-blue-50 text-blue-800 border-blue-200'
+                                      : 'bg-emerald-50 text-[#0f6b38] border-emerald-200'
+                                  }`}
                                 >
-                                  <Edit2 className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  onClick={() => requestDeleteCatalogItem(item.id)}
-                                  className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
-                                  title="Eliminar actividad maestra"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        ))
+                                  {isPct ? 'Porcentaje (%)' : 'Cantidades'}
+                                </span>
+                              </td>
+                              <td className="py-2.5 px-2 text-right font-mono">
+                                {isPct ? '100 %' : `${item.targetUnits} ${item.unit}`}
+                              </td>
+                              <td className="py-2.5 px-2 text-right font-mono">
+                                {item.weight}x
+                              </td>
+                              <td className="py-2.5 px-3 text-center">
+                                <div className="flex items-center justify-center gap-1">
+                                  <button
+                                    onClick={() => openEditCatalogModal(item)}
+                                    className="p-1.5 rounded-lg text-slate-600 hover:bg-slate-200"
+                                    title="Editar actividad maestra"
+                                  >
+                                    <Edit2 className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={() => requestDeleteCatalogItem(item.id)}
+                                    className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
+                                    title="Eliminar actividad maestra"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
                     )}
                   </tbody>
                 </table>
@@ -5653,35 +6401,13 @@ export default function App() {
                   {currentGalpon ? `(${currentGalpon.code})` : ''}
                 </h2>
                 <p className="text-xs text-slate-500">
-                  6 áreas con clasificación Interno/Externo, sistema, estructura, edición
-                  y eliminación
+                  6 áreas con clasificación Interno/Externo, sistema, estructura, modalidad de
+                  avance (Cantidades o Porcentaje), edición y eliminación
                 </p>
               </div>
               <button
                 disabled={allGalponesList.length === 0}
-                onClick={() => {
-                  setFormActivity({
-                    useCatalog: true,
-                    targetGalponId: currentGalpon?.id || '',
-                    catalogItemId: '',
-                    code: '',
-                    name: '',
-                    areaName: '',
-                    locationType: '',
-                    sistemaName: '',
-                    customSistemaName: '',
-                    structureName: '',
-                    customStructureName: '',
-                    targetUnits: '',
-                    unit: '',
-                    weight: '',
-                    plannedHH: '',
-                    startDate: '',
-                    dueDate: '',
-                    sharedWithGalponId: ''
-                  });
-                  setModalNewActivity(true);
-                }}
+                onClick={openNewActivityModal}
                 className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white text-xs font-bold flex items-center gap-1.5"
               >
                 <Plus className="w-4 h-4" />
@@ -5749,6 +6475,7 @@ export default function App() {
                       <th className="py-3 px-3">Ubicación / Sistema</th>
                       <th className="py-3 px-3">Estructura</th>
                       <th className="py-3 px-3">Actividad</th>
+                      <th className="py-3 px-2 text-center">Modalidad</th>
                       <th className="py-3 px-2 text-right">Meta</th>
                       <th className="py-3 px-2 text-right">Avance %</th>
                       <th className="py-3 px-3 text-center">Acciones</th>
@@ -5775,31 +6502,44 @@ export default function App() {
                           return false;
                         return true;
                       })
-                      .map((act) => (
-                        <tr key={act.id} className="hover:bg-slate-50">
-                          <td className="py-2.5 px-3 font-mono font-bold">
-                            {act.code}
-                          </td>
-                          <td className="py-2.5 px-3 font-bold text-[#0f6b38]">
-                            {act.areaName}
-                          </td>
-                          <td className="py-2.5 px-3">
-                            {act.sistemaName
-                              ? `${act.locationType} • ${act.sistemaName}`
-                              : '-'}
-                          </td>
-                          <td className="py-2.5 px-3 font-bold text-slate-700">
-                            {act.structureName}
-                          </td>
-                          <td className="py-2.5 px-3 font-bold text-slate-900">
-                            {act.name}
-                          </td>
-                          <td className="py-2.5 px-2 text-right font-mono">
-                            {act.targetUnits} {act.unit}
-                          </td>
-                          <td className="py-2.5 px-2 text-right font-mono font-black text-[#0f6b38]">
-                            {act.progressPercent}%
-                          </td>
+                      .map((act) => {
+                        const isPct = act.progressMode === 'percentage';
+                        return (
+                          <tr key={act.id} className="hover:bg-slate-50">
+                            <td className="py-2.5 px-3 font-mono font-bold">
+                              {act.code}
+                            </td>
+                            <td className="py-2.5 px-3 font-bold text-[#0f6b38]">
+                              {act.areaName}
+                            </td>
+                            <td className="py-2.5 px-3">
+                              {act.sistemaName
+                                ? `${act.locationType} • ${act.sistemaName}`
+                                : '-'}
+                            </td>
+                            <td className="py-2.5 px-3 font-bold text-slate-700">
+                              {act.structureName}
+                            </td>
+                            <td className="py-2.5 px-3 font-bold text-slate-900">
+                              {act.name}
+                            </td>
+                            <td className="py-2.5 px-2 text-center">
+                              <span
+                                className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                  isPct
+                                    ? 'bg-blue-50 text-blue-800 border-blue-200'
+                                    : 'bg-emerald-50 text-[#0f6b38] border-emerald-200'
+                                }`}
+                              >
+                                {isPct ? 'Porcentaje (%)' : 'Cantidades'}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-2 text-right font-mono">
+                              {isPct ? '100 %' : `${act.targetUnits} ${act.unit}`}
+                            </td>
+                            <td className="py-2.5 px-2 text-right font-mono font-black text-[#0f6b38]">
+                              {act.progressPercent}%
+                            </td>
                           <td className="py-2.5 px-3 text-center">
                             <div className="flex items-center justify-center gap-1">
                               <button
@@ -5819,7 +6559,8 @@ export default function App() {
                             </div>
                           </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                   </tbody>
                 </table>
               </div>
@@ -6319,27 +7060,504 @@ export default function App() {
         )}
 
         {/* ================================================================== */}
-        {/* VISTA 10: INFORMES GLOBALES                                        */}
+        {/* VISTA 10: INFORMES GLOBALES (INTERACTIVO MULTIPROYECTO)            */}
         {/* ================================================================== */}
         {currentTab === 'informes' && (
           <div className="space-y-4">
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            {/* Cabecera Principal y Botones de Exportación */}
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-4 shadow-xs">
               <div>
-                <h2 className="text-base font-extrabold text-slate-900">
-                  Informes Globales Multiproyecto
-                </h2>
-                <p className="text-xs text-slate-500">
-                  Exporta la sábana completa de todos los sectores, galpones, sistemas,
-                  estructuras y actividades
+                <div className="flex items-center gap-2">
+                  <h2 className="text-base font-black text-slate-900">
+                    Informes Globales Multiproyecto
+                  </h2>
+                  <span className="px-2.5 py-0.5 rounded-full bg-emerald-100 text-[#0f6b38] text-[11px] font-black uppercase">
+                    Tabla Interactiva
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Visualización consolidada y exportación con paridad matemática total con Dashboard y Carta Gantt
                 </p>
               </div>
-              <button
-                onClick={handleExportGlobalCSV}
-                className="px-4 py-2.5 bg-[#0f6b38] hover:bg-[#0a4e28] text-white text-xs font-bold rounded-xl flex items-center gap-2"
-              >
-                <Download className="w-4 h-4" />
-                <span>Exportar Sábana Global (.CSV / Excel)</span>
-              </button>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {canDo('informes', 'export') && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleExportGlobalCSV(true)}
+                      className="px-3 py-2 bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl flex items-center gap-1.5 shadow-xs transition"
+                      title="Exportar en formato CSV los registros filtrados"
+                    >
+                      <Download className="w-4 h-4 text-[#0f6b38]" />
+                      <span>CSV Filtrados ({filteredGlobalReportRows.length})</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleExportGlobalXLSX(true)}
+                      className="px-3 py-2 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 text-[#0f6b38] text-xs font-bold rounded-xl flex items-center gap-1.5 shadow-xs transition"
+                      title="Exportar en formato Excel (.xlsx) los registros filtrados"
+                    >
+                      <FileSpreadsheet className="w-4 h-4 text-[#0f6b38]" />
+                      <span>Excel Filtrados (.XLSX)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleExportGlobalCSV(false)}
+                      className="px-3.5 py-2 bg-[#0f6b38] hover:bg-[#0a4e28] text-white text-xs font-bold rounded-xl flex items-center gap-1.5 shadow-xs transition"
+                      title="Exportar todos los registros en CSV"
+                    >
+                      <Download className="w-4 h-4" />
+                      <span>Sábana Completa (.CSV)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleExportGlobalXLSX(false)}
+                      className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 shadow-xs transition"
+                      title="Exportar todos los registros en libro Excel (.xlsx)"
+                    >
+                      <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                      <span>Sábana Excel (.XLSX)</span>
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Tarjetas de Métricas Resumen (KPIs Dinámicos) */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
+              <div className="bg-white p-3.5 rounded-xl border border-slate-200">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">
+                  Actividades
+                </span>
+                <span className="text-xl font-black text-slate-900 font-mono">
+                  {informesMetrics.total}
+                </span>
+                <span className="text-[10px] text-slate-400 block mt-0.5">
+                  en vista actual
+                </span>
+              </div>
+
+              <div className="bg-white p-3.5 rounded-xl border border-emerald-200 bg-emerald-50/30">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-[#0f6b38] block">
+                  Completadas
+                </span>
+                <span className="text-xl font-black text-[#0f6b38] font-mono">
+                  {informesMetrics.completed}
+                </span>
+                <span className="text-[10px] font-semibold text-emerald-700 block mt-0.5">
+                  {informesMetrics.total > 0
+                    ? `${((informesMetrics.completed / informesMetrics.total) * 100).toFixed(0)}% del total`
+                    : '0%'}
+                </span>
+              </div>
+
+              <div className="bg-white p-3.5 rounded-xl border border-blue-200 bg-blue-50/30">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-700 block">
+                  En Proceso
+                </span>
+                <span className="text-xl font-black text-blue-700 font-mono">
+                  {informesMetrics.inProgress}
+                </span>
+                <span className="text-[10px] font-semibold text-blue-600 block mt-0.5">
+                  en ejecución
+                </span>
+              </div>
+
+              <div className="bg-white p-3.5 rounded-xl border border-amber-200 bg-amber-50/30">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-amber-700 block">
+                  No Iniciadas
+                </span>
+                <span className="text-xl font-black text-amber-700 font-mono">
+                  {informesMetrics.notStarted}
+                </span>
+                <span className="text-[10px] font-semibold text-amber-600 block mt-0.5">
+                  pendientes
+                </span>
+              </div>
+
+              <div className="bg-white p-3.5 rounded-xl border border-rose-200 bg-rose-50/30">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-rose-700 block">
+                  Atrasadas
+                </span>
+                <span className="text-xl font-black text-rose-700 font-mono">
+                  {informesMetrics.delayed}
+                </span>
+                <span className="text-[10px] font-semibold text-rose-600 block mt-0.5">
+                  requieren atención
+                </span>
+              </div>
+
+              <div className="bg-white p-3.5 rounded-xl border border-slate-200">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">
+                  Avance Ponderado
+                </span>
+                <span className="text-xl font-black text-slate-900 font-mono">
+                  {informesMetrics.weightedProgress}%
+                </span>
+                <span className="text-[10px] text-slate-500 block mt-0.5">
+                  según ponderación
+                </span>
+              </div>
+
+              <div className="bg-white p-3.5 rounded-xl border border-slate-200 col-span-2 sm:col-span-2 lg:col-span-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">
+                  Horas Hombre
+                </span>
+                <div className="flex items-baseline gap-1">
+                  <span className="text-lg font-black text-slate-900 font-mono">
+                    {informesMetrics.accumulatedHH.toLocaleString()}
+                  </span>
+                  <span className="text-xs text-slate-400 font-bold">
+                    / {informesMetrics.plannedHH.toLocaleString()}
+                  </span>
+                </div>
+                <span className="text-[10px] text-slate-500 block mt-0.5">
+                  HH Ejec / Plan
+                </span>
+              </div>
+            </div>
+
+            {/* Barra de Filtros Interactivos */}
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-2">
+                <div className="flex items-center gap-2">
+                  <Filter className="w-4 h-4 text-slate-500" />
+                  <span className="text-xs font-bold text-slate-700">Filtros de Búsqueda y Segmentación</span>
+                </div>
+                {(filterInformesSectorId !== 'ALL' ||
+                  filterInformesGalponId !== 'ALL' ||
+                  filterInformesAreaName !== 'ALL' ||
+                  filterInformesSistemaName !== 'ALL' ||
+                  filterInformesMode !== 'ALL' ||
+                  filterInformesStatus !== 'ALL' ||
+                  searchInformesText.trim() !== '') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFilterInformesSectorId('ALL');
+                      setFilterInformesGalponId('ALL');
+                      setFilterInformesAreaName('ALL');
+                      setFilterInformesSistemaName('ALL');
+                      setFilterInformesMode('ALL');
+                      setFilterInformesStatus('ALL');
+                      setSearchInformesText('');
+                      setInformesPage(1);
+                    }}
+                    className="text-xs font-bold text-[#0f6b38] hover:underline flex items-center gap-1"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>Restablecer Filtros</span>
+                  </button>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 text-xs">
+                {/* Búsqueda de Texto */}
+                <div className="lg:col-span-2 relative">
+                  <Search className="w-3.5 h-3.5 absolute left-3 top-3 text-slate-400" />
+                  <input
+                    type="text"
+                    value={searchInformesText}
+                    onChange={(e) => {
+                      setSearchInformesText(e.target.value);
+                      setInformesPage(1);
+                    }}
+                    placeholder="Buscar código, actividad, estructura..."
+                    className="w-full pl-8 pr-3 py-2 bg-slate-50 border border-slate-300 rounded-xl focus:bg-white focus:outline-hidden focus:ring-1 focus:ring-[#0f6b38] text-xs font-medium"
+                  />
+                </div>
+
+                {/* Filtro: Sector */}
+                <div>
+                  <select
+                    value={filterInformesSectorId}
+                    onChange={(e) => {
+                      setFilterInformesSectorId(e.target.value);
+                      setFilterInformesGalponId('ALL');
+                      setInformesPage(1);
+                    }}
+                    className="w-full px-2.5 py-2 bg-slate-50 border border-slate-300 rounded-xl font-medium focus:bg-white text-xs"
+                  >
+                    <option value="ALL">Sector: Todos</option>
+                    {scopedSectors.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Filtro: Galpón */}
+                <div>
+                  <select
+                    value={filterInformesGalponId}
+                    onChange={(e) => {
+                      setFilterInformesGalponId(e.target.value);
+                      setInformesPage(1);
+                    }}
+                    className="w-full px-2.5 py-2 bg-slate-50 border border-slate-300 rounded-xl font-medium focus:bg-white text-xs"
+                  >
+                    <option value="ALL">Galpón: Todos</option>
+                    {informesGalponesOptions.map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.code} ({g.sectorName})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Filtro: Área */}
+                <div>
+                  <select
+                    value={filterInformesAreaName}
+                    onChange={(e) => {
+                      setFilterInformesAreaName(e.target.value);
+                      setInformesPage(1);
+                    }}
+                    className="w-full px-2.5 py-2 bg-slate-50 border border-slate-300 rounded-xl font-medium focus:bg-white text-xs"
+                  >
+                    <option value="ALL">Área: Todas</option>
+                    {uniqueInformesAreas.map((area) => (
+                      <option key={area} value={area}>
+                        {area}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Filtro: Sistema */}
+                <div>
+                  <select
+                    value={filterInformesSistemaName}
+                    onChange={(e) => {
+                      setFilterInformesSistemaName(e.target.value);
+                      setInformesPage(1);
+                    }}
+                    className="w-full px-2.5 py-2 bg-slate-50 border border-slate-300 rounded-xl font-medium focus:bg-white text-xs"
+                  >
+                    <option value="ALL">Sistema: Todos</option>
+                    {uniqueInformesSistemas.map((sis) => (
+                      <option key={sis} value={sis}>
+                        {sis}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Filtro: Modalidad */}
+                <div>
+                  <select
+                    value={filterInformesMode}
+                    onChange={(e) => {
+                      setFilterInformesMode(e.target.value);
+                      setInformesPage(1);
+                    }}
+                    className="w-full px-2.5 py-2 bg-slate-50 border border-slate-300 rounded-xl font-medium focus:bg-white text-xs"
+                  >
+                    <option value="ALL">Modalidad: Todas</option>
+                    <option value="quantity">Cantidades</option>
+                    <option value="percentage">Porcentaje</option>
+                  </select>
+                </div>
+
+                {/* Filtro: Estado */}
+                <div>
+                  <select
+                    value={filterInformesStatus}
+                    onChange={(e) => {
+                      setFilterInformesStatus(e.target.value);
+                      setInformesPage(1);
+                    }}
+                    className="w-full px-2.5 py-2 bg-slate-50 border border-slate-300 rounded-xl font-medium focus:bg-white text-xs"
+                  >
+                    <option value="ALL">Estado: Todos</option>
+                    <option value="Completado">Completada</option>
+                    <option value="En proceso">En proceso</option>
+                    <option value="No iniciado">Pendiente / No iniciada</option>
+                    <option value="Atrasado">Atrasada / Alerta</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            {/* Tabla Resumen Interactiva */}
+            <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead className="bg-slate-50 text-slate-600 uppercase text-[11px] font-extrabold border-b border-slate-200">
+                    <tr>
+                      <th className="py-3 px-3">Proyecto</th>
+                      <th className="py-3 px-3">Sector</th>
+                      <th className="py-3 px-3">Galpón</th>
+                      <th className="py-3 px-3">Área</th>
+                      <th className="py-3 px-3">Sistema</th>
+                      <th className="py-3 px-3">Estructura</th>
+                      <th className="py-3 px-3">Actividad</th>
+                      <th className="py-3 px-3">Modalidad</th>
+                      <th className="py-3 px-3 text-right">Meta</th>
+                      <th className="py-3 px-3 text-right">Ejecutado</th>
+                      <th className="py-3 px-3 text-center min-w-[120px]">Avance %</th>
+                      <th className="py-3 px-3 text-center">Estado</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {paginatedInformesRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={12} className="py-12 text-center text-slate-400">
+                          <Table className="w-8 h-8 mx-auto mb-2 opacity-40" />
+                          <p className="font-bold text-sm">No se encontraron actividades</p>
+                          <p className="text-xs mt-0.5">
+                            Modifica los criterios de filtro o la búsqueda para ver resultados
+                          </p>
+                        </td>
+                      </tr>
+                    ) : (
+                      paginatedInformesRows.map((row) => (
+                        <tr key={row.id} className="hover:bg-slate-50/80 transition-colors">
+                          <td className="py-2.5 px-3 text-slate-500 font-medium whitespace-nowrap">
+                            {row.projectName}
+                          </td>
+                          <td className="py-2.5 px-3 font-semibold text-slate-800 whitespace-nowrap">
+                            {row.sectorName}
+                          </td>
+                          <td className="py-2.5 px-3 whitespace-nowrap">
+                            <span className="font-mono font-bold text-slate-900 bg-slate-100 px-2 py-0.5 rounded-md">
+                              {row.galponCode}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-slate-700 font-medium whitespace-nowrap">
+                            {row.areaName}
+                          </td>
+                          <td className="py-2.5 px-3 text-slate-500 whitespace-nowrap">
+                            {row.sistemaName}
+                          </td>
+                          <td className="py-2.5 px-3 text-slate-700 font-semibold whitespace-nowrap">
+                            {row.structureName || '-'}
+                          </td>
+                          <td className="py-2.5 px-3 max-w-[260px]">
+                            <div className="flex flex-col">
+                              <span className="font-mono font-bold text-[#0f6b38] text-[11px]">
+                                {row.activityCode}
+                              </span>
+                              <span className="font-semibold text-slate-900 truncate" title={row.activityName}>
+                                {row.activityName}
+                              </span>
+                            </div>
+                          </td>
+                          <td className="py-2.5 px-3 whitespace-nowrap">
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                                row.progressMode === 'percentage'
+                                  ? 'bg-indigo-100 text-indigo-700'
+                                  : 'bg-emerald-100 text-[#0f6b38]'
+                              }`}
+                            >
+                              {row.progressModeLabel}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-700 whitespace-nowrap">
+                            {row.targetUnits.toLocaleString()} {row.unit}
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-900 whitespace-nowrap">
+                            {row.accumulatedQty.toLocaleString()} {row.unit}
+                          </td>
+                          <td className="py-2.5 px-3 whitespace-nowrap">
+                            <div className="flex items-center gap-2">
+                              <div className="flex-1 bg-slate-100 h-2 rounded-full overflow-hidden min-w-[60px]">
+                                <div
+                                  className={`h-full transition-all ${
+                                    row.progressPercent >= 100
+                                      ? 'bg-emerald-500'
+                                      : row.progressPercent > 0
+                                        ? 'bg-blue-500'
+                                        : 'bg-slate-300'
+                                  }`}
+                                  style={{ width: `${Math.min(row.progressPercent, 100)}%` }}
+                                />
+                              </div>
+                              <span className="font-mono font-bold text-xs text-slate-800 w-11 text-right">
+                                {row.progressPercent}%
+                              </span>
+                            </div>
+                          </td>
+                          <td className="py-2.5 px-3 text-center whitespace-nowrap">
+                            <span
+                              className={`px-2.5 py-1 rounded-full text-[10px] font-black uppercase ${
+                                row.computedStatus === 'Completado'
+                                  ? 'bg-emerald-100 text-[#0f6b38]'
+                                  : row.computedStatus === 'En proceso'
+                                    ? 'bg-blue-100 text-blue-700'
+                                    : row.computedStatus === 'Atrasado'
+                                      ? 'bg-rose-100 text-rose-700'
+                                      : 'bg-amber-100 text-amber-800'
+                              }`}
+                            >
+                              {row.computedStatus}
+                            </span>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Barra de Paginación y Resumen de Filas */}
+              {filteredGlobalReportRows.length > 0 && (
+                <div className="p-3 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-600">
+                  <div className="flex items-center gap-2">
+                    <span>Filas por página:</span>
+                    <select
+                      value={informesPageSize}
+                      onChange={(e) => {
+                        setInformesPageSize(Number(e.target.value));
+                        setInformesPage(1);
+                      }}
+                      className="px-2 py-1 bg-white border border-slate-300 rounded-lg font-bold text-xs"
+                    >
+                      <option value={25}>25</option>
+                      <option value={50}>50</option>
+                      <option value={100}>100</option>
+                      <option value={0}>Todas ({filteredGlobalReportRows.length})</option>
+                    </select>
+                    <span className="text-slate-400">|</span>
+                    <span>
+                      Mostrando {informesPageSize > 0 ? (informesPage - 1) * informesPageSize + 1 : 1} a{' '}
+                      {informesPageSize > 0
+                        ? Math.min(informesPage * informesPageSize, filteredGlobalReportRows.length)
+                        : filteredGlobalReportRows.length}{' '}
+                      de {filteredGlobalReportRows.length} actividades
+                    </span>
+                  </div>
+
+                  {informesPageSize > 0 && totalInformesPages > 1 && (
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={informesPage <= 1}
+                        onClick={() => setInformesPage((p) => Math.max(1, p - 1))}
+                        className="px-2.5 py-1 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1 font-bold text-xs"
+                      >
+                        <ChevronLeft className="w-3.5 h-3.5" />
+                        <span>Anterior</span>
+                      </button>
+                      <span className="px-2 font-mono font-bold">
+                        {informesPage} / {totalInformesPages}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={informesPage >= totalInformesPages}
+                        onClick={() => setInformesPage((p) => Math.min(totalInformesPages, p + 1))}
+                        className="px-2.5 py-1 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1 font-bold text-xs"
+                      >
+                        <span>Siguiente</span>
+                        <ChevronRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -6554,47 +7772,91 @@ export default function App() {
       </main>
 
       {/* ==================================================================== */}
-      {/* 5. BARRA DE NAVEGACIÓN INFERIOR (4 VISTAS RÁPIDAS)                   */}
+      {/* 5. BARRA DE NAVEGACIÓN INFERIOR FIJA — PC, TABLET Y CELULAR          */}
+      {/*    Única navegación para Dashboard, Gantt, Avance y Asistencia       */}
       {/* ==================================================================== */}
-      <nav className="fixed bottom-0 left-0 right-0 z-40 bg-white border-t border-slate-200 shadow-lg">
-        <div className="max-w-md mx-auto grid grid-cols-4 py-1.5 px-2">
+      <nav
+        data-testid="bottom-navigation-bar"
+        className="fixed bottom-0 left-0 right-0 z-40 bg-white border-t border-slate-200 shadow-[0_-2px_10px_rgba(15,23,42,0.05)]"
+      >
+        <div className="max-w-5xl mx-auto grid grid-cols-4 px-2 sm:px-6 py-1.5 gap-1">
           <button
-            onClick={() => setCurrentTab('dashboard')}
-            className={`flex flex-col items-center py-1 text-[11px] font-bold transition ${
-              currentTab === 'dashboard' ? 'text-[#0f6b38]' : 'text-slate-400'
+            type="button"
+            data-testid="bottom-nav-dashboard"
+            onClick={() => {
+              setSidebarOpen(false);
+              setCurrentTab('dashboard');
+            }}
+            className={`relative flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-2 py-2 px-2 rounded-xl text-[11px] sm:text-xs font-bold transition cursor-pointer ${
+              currentTab === 'dashboard'
+                ? 'bg-emerald-50/90 text-[#0f6b38]'
+                : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
             }`}
           >
-            <BarChart3 className="w-5 h-5 mb-0.5" />
+            {currentTab === 'dashboard' && (
+              <span className="absolute top-0 left-4 right-4 h-0.5 rounded-full bg-[#0f6b38]" />
+            )}
+            <BarChart3 className="w-5 h-5 shrink-0" />
             <span>Dashboard</span>
           </button>
 
           <button
-            onClick={() => setCurrentTab('gantt')}
-            className={`flex flex-col items-center py-1 text-[11px] font-bold transition ${
-              currentTab === 'gantt' ? 'text-[#0f6b38]' : 'text-slate-400'
+            type="button"
+            data-testid="bottom-nav-gantt"
+            onClick={() => {
+              setSidebarOpen(false);
+              setCurrentTab('gantt');
+            }}
+            className={`relative flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-2 py-2 px-2 rounded-xl text-[11px] sm:text-xs font-bold transition cursor-pointer ${
+              currentTab === 'gantt'
+                ? 'bg-emerald-50/90 text-[#0f6b38]'
+                : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
             }`}
           >
-            <Layers className="w-5 h-5 mb-0.5" />
+            {currentTab === 'gantt' && (
+              <span className="absolute top-0 left-4 right-4 h-0.5 rounded-full bg-[#0f6b38]" />
+            )}
+            <Layers className="w-5 h-5 shrink-0" />
             <span>Gantt</span>
           </button>
 
           <button
-            onClick={() => setCurrentTab('avance_diario')}
-            className={`flex flex-col items-center py-1 text-[11px] font-bold transition ${
-              currentTab === 'avance_diario' ? 'text-[#0f6b38]' : 'text-slate-400'
+            type="button"
+            data-testid="bottom-nav-avance"
+            onClick={() => {
+              setSidebarOpen(false);
+              setCurrentTab('avance_diario');
+            }}
+            className={`relative flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-2 py-2 px-2 rounded-xl text-[11px] sm:text-xs font-bold transition cursor-pointer ${
+              currentTab === 'avance_diario'
+                ? 'bg-emerald-50/90 text-[#0f6b38]'
+                : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
             }`}
           >
-            <TrendingUp className="w-5 h-5 mb-0.5" />
+            {currentTab === 'avance_diario' && (
+              <span className="absolute top-0 left-4 right-4 h-0.5 rounded-full bg-[#0f6b38]" />
+            )}
+            <TrendingUp className="w-5 h-5 shrink-0" />
             <span>Avance</span>
           </button>
 
           <button
-            onClick={() => setCurrentTab('asistencia')}
-            className={`flex flex-col items-center py-1 text-[11px] font-bold transition ${
-              currentTab === 'asistencia' ? 'text-[#0f6b38]' : 'text-slate-400'
+            type="button"
+            data-testid="bottom-nav-asistencia"
+            onClick={() => {
+              setSidebarOpen(false);
+              setCurrentTab('asistencia');
+            }}
+            className={`relative flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-2 py-2 px-2 rounded-xl text-[11px] sm:text-xs font-bold transition cursor-pointer ${
+              currentTab === 'asistencia'
+                ? 'bg-emerald-50/90 text-[#0f6b38]'
+                : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
             }`}
           >
-            <UserCheck className="w-5 h-5 mb-0.5" />
+            {currentTab === 'asistencia' && (
+              <span className="absolute top-0 left-4 right-4 h-0.5 rounded-full bg-[#0f6b38]" />
+            )}
+            <Users className="w-5 h-5 shrink-0" />
             <span>Asistencia</span>
           </button>
         </div>
@@ -6763,11 +8025,13 @@ export default function App() {
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                   >
                     <option value="">-- Seleccionar Área --</option>
-                    {ALL_AREAS.map((a) => (
-                      <option key={a} value={a}>
-                        {a}
-                      </option>
-                    ))}
+                    {Array.from(new Set([...ALL_AREAS, ...availableAssignCatalogAreas])).map(
+                      (a) => (
+                        <option key={a} value={a}>
+                          {a}
+                        </option>
+                      )
+                    )}
                   </select>
                 </div>
                 {AREAS_WITH_SISTEMAS.includes(formCatalogItem.areaName) && (
@@ -6802,7 +8066,10 @@ export default function App() {
                     onChange={(e) =>
                       setFormCatalogItem({
                         ...formCatalogItem,
-                        sistemaName: e.target.value
+                        sistemaName: e.target.value,
+                        customSistemaName: '',
+                        structureName: '',
+                        customStructureName: ''
                       })
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold mb-1.5"
@@ -6810,7 +8077,7 @@ export default function App() {
                     <option value="">-- Seleccionar Sistema --</option>
                     {Array.from(
                       new Set(
-                        masterCatalog
+                        activeMasterCatalog
                           .filter((c) => c.areaName === formCatalogItem.areaName)
                           .map((c) => c.sistemaName)
                           .filter(Boolean)
@@ -6855,7 +8122,7 @@ export default function App() {
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold mb-1.5"
                 >
                   <option value="">-- Seleccionar Estructura --</option>
-                  {allKnownStructures.map((stName) => (
+                  {availableCatalogEditorStructures.map((stName) => (
                     <option key={stName} value={stName}>
                       {stName}
                     </option>
@@ -6893,6 +8160,33 @@ export default function App() {
                 />
               </div>
 
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                <label className="block font-bold text-slate-800 mb-1">
+                  Modalidad de Registro del Avance: *
+                </label>
+                <select
+                  value={formCatalogItem.progressMode}
+                  onChange={(e) => {
+                    const nextMode = e.target.value as ProgressModality;
+                    setFormCatalogItem({
+                      ...formCatalogItem,
+                      progressMode: nextMode,
+                      targetUnits:
+                        nextMode === 'percentage' ? '100' : formCatalogItem.targetUnits,
+                      unit: nextMode === 'percentage' ? '%' : formCatalogItem.unit
+                    });
+                  }}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white font-bold text-[#0f6b38]"
+                >
+                  <option value="quantity">
+                    Avance por Cantidades (Predeterminado: Meta numérica + Unidad)
+                  </option>
+                  <option value="percentage">
+                    Avance por Porcentaje (0% a 100% — Registra % total alcanzado, no suma)
+                  </option>
+                </select>
+              </div>
+
               <div className="grid grid-cols-4 gap-2">
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">Meta: *</label>
@@ -6900,25 +8194,35 @@ export default function App() {
                     type="number"
                     step="any"
                     required
-                    value={formCatalogItem.targetUnits}
+                    disabled={formCatalogItem.progressMode === 'percentage'}
+                    value={
+                      formCatalogItem.progressMode === 'percentage'
+                        ? '100'
+                        : formCatalogItem.targetUnits
+                    }
                     onChange={(e) =>
                       setFormCatalogItem({
                         ...formCatalogItem,
                         targetUnits: e.target.value
                       })
                     }
-                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono"
+                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono disabled:opacity-60"
                   />
                 </div>
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">Unidad:</label>
                   <input
                     type="text"
-                    value={formCatalogItem.unit}
+                    disabled={formCatalogItem.progressMode === 'percentage'}
+                    value={
+                      formCatalogItem.progressMode === 'percentage'
+                        ? '%'
+                        : formCatalogItem.unit
+                    }
                     onChange={(e) =>
                       setFormCatalogItem({ ...formCatalogItem, unit: e.target.value })
                     }
-                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50"
+                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 disabled:opacity-60"
                   />
                 </div>
                 <div>
@@ -7472,7 +8776,7 @@ export default function App() {
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                 >
                   <option value="">-- Seleccionar Sector --</option>
-                  {sectors.map((s) => (
+                  {scopedSectors.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name}
                     </option>
@@ -7710,18 +9014,19 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: AGREGAR ACTIVIDAD AL GALPÓN (CUALQUIER SECTOR Y GALPÓN) */}
+      {/* MODAL: AGREGAR ACTIVIDAD AL GALPÓN (SELECCIÓN PROGRESIVA DESDE CATÁLOGO MAESTRO) */}
       {modalNewActivity && (
         <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl my-8">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-xl border border-slate-200 shadow-2xl my-8">
             <h3 className="text-base font-black text-slate-900 mb-1">
               Agregar Actividad a Galpón
             </h3>
             <p className="text-xs text-slate-500">
-              Selecciona cualquier actividad del Catálogo Maestro y asígnala al galpón y
-              sector que desees
+              Selecciona progresivamente Área, Sistema, Estructura y Actividad(es) activas
+              del Catálogo Maestro para asignarlas al galpón destino
             </p>
-            <form onSubmit={handleSaveNewActivity} className="space-y-3 text-xs mt-3">
+            <form onSubmit={handleSaveNewActivity} className="space-y-3.5 text-xs mt-3">
+              {/* Selección de Galpón Destino y Galpón Compartido Opcional */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">
@@ -7729,6 +9034,8 @@ export default function App() {
                   </label>
                   <select
                     required
+                    data-testid="assign-target-galpon"
+                    aria-label="Galpón Destino"
                     value={formActivity.targetGalponId}
                     onChange={(e) =>
                       setFormActivity({
@@ -7752,6 +9059,8 @@ export default function App() {
                     Agregar también a otro Galpón (Opcional):
                   </label>
                   <select
+                    data-testid="assign-secondary-galpon"
+                    aria-label="Agregar también a otro Galpón"
                     value={formActivity.sharedWithGalponId}
                     onChange={(e) =>
                       setFormActivity({
@@ -7773,204 +9082,417 @@ export default function App() {
                 </div>
               </div>
 
-              {masterCatalog.length > 0 && (
-                <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200">
-                  <label className="block font-bold text-[#0f6b38] mb-1">
-                    Cargar desde Catálogo Maestro (Todas las Actividades Maestras):
-                  </label>
-                  <select
-                    value={formActivity.catalogItemId}
-                    onChange={(e) => {
-                      const catId = e.target.value;
-                      const found = masterCatalog.find((c) => c.id === catId);
-                      if (found) {
-                        setFormActivity({
-                          ...formActivity,
-                          catalogItemId: catId,
-                          code: found.code,
-                          name: found.name,
-                          areaName: found.areaName,
-                          locationType: found.locationType || 'Interno',
-                          sistemaName: found.sistemaName || '',
-                          structureName: found.structureName || '',
-                          targetUnits: String(found.targetUnits ?? ''),
-                          unit: found.unit || '',
-                          weight: String(found.weight ?? ''),
-                          plannedHH: String(found.plannedHH ?? '')
-                        });
-                      } else {
-                        setFormActivity({ ...formActivity, catalogItemId: '' });
-                      }
-                    }}
-                    className="w-full px-3 py-2 rounded-xl border border-emerald-300 bg-white font-bold"
-                  >
-                    <option value="">
-                      -- Seleccionar del catálogo o llenar manualmente --
-                    </option>
-                    {masterCatalog.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        [{c.code}] {c.name} ({c.technology ? `${c.technology} • ` : ''}
-                        {c.areaName} • {c.structureName})
-                      </option>
-                    ))}
-                  </select>
+              {/* FLUJO PROGRESIVO DE 4 PASOS DESDE EL CATÁLOGO MAESTRO ACTIVO */}
+              <div className="p-3.5 rounded-xl bg-emerald-50/60 border border-emerald-200 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="font-extrabold text-[#0f6b38] uppercase tracking-wide text-[11px]">
+                    Selección Progresiva desde Catálogo Maestro
+                  </span>
+                  <span className="text-[11px] font-semibold text-slate-500">
+                    {activeMasterCatalog.length} actividad(es) activa(s) en catálogo
+                  </span>
                 </div>
-              )}
 
+                {activeMasterCatalog.length === 0 ? (
+                  <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 font-semibold">
+                    No existen actividades activas en el Catálogo Maestro. Registra primero
+                    las actividades maestras en el módulo «Catálogo Maestro».
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                      {/* PASO 1: ÁREA */}
+                      <div>
+                        <label
+                          htmlFor="assign-step-area"
+                          className="block font-bold text-slate-800 mb-1"
+                        >
+                          1. Área: *
+                        </label>
+                        <select
+                          id="assign-step-area"
+                          data-testid="assign-step-area"
+                          aria-label="Paso 1. Seleccionar Área"
+                          required
+                          value={formActivity.areaName}
+                          onChange={(e) =>
+                            setFormActivity((prev) =>
+                              applyCatalogStepAreaChange(
+                                prev,
+                                e.target.value,
+                                activeMasterCatalog
+                              )
+                            )
+                          }
+                          className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-white font-bold text-slate-900"
+                        >
+                          <option value="">-- Seleccionar Área --</option>
+                          {availableAssignCatalogAreas.map((areaName) => (
+                            <option key={areaName} value={areaName}>
+                              {areaName}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* PASO 2: SISTEMA */}
+                      <div>
+                        <label
+                          htmlFor="assign-step-sistema"
+                          className="block font-bold text-slate-800 mb-1"
+                        >
+                          2. Sistema: *
+                        </label>
+                        <select
+                          id="assign-step-sistema"
+                          data-testid="assign-step-sistema"
+                          aria-label="Paso 2. Seleccionar Sistema"
+                          required
+                          disabled={!formActivity.areaName}
+                          value={formActivity.sistemaName}
+                          onChange={(e) =>
+                            setFormActivity((prev) =>
+                              applyCatalogStepSistemaChange(
+                                prev,
+                                e.target.value,
+                                activeMasterCatalog
+                              )
+                            )
+                          }
+                          className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-white font-bold text-slate-900 disabled:bg-slate-100 disabled:text-slate-400"
+                        >
+                          <option value="">
+                            {!formActivity.areaName
+                              ? '-- Primero elija Área --'
+                              : '-- Seleccionar Sistema --'}
+                          </option>
+                          {availableAssignCatalogSystems.map((sys) => (
+                            <option key={sys.value} value={sys.value}>
+                              {sys.value === NO_SISTEMA_VALUE
+                                ? sys.label
+                                : `${sys.label} (${sys.locationType})`}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* PASO 3: ESTRUCTURA */}
+                      <div>
+                        <label
+                          htmlFor="assign-step-estructura"
+                          className="block font-bold text-slate-800 mb-1"
+                        >
+                          3. Estructura: *
+                        </label>
+                        <select
+                          id="assign-step-estructura"
+                          data-testid="assign-step-estructura"
+                          aria-label="Paso 3. Seleccionar Estructura"
+                          required
+                          disabled={!formActivity.areaName || !formActivity.sistemaName}
+                          value={formActivity.structureName}
+                          onChange={(e) =>
+                            setFormActivity((prev) =>
+                              applyCatalogStepEstructuraChange(prev, e.target.value)
+                            )
+                          }
+                          className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-white font-bold text-slate-900 disabled:bg-slate-100 disabled:text-slate-400"
+                        >
+                          <option value="">
+                            {!formActivity.sistemaName
+                              ? '-- Primero elija Sistema --'
+                              : '-- Seleccionar Estructura --'}
+                          </option>
+                          {availableAssignCatalogStructures.map((stName) => (
+                            <option key={stName} value={stName}>
+                              {stName}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* PASO 4: ACTIVIDAD(ES) DE LA ESTRUCTURA SELECCIONADA */}
+                    <div data-testid="assign-step-actividad">
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label className="font-bold text-slate-800">
+                          4. Actividad(es) de la Estructura: *
+                        </label>
+                        {formActivity.structureName &&
+                          availableAssignCatalogActivities.length > 0 && (
+                            <div className="flex items-center gap-2">
+                              <span className="text-[11px] font-bold text-[#0f6b38]">
+                                {formActivity.selectedCatalogItemIds.length} de{' '}
+                                {availableAssignCatalogActivities.length} seleccionada(s)
+                              </span>
+                              <button
+                                type="button"
+                                data-testid="assign-btn-toggle-all-activities"
+                                onClick={() => {
+                                  const allSelected =
+                                    formActivity.selectedCatalogItemIds.length ===
+                                    availableAssignCatalogActivities.length;
+                                  setFormActivity((prev) =>
+                                    applyCatalogStepSelectAllActivities(
+                                      prev,
+                                      availableAssignCatalogActivities,
+                                      !allSelected
+                                    )
+                                  );
+                                }}
+                                className="px-2 py-0.5 rounded-lg bg-white hover:bg-emerald-100 text-[#0f6b38] border border-emerald-300 font-bold text-[11px] transition cursor-pointer"
+                              >
+                                {formActivity.selectedCatalogItemIds.length ===
+                                availableAssignCatalogActivities.length
+                                  ? 'Desmarcar todas'
+                                  : 'Seleccionar todas'}
+                              </button>
+                            </div>
+                          )}
+                      </div>
+
+                      {!formActivity.structureName ? (
+                        <div className="px-3 py-2.5 rounded-xl border border-slate-200 bg-slate-100 text-slate-400 font-semibold">
+                          Seleccione primero Área, Sistema y Estructura para visualizar sus
+                          actividades maestras activas.
+                        </div>
+                      ) : availableAssignCatalogActivities.length === 0 ? (
+                        <div className="px-3 py-2.5 rounded-xl border border-amber-200 bg-amber-50 text-amber-800 font-semibold">
+                          No hay actividades activas registradas para esta estructura en el
+                          Catálogo Maestro.
+                        </div>
+                      ) : (
+                        <div className="max-h-44 overflow-y-auto rounded-xl border border-emerald-300 bg-white divide-y divide-slate-100">
+                          {availableAssignCatalogActivities.map((actItem) => {
+                            const isChecked =
+                              formActivity.selectedCatalogItemIds.includes(actItem.id);
+                            const isPct =
+                              normalizeProgressMode(actItem.progressMode) === 'percentage';
+                            return (
+                              <label
+                                key={actItem.id}
+                                data-testid={`assign-activity-option-${actItem.code}`}
+                                className={`flex items-center justify-between gap-2.5 px-3 py-2 cursor-pointer transition ${
+                                  isChecked ? 'bg-emerald-50/90' : 'hover:bg-slate-50'
+                                }`}
+                              >
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <input
+                                    type="checkbox"
+                                    checked={isChecked}
+                                    onChange={() =>
+                                      setFormActivity((prev) =>
+                                        applyCatalogStepActivityToggle(
+                                          prev,
+                                          actItem.id,
+                                          availableAssignCatalogActivities
+                                        )
+                                      )
+                                    }
+                                    className="w-4 h-4 accent-[#0f6b38] rounded shrink-0"
+                                  />
+                                  <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-800 font-mono font-bold text-[10px] shrink-0">
+                                    {actItem.code}
+                                  </span>
+                                  <span className="font-bold text-slate-900 truncate">
+                                    {actItem.name}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
+                                      isPct
+                                        ? 'bg-blue-50 text-blue-800 border-blue-200'
+                                        : 'bg-emerald-50 text-[#0f6b38] border-emerald-200'
+                                    }`}
+                                  >
+                                    {isPct
+                                      ? '100 %'
+                                      : `${actItem.targetUnits || 0} ${actItem.unit || ''}`}
+                                  </span>
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* Fechas programadas de inicio y término */}
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block font-bold text-slate-700 mb-1">Código: *</label>
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Fecha Inicio Planificada:
+                  </label>
                   <input
-                    type="text"
-                    required
-                    value={formActivity.code}
+                    type="date"
+                    value={formActivity.startDate}
                     onChange={(e) =>
-                      setFormActivity({ ...formActivity, code: e.target.value })
+                      setFormActivity({ ...formActivity, startDate: e.target.value })
                     }
-                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono font-bold"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                   />
                 </div>
                 <div>
-                  <label className="block font-bold text-slate-700 mb-1">Área: *</label>
-                  <select
-                    required
-                    value={formActivity.areaName}
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Fecha Fin Planificada:
+                  </label>
+                  <input
+                    type="date"
+                    value={formActivity.dueDate}
                     onChange={(e) =>
-                      setFormActivity({ ...formActivity, areaName: e.target.value })
+                      setFormActivity({ ...formActivity, dueDate: e.target.value })
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
-                  >
-                    <option value="">-- Seleccionar Área --</option>
-                    {ALL_AREAS.map((a) => (
-                      <option key={a} value={a}>
-                        {a}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </div>
               </div>
 
-              {AREAS_WITH_SISTEMAS.includes(formActivity.areaName) && (
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block font-bold text-slate-700 mb-1">
-                      Ubicación:
+              {/* Configuración detallada cuando se selecciona 1 actividad */}
+              {formActivity.selectedCatalogItemIds.length === 1 && (
+                <div className="space-y-3 pt-1 border-t border-slate-200">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block font-bold text-slate-700 mb-1">
+                        Código: *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={formActivity.code}
+                        onChange={(e) =>
+                          setFormActivity({ ...formActivity, code: e.target.value })
+                        }
+                        className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-bold text-slate-700 mb-1">
+                        Actividad: *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={formActivity.name}
+                        onChange={(e) =>
+                          setFormActivity({ ...formActivity, name: e.target.value })
+                        }
+                        className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <label className="block font-bold text-slate-800 mb-1">
+                      Modalidad de Registro del Avance: *
                     </label>
                     <select
-                      value={formActivity.locationType}
-                      onChange={(e) =>
+                      value={formActivity.progressMode}
+                      onChange={(e) => {
+                        const nextMode = e.target.value as ProgressModality;
                         setFormActivity({
                           ...formActivity,
-                          locationType: e.target.value
-                        })
-                      }
-                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
+                          progressMode: nextMode,
+                          targetUnits:
+                            nextMode === 'percentage' ? '100' : formActivity.targetUnits,
+                          unit: nextMode === 'percentage' ? '%' : formActivity.unit
+                        });
+                      }}
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white font-bold text-[#0f6b38]"
                     >
-                      <option value="">-- Seleccionar Ubicación --</option>
-                      <option value="Interno">Interno</option>
-                      <option value="Externo">Externo</option>
+                      <option value="quantity">
+                        Avance por Cantidades (Predeterminado: Meta numérica + Unidad)
+                      </option>
+                      <option value="percentage">
+                        Avance por Porcentaje (0% a 100% — Registra % total alcanzado, no suma)
+                      </option>
                     </select>
                   </div>
-                  <div>
-                    <label className="block font-bold text-slate-700 mb-1">Sistema:</label>
-                    <input
-                      type="text"
-                      placeholder="Nombre del sistema"
-                      value={formActivity.sistemaName}
-                      onChange={(e) =>
-                        setFormActivity({
-                          ...formActivity,
-                          sistemaName: e.target.value
-                        })
-                      }
-                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
-                    />
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="block font-bold text-slate-700 mb-1">
+                        Meta: *
+                      </label>
+                      <input
+                        type="number"
+                        step="any"
+                        required
+                        disabled={formActivity.progressMode === 'percentage'}
+                        value={
+                          formActivity.progressMode === 'percentage'
+                            ? '100'
+                            : formActivity.targetUnits
+                        }
+                        onChange={(e) =>
+                          setFormActivity({
+                            ...formActivity,
+                            targetUnits: e.target.value
+                          })
+                        }
+                        className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono disabled:opacity-60"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-bold text-slate-700 mb-1">
+                        Unidad:
+                      </label>
+                      <input
+                        type="text"
+                        disabled={formActivity.progressMode === 'percentage'}
+                        value={
+                          formActivity.progressMode === 'percentage'
+                            ? '%'
+                            : formActivity.unit
+                        }
+                        onChange={(e) =>
+                          setFormActivity({ ...formActivity, unit: e.target.value })
+                        }
+                        className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 disabled:opacity-60"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-bold text-slate-700 mb-1">Peso:</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={formActivity.weight}
+                        onChange={(e) =>
+                          setFormActivity({ ...formActivity, weight: e.target.value })
+                        }
+                        className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono"
+                      />
+                    </div>
                   </div>
                 </div>
               )}
-
-              <div>
-                <label className="block font-bold text-slate-700 mb-1">
-                  Estructura: *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={formActivity.structureName}
-                  onChange={(e) =>
-                    setFormActivity({ ...formActivity, structureName: e.target.value })
-                  }
-                  className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
-                />
-              </div>
-
-              <div>
-                <label className="block font-bold text-slate-700 mb-1">
-                  Actividad: *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={formActivity.name}
-                  onChange={(e) =>
-                    setFormActivity({ ...formActivity, name: e.target.value })
-                  }
-                  className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
-                />
-              </div>
-
-              <div className="grid grid-cols-3 gap-2">
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">Meta: *</label>
-                  <input
-                    type="number"
-                    step="any"
-                    required
-                    value={formActivity.targetUnits}
-                    onChange={(e) =>
-                      setFormActivity({ ...formActivity, targetUnits: e.target.value })
-                    }
-                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono"
-                  />
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">Unidad:</label>
-                  <input
-                    type="text"
-                    value={formActivity.unit}
-                    onChange={(e) =>
-                      setFormActivity({ ...formActivity, unit: e.target.value })
-                    }
-                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50"
-                  />
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">Peso:</label>
-                  <input
-                    type="number"
-                    step="0.1"
-                    value={formActivity.weight}
-                    onChange={(e) =>
-                      setFormActivity({ ...formActivity, weight: e.target.value })
-                    }
-                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono"
-                  />
-                </div>
-              </div>
 
               <div className="pt-3 flex justify-end gap-2">
                 <button
                   type="button"
                   onClick={() => setModalNewActivity(false)}
-                  className="px-4 py-2 font-bold text-slate-500"
+                  className="px-4 py-2 font-bold text-slate-500 cursor-pointer"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 rounded-xl bg-[#0f6b38] text-white font-bold"
+                  data-testid="assign-btn-submit"
+                  disabled={
+                    !formActivity.targetGalponId ||
+                    !formActivity.areaName ||
+                    !formActivity.sistemaName ||
+                    !formActivity.structureName ||
+                    formActivity.selectedCatalogItemIds.length === 0
+                  }
+                  className="px-5 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold cursor-pointer"
                 >
-                  Guardar Actividad
+                  {formActivity.selectedCatalogItemIds.length > 1
+                    ? `Guardar Actividades (${formActivity.selectedCatalogItemIds.length})`
+                    : 'Guardar Actividad'}
                 </button>
               </div>
             </form>
@@ -8019,6 +9541,37 @@ export default function App() {
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                 />
               </div>
+
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                <label className="block font-bold text-slate-800 mb-1">
+                  Modalidad de Registro del Avance:
+                </label>
+                <select
+                  value={normalizeProgressMode(modalEditGalponActivity.progressMode)}
+                  onChange={(e) => {
+                    const nextMode = e.target.value as ProgressModality;
+                    setModalEditGalponActivity({
+                      ...modalEditGalponActivity,
+                      progressMode: nextMode,
+                      targetUnits:
+                        nextMode === 'percentage'
+                          ? 100
+                          : modalEditGalponActivity.targetUnits,
+                      unit:
+                        nextMode === 'percentage' ? '%' : modalEditGalponActivity.unit
+                    });
+                  }}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white font-bold text-[#0f6b38]"
+                >
+                  <option value="quantity">
+                    Avance por Cantidades (Predeterminado)
+                  </option>
+                  <option value="percentage">
+                    Avance por Porcentaje (0% a 100% — No suma entre días)
+                  </option>
+                </select>
+              </div>
+
               <div className="grid grid-cols-3 gap-2">
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">Meta:</label>
@@ -8026,28 +9579,46 @@ export default function App() {
                     type="number"
                     step="any"
                     required
-                    value={modalEditGalponActivity.targetUnits}
+                    disabled={
+                      normalizeProgressMode(modalEditGalponActivity.progressMode) ===
+                      'percentage'
+                    }
+                    value={
+                      normalizeProgressMode(modalEditGalponActivity.progressMode) ===
+                      'percentage'
+                        ? 100
+                        : modalEditGalponActivity.targetUnits
+                    }
                     onChange={(e) =>
                       setModalEditGalponActivity({
                         ...modalEditGalponActivity,
                         targetUnits: e.target.value
                       })
                     }
-                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono"
+                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono disabled:opacity-60"
                   />
                 </div>
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">Unidad:</label>
                   <input
                     type="text"
-                    value={modalEditGalponActivity.unit}
+                    disabled={
+                      normalizeProgressMode(modalEditGalponActivity.progressMode) ===
+                      'percentage'
+                    }
+                    value={
+                      normalizeProgressMode(modalEditGalponActivity.progressMode) ===
+                      'percentage'
+                        ? '%'
+                        : modalEditGalponActivity.unit
+                    }
                     onChange={(e) =>
                       setModalEditGalponActivity({
                         ...modalEditGalponActivity,
                         unit: e.target.value
                       })
                     }
-                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50"
+                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 disabled:opacity-60"
                   />
                 </div>
                 <div>
@@ -8095,6 +9666,24 @@ export default function App() {
                 ? `Modificar Avance Diario (${currentGalpon?.code})`
                 : `Registrar Avance Diario (${currentGalpon?.code})`}
             </h3>
+            {!isNetworkOnline && (
+              <div className="mt-2 p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-[11px] text-amber-900 font-bold">
+                Modo sin conexión (Offline) activo: Este registro se guardará localmente en tu
+                dispositivo y podrás enviarlo cuando regrese internet con el botón «SINCRONIZAR DATOS».
+              </div>
+            )}
+            {advanceValidationError && (
+              <div className="mt-2 p-3 rounded-xl bg-rose-50 border border-rose-300 text-xs text-rose-800 font-bold flex items-start justify-between gap-2">
+                <span>{advanceValidationError}</span>
+                <button
+                  type="button"
+                  onClick={() => setAdvanceValidationError(null)}
+                  className="text-rose-700 font-black px-1"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             <form onSubmit={handleSaveAdvance} className="space-y-3 text-xs mt-3">
               <div className="grid grid-cols-2 gap-3">
                 <div>
@@ -8165,20 +9754,63 @@ export default function App() {
                 <select
                   required
                   value={formAdvance.activityCode}
-                  onChange={(e) =>
-                    setFormAdvance({ ...formAdvance, activityCode: e.target.value })
-                  }
+                  onChange={(e) => {
+                    setAdvanceValidationError(null);
+                    setFormAdvance({
+                      ...formAdvance,
+                      activityCode: e.target.value,
+                      isAuthorizedCorrection: false,
+                      correctionReason: ''
+                    });
+                  }}
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold text-[#0f6b38]"
                 >
                   <option value="">-- Seleccionar Actividad --</option>
-                  {cascadeAdvancesList.map((a) => (
-                    <option key={a.id} value={a.code}>
-                      [{a.code}] {a.structureName} → {a.name} (Meta: {a.targetUnits}{' '}
-                      {a.unit} | Actual: {a.accumulatedQty})
-                    </option>
-                  ))}
+                  {cascadeAdvancesList.map((a) => {
+                    const isPct = a.progressMode === 'percentage';
+                    return (
+                      <option key={a.id} value={a.code}>
+                        [{a.code}] {a.structureName} → {a.name} (
+                        {isPct
+                          ? `Modalidad Porcentaje: Actual ${a.progressPercent}% / 100%`
+                          : `Meta: ${a.targetUnits} ${a.unit} | Acum: ${a.accumulatedQty}`}
+                        )
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
+
+              {selectedAdvanceActivityObj && (
+                <div
+                  className={`p-3 rounded-xl border ${
+                    selectedAdvanceActivityObj.progressMode === 'percentage'
+                      ? 'bg-blue-50 border-blue-200 text-blue-950'
+                      : 'bg-emerald-50/70 border-emerald-200 text-slate-800'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="font-extrabold">
+                      {selectedAdvanceActivityObj.progressMode === 'percentage'
+                        ? 'Modalidad: Avance por Porcentaje Total Alcanzado (0% a 100%)'
+                        : 'Modalidad: Avance por Cantidades Acumuladas'}
+                    </span>
+                    <span className="font-mono font-black px-2 py-0.5 rounded bg-white border border-slate-200 text-[#0f6b38]">
+                      {selectedAdvanceActivityObj.progressMode === 'percentage'
+                        ? `Último % válido: ${selectedAdvanceActivityObj.lastValidPercentage ?? 0}%`
+                        : `Acumulado: ${selectedAdvanceActivityObj.accumulatedQty} / ${selectedAdvanceActivityObj.targetUnits} ${selectedAdvanceActivityObj.unit}`}
+                    </span>
+                  </div>
+                  {selectedAdvanceActivityObj.progressMode === 'percentage' && (
+                    <p className="text-[11px] text-blue-800 mt-1">
+                      Ingresa el <strong>porcentaje total alcanzado hasta hoy (0% a 100%)</strong>.
+                      El sistema toma el último porcentaje válido registrado y{' '}
+                      <strong>NO suma porcentajes entre días</strong> (ej. Día 1: 10%, Día 2: 20% →
+                      Avance real = 20%). Al llegar a 100%, la actividad queda Completada.
+                    </p>
+                  )}
+                </div>
+              )}
 
               <div className="grid grid-cols-3 gap-2">
                 <div>
@@ -8195,16 +9827,30 @@ export default function App() {
                 </div>
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">
-                    Cantidad Hoy: *
+                    {selectedAdvanceActivityObj?.progressMode === 'percentage'
+                      ? '% Total Hoy (0-100): *'
+                      : 'Cantidad Hoy: *'}
                   </label>
                   <input
                     type="number"
                     step="any"
-                    required
-                    value={formAdvance.quantityToday}
-                    onChange={(e) =>
-                      setFormAdvance({ ...formAdvance, quantityToday: e.target.value })
+                    min={0}
+                    max={
+                      selectedAdvanceActivityObj?.progressMode === 'percentage'
+                        ? 100
+                        : undefined
                     }
+                    required
+                    placeholder={
+                      selectedAdvanceActivityObj?.progressMode === 'percentage'
+                        ? `Ej. ${Math.min(100, (selectedAdvanceActivityObj?.lastValidPercentage || 0) + 10)}`
+                        : ''
+                    }
+                    value={formAdvance.quantityToday}
+                    onChange={(e) => {
+                      setAdvanceValidationError(null);
+                      setFormAdvance({ ...formAdvance, quantityToday: e.target.value });
+                    }}
                     className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono font-bold text-[#0f6b38]"
                   />
                 </div>
@@ -8223,6 +9869,65 @@ export default function App() {
                   />
                 </div>
               </div>
+
+              {/* Autorización de Corrección Histórica cuando el nuevo porcentaje es menor al último porcentaje válido */}
+              {selectedAdvanceActivityObj?.progressMode === 'percentage' &&
+                formAdvance.quantityToday !== '' &&
+                Number(formAdvance.quantityToday) <
+                  (selectedAdvanceActivityObj.lastValidPercentage ?? 0) && (
+                  <div className="p-3 rounded-xl bg-purple-50 border border-purple-300 space-y-2">
+                    <p className="text-[11px] font-extrabold text-purple-950">
+                      Atención: El porcentaje ingresado ({formAdvance.quantityToday}%) es menor al
+                      último porcentaje válido registrado (
+                      {selectedAdvanceActivityObj.lastValidPercentage ?? 0}%).
+                    </p>
+                    {canUserAuthorizePercentageCorrection(profile?.role) ? (
+                      <>
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={formAdvance.isAuthorizedCorrection}
+                            onChange={(e) =>
+                              setFormAdvance({
+                                ...formAdvance,
+                                isAuthorizedCorrection: e.target.checked
+                              })
+                            }
+                            className="accent-purple-700 w-4 h-4 rounded"
+                          />
+                          <span className="font-bold text-purple-900">
+                            Autorizar corrección histórica de porcentaje ({profile?.role})
+                          </span>
+                        </label>
+                        {formAdvance.isAuthorizedCorrection && (
+                          <div>
+                            <label className="block font-bold text-purple-900 mb-1">
+                              Motivo obligatorio de la corrección histórica: *
+                            </label>
+                            <input
+                              type="text"
+                              required={formAdvance.isAuthorizedCorrection}
+                              placeholder="Ej. Corrección de medición en campo verificada por supervisión..."
+                              value={formAdvance.correctionReason}
+                              onChange={(e) =>
+                                setFormAdvance({
+                                  ...formAdvance,
+                                  correctionReason: e.target.value
+                                })
+                              }
+                              className="w-full px-2.5 py-1.5 rounded-lg border border-purple-300 bg-white font-bold text-slate-800"
+                            />
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-[11px] text-rose-700 font-bold">
+                        Solo un Supervisor, Jefe de proyecto o Administrador puede autorizar una
+                        corrección histórica que disminuya el porcentaje.
+                      </p>
+                    )}
+                  </div>
+                )}
 
               <div className="grid grid-cols-2 gap-2">
                 <div>
@@ -8392,8 +10097,15 @@ export default function App() {
                       {selectedAdvanceActivityObj.structureName}):
                     </span>
                     {selectedAdvanceActivityObj.linkedMaterials.map((mat: any) => {
-                      const pctToday =
-                        selectedAdvanceActivityObj.targetUnits > 0
+                      const isPct =
+                        selectedAdvanceActivityObj.progressMode === 'percentage';
+                      const pctToday = isPct
+                        ? Math.max(
+                            0,
+                            Number(formAdvance.quantityToday || 0) -
+                              Number(selectedAdvanceActivityObj.lastValidPercentage || 0)
+                          ) / 100
+                        : selectedAdvanceActivityObj.targetUnits > 0
                           ? Number(formAdvance.quantityToday || 0) /
                             selectedAdvanceActivityObj.targetUnits
                           : 0;
@@ -8441,6 +10153,7 @@ export default function App() {
                   onClick={() => {
                     setModalNewAdvance(false);
                     setEditingAdvanceId(null);
+                    setAdvanceValidationError(null);
                   }}
                   className="px-4 py-2 font-bold text-slate-500"
                 >
@@ -8630,7 +10343,7 @@ export default function App() {
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
                   {modalBulkUpload === 'catalogo' &&
-                    'Columnas requeridas: Proveedor, Codigo, Area, Ubicacion, Sistema (si aplica), Estructura, Actividad, Meta, Unidad, Peso, HH'}
+                    'Columnas requeridas: Proveedor, Codigo, Area, Ubicacion, Sistema (si aplica), Estructura, Actividad, Meta, Unidad, Peso, HH. Opcional: Modalidad (Cantidades / Porcentaje)'}
                   {modalBulkUpload === 'materiales' &&
                     'Columnas requeridas: Proveedor, Codigo, Material, Area, Sistema (si aplica), Estructura, CantidadTotal, Unidad, Galpon (o elegir galpón destino abajo)'}
                   {modalBulkUpload === 'personal' &&
@@ -8785,6 +10498,9 @@ export default function App() {
                           <th className="py-2 px-2.5">Fila</th>
                           <th className="py-2 px-2.5">Estado</th>
                           <th className="py-2 px-2.5">Código</th>
+                          {modalBulkUpload === 'catalogo' && (
+                            <th className="py-2 px-2.5">Modalidad</th>
+                          )}
                           <th className="py-2 px-2.5">Descripción / Nombre</th>
                           <th className="py-2 px-2.5">Relación / Destino</th>
                           <th className="py-2 px-2.5">Detalle de Validación</th>
@@ -8816,6 +10532,21 @@ export default function App() {
                             <td className="py-1.5 px-2.5 font-mono font-bold">
                               {row.payload.code || row.payload.workerCode || '-'}
                             </td>
+                            {modalBulkUpload === 'catalogo' && (
+                              <td className="py-1.5 px-2.5">
+                                <span
+                                  className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                                    row.payload?.progressMode === 'percentage'
+                                      ? 'bg-indigo-100 text-indigo-700'
+                                      : 'bg-emerald-100 text-[#0f6b38]'
+                                  }`}
+                                >
+                                  {row.payload?.progressMode === 'percentage'
+                                    ? 'Porcentaje (100%)'
+                                    : `Cantidades (${row.payload?.targetUnits || 0} ${row.payload?.unit || ''})`}
+                                </span>
+                              </td>
+                            )}
                             <td className="py-1.5 px-2.5 font-bold text-slate-900">
                               {row.payload.name || '-'}
                             </td>
@@ -8884,7 +10615,9 @@ export default function App() {
                               ? 'Avance Diario'
                               : deleteConfirmModal.type === 'catalog_item'
                                 ? 'Actividad Maestra'
-                                : 'Plantilla / Proveedor'}
+                                : deleteConfirmModal.type === 'catalog_structure'
+                                  ? 'Estructura Maestra'
+                                  : 'Plantilla / Proveedor'}
                   : [{deleteConfirmModal.code}] {deleteConfirmModal.name}
                 </h3>
                 <p className="text-xs text-slate-500 mt-1">
@@ -9046,6 +10779,22 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* MODAL: CENTRO DE SINCRONIZACIÓN OFFLINE Y RESOLUCIÓN DE CONFLICTOS MULTIUSUARIO */}
+      <OfflineSyncCenterModal
+        isOpen={modalSyncCenterOpen}
+        onClose={() => setModalSyncCenterOpen(false)}
+        connectionIndicatorState={connectionIndicatorState}
+        isNetworkOnline={isNetworkOnline}
+        pendingOperations={pendingOperations}
+        syncConflicts={syncConflicts}
+        lastSyncSummary={lastSyncSummary}
+        isManualSyncing={isManualSyncing}
+        userRole={profile?.role}
+        activeUserId={profile?.uid}
+        onTriggerManualSync={triggerManualSync}
+        onResolveConflict={resolveSyncConflict}
+      />
     </div>
   );
 }

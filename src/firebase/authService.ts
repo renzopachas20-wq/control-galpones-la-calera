@@ -1,12 +1,16 @@
 import {
   signInWithEmailAndPassword,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider,
   signOut,
   sendPasswordResetEmail,
   onAuthStateChanged,
   setPersistence,
   browserLocalPersistence,
+  browserSessionPersistence,
+  inMemoryPersistence,
   type User
 } from 'firebase/auth';
 import {
@@ -19,6 +23,7 @@ import {
   type Unsubscribe
 } from 'firebase/firestore';
 import { auth, db } from './config';
+import { getApiUrl } from './apiConfig';
 
 // ============================================================================
 // 1. Definición de los Seis Roles Oficiales y Perfil de Usuario
@@ -44,6 +49,7 @@ export interface UserProfile {
   authMethod?: AuthMethod;
   role: OfficialRole;
   active: boolean;
+  status?: string;
   assignedProject?: string;
   assignedSectorIds: string[];
   assignedGalponIds: string[];
@@ -126,11 +132,29 @@ export function translateFirebaseAuthError(error: any): string {
 // 3. Autenticación y Gestión de Sesión (Correo/Contraseña + Google)
 // ============================================================================
 
+/**
+ * Configuración segura de persistencia de sesión:
+ * Soporta Safari con ITP (Intelligent Tracking Prevention), modo privado y
+ * WebView móvil (Capacitor/Android) donde localStorage puede arrojar SecurityError.
+ * Degrada suavemente: browserLocalPersistence -> browserSessionPersistence -> inMemoryPersistence.
+ */
+export async function ensureAuthPersistence(): Promise<void> {
+  try {
+    await setPersistence(auth, browserLocalPersistence);
+  } catch (err1) {
+    try {
+      await setPersistence(auth, browserSessionPersistence);
+    } catch {
+      await setPersistence(auth, inMemoryPersistence).catch(() => {});
+    }
+  }
+}
+
 export async function loginWithEmail(
   email: string,
   password: string
 ): Promise<{ user: User; profile: UserProfile }> {
-  await setPersistence(auth, browserLocalPersistence);
+  await ensureAuthPersistence();
   const cleanEmail = email.trim().toLowerCase();
   const credential = await signInWithEmailAndPassword(auth, cleanEmail, password);
   const profile = await fetchOrBootstrapProfile(credential.user);
@@ -139,20 +163,42 @@ export async function loginWithEmail(
 
 /**
  * Inicio de sesión con Google utilizando Firebase Authentication (GoogleAuthProvider).
- * Compatible con navegador web y preparado para contenedor móvil Capacitor/Android.
- * Verifica obligatoriamente que exista un perfil activo autorizado en /users/{uid}.
+ * Compatible con navegador de escritorio, Safari iOS y contenedor móvil Capacitor/Android.
+ * Si el navegador móvil bloquea la ventana emergente ('auth/popup-blocked'), realiza
+ * fallback automático y transparente a signInWithRedirect para garantizar compatibilidad completa.
  */
-export async function loginWithGoogle(): Promise<{ user: User; profile: UserProfile }> {
-  await setPersistence(auth, browserLocalPersistence);
+export async function loginWithGoogle(): Promise<{ user: User; profile: UserProfile } | null> {
+  await ensureAuthPersistence();
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: 'select_account' });
 
-  const credential = await signInWithPopup(auth, provider);
   try {
+    const credential = await signInWithPopup(auth, provider);
+    const profile = await fetchOrBootstrapProfile(credential.user);
+    return { user: credential.user, profile };
+  } catch (err: any) {
+    const code = err?.code || '';
+    if (code === 'auth/popup-blocked' || code === 'auth/cancelled-popup-request') {
+      console.warn('Ventana emergente de Google bloqueada o restringida. Iniciando redirección segura para Safari/Móvil...');
+      await signInWithRedirect(auth, provider);
+      return null;
+    }
+    await signOut(auth).catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Procesa el resultado de signInWithRedirect al cargar la aplicación (Safari iOS / Móvil).
+ */
+export async function handleGoogleRedirectResult(): Promise<{ user: User; profile: UserProfile } | null> {
+  try {
+    const credential = await getRedirectResult(auth);
+    if (!credential || !credential.user) return null;
     const profile = await fetchOrBootstrapProfile(credential.user);
     return { user: credential.user, profile };
   } catch (err) {
-    await signOut(auth).catch(() => {});
+    console.error('Error al procesar resultado de redirección Google:', err);
     throw err;
   }
 }
@@ -179,7 +225,7 @@ export async function fetchOrBootstrapProfile(user: User): Promise<UserProfile> 
 
   // 1. Verificar sesión en el backend primero (permite vincular cuentas Google pre-autorizadas y validar estado)
   try {
-    const resp = await fetch('/api/auth/verify-session', {
+    const resp = await fetch(getApiUrl('/api/auth/verify-session'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -261,6 +307,8 @@ export async function fetchOrBootstrapProfile(user: User): Promise<UserProfile> 
 }
 
 export function normalizeUserProfile(raw: any): UserProfile {
+  const isActive =
+    raw?.active !== undefined ? Boolean(raw.active) : raw?.status === 'activo';
   return {
     uid: String(raw?.uid || ''),
     email: String(raw?.email || '').toLowerCase(),
@@ -271,7 +319,8 @@ export function normalizeUserProfile(raw: any): UserProfile {
         ? raw.authMethod
         : 'password',
     role: (OFFICIAL_ROLES.includes(raw?.role) ? raw.role : 'Solo lectura') as OfficialRole,
-    active: Boolean(raw?.active),
+    active: isActive,
+    status: isActive ? 'activo' : 'inactivo',
     assignedProject: raw?.assignedProject ? String(raw.assignedProject) : 'TODOS',
     assignedSectorIds: Array.isArray(raw?.assignedSectorIds)
       ? raw.assignedSectorIds.map(String)
@@ -341,7 +390,7 @@ export async function adminListUsers(): Promise<UserProfile[]> {
     return list;
   } catch {
     const headers = await getAdminAuthHeaders();
-    const resp = await fetch('/api/admin/users', { method: 'GET', headers });
+    const resp = await fetch(getApiUrl('/api/admin/users'), { method: 'GET', headers });
     const data = await resp.json();
     if (!resp.ok) {
       throw new Error(data?.message || 'Error al listar los usuarios.');
@@ -352,7 +401,7 @@ export async function adminListUsers(): Promise<UserProfile[]> {
 
 export async function adminCreateUser(input: CreateUserInput): Promise<UserProfile> {
   const headers = await getAdminAuthHeaders();
-  const resp = await fetch('/api/admin/users', {
+  const resp = await fetch(getApiUrl('/api/admin/users'), {
     method: 'POST',
     headers,
     body: JSON.stringify(input)
@@ -369,7 +418,7 @@ export async function adminUpdateUser(
   updates: UpdateUserInput
 ): Promise<{ user: UserProfile; authEmailSyncNote?: string }> {
   const headers = await getAdminAuthHeaders();
-  const resp = await fetch(`/api/admin/users/${encodeURIComponent(uid)}`, {
+  const resp = await fetch(getApiUrl(`/api/admin/users/${encodeURIComponent(uid)}`), {
     method: 'PATCH',
     headers,
     body: JSON.stringify(updates)
@@ -389,7 +438,7 @@ export async function adminGenerateTempPassword(
   tempPassword?: string
 ): Promise<{ mode: 'direct_update' | 'reset_email_sent'; tempPassword?: string; message: string }> {
   const headers = await getAdminAuthHeaders();
-  const resp = await fetch(`/api/admin/users/${encodeURIComponent(uid)}/temp-password`, {
+  const resp = await fetch(getApiUrl(`/api/admin/users/${encodeURIComponent(uid)}/temp-password`), {
     method: 'POST',
     headers,
     body: JSON.stringify({ tempPassword })
@@ -403,7 +452,7 @@ export async function adminGenerateTempPassword(
 
 export async function adminSendPasswordReset(uid: string): Promise<string> {
   const headers = await getAdminAuthHeaders();
-  const resp = await fetch(`/api/admin/users/${encodeURIComponent(uid)}/reset-password`, {
+  const resp = await fetch(getApiUrl(`/api/admin/users/${encodeURIComponent(uid)}/reset-password`), {
     method: 'POST',
     headers
   });
