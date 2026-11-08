@@ -486,9 +486,12 @@ export function useFirestoreOperationalSync({
     setAttendanceRecords
   ]);
 
+  const activeProfileUid = isProfileAuthorizedActive(profile) ? profile?.uid || null : null;
+  const activeProfileRole = isProfileAuthorizedActive(profile) ? profile?.role || null : null;
+
   // 1. Suscripciones en tiempo real desde Firestore combinadas con cola local offline (C-2)
   useEffect(() => {
-    if (!isProfileAuthorizedActive(profile) || !auth.currentUser) return;
+    if (!activeProfileUid || !activeProfileRole || !auth.currentUser) return;
 
     const unsubs: (() => void)[] = [];
 
@@ -710,7 +713,7 @@ export function useFirestoreOperationalSync({
     );
 
     // 1.8 Movements (Bitácora de Auditoría — en firestore.rules solo roles distintos de Auxiliar tienen lectura)
-    if (profile.role !== 'Auxiliar') {
+    if (activeProfileRole !== 'Auxiliar') {
       unsubs.push(
         onSnapshot(
           collection(db, 'movements'),
@@ -747,7 +750,8 @@ export function useFirestoreOperationalSync({
       unsubs.forEach((u) => u());
     };
   }, [
-    profile,
+    activeProfileUid,
+    activeProfileRole,
     markSyncedNow,
     setTechnologies,
     setMasterCatalog,

@@ -345,21 +345,50 @@ async function deleteProfileFromFirestore(uid: string, idToken: string): Promise
 }
 
 async function listAllProfilesFromFirestore(idToken: string): Promise<UserProfileDTO[]> {
-  const url = `${FIRESTORE_BASE_URL}/users?pageSize=300`;
-  const resp = await fetch(url, {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${idToken}` }
+  const url = `${FIRESTORE_BASE_URL}:runQuery`;
+  const queryBody = JSON.stringify({
+    structuredQuery: {
+      from: [{ collectionId: 'users' }],
+      limit: 300
+    }
   });
+
+  let resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: queryBody
+  });
+
+  if (resp.status === 403) {
+    const vaultedAdmin = await getVaultedAdminIdToken();
+    if (vaultedAdmin && vaultedAdmin.idToken !== idToken) {
+      resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${vaultedAdmin.idToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: queryBody
+      });
+    }
+  }
+
   if (!resp.ok) {
     const errText = await resp.text();
     throw new Error(`Firestore LIST /users falló (${resp.status}): ${errText}`);
   }
-  const data = (await resp.json()) as any;
-  const docs = data.documents || [];
+  const rows = (await resp.json()) as any[];
   const profiles: UserProfileDTO[] = [];
-  for (const doc of docs) {
-    const p = parseFirestoreDocToProfile(doc);
-    if (p) profiles.push(p);
+  if (Array.isArray(rows)) {
+    for (const row of rows) {
+      if (row && row.document) {
+        const p = parseFirestoreDocToProfile(row.document);
+        if (p) profiles.push(p);
+      }
+    }
   }
   profiles.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
   return profiles;

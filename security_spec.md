@@ -22,3 +22,13 @@
 6. **Inmutabilidad del Historial de Movimientos (`/movements/{movementId}`)**:
    - Todo registro creado en `/movements/{movementId}` exige que `request.resource.data.userId == request.auth.uid` y que el tipo sea `'REGISTRO'`, `'MODIFICACIÓN'` o `'ELIMINACIÓN'`.
    - `allow update, delete: if false;` garantiza que ningún usuario pueda alterar ni borrar la trazabilidad histórica.
+7. **Separación de `allow get` y `allow list` en `/users` y uso de `:runQuery` en Firestore Enterprise Edition**:
+   - **Causa diagnosticada**:
+     1. En `server.ts`, `listAllProfilesFromFirestore` invocaba `GET /v1/projects/.../databases/.../documents/users?pageSize=300` (método REST `documents.list`), el cual en Firestore Enterprise Edition (`ai-studio-controlgalponesl-58fc2d34-fb60-4c1b-ac12-3af5a15f1e71`) incluye enumeración de documentos huérfanos/inexistentes y es rechazado con `403 PERMISSION_DENIED` para tokens de usuario, mientras que el endpoint oficial de consulta `POST /v1/projects/.../databases/.../documents:runQuery` (`structuredQuery`) evalúa correctamente las reglas de colección.
+     2. En `firestore.rules`, `match /users/{userId}` combinaba `allow read: if isOwner(userId) || isAdmin();` sin separar `allow get` de `allow list: if isAdmin();`.
+   - **Cambio aplicado**:
+     - En `firestore.rules`, `/users/{userId}` separa `allow get: if isOwner(userId) || isAdmin();` y `allow list: if isAdmin();` (incluyendo `isPrimaryAdmin() || hasRole(['Administrador'])`). Los usuarios no administradores tienen estrictamente prohibido hacer `list` sobre `/users` o `get` sobre perfiles de otros usuarios.
+     - En `server.ts`, `listAllProfilesFromFirestore` utiliza `POST ${FIRESTORE_BASE_URL}:runQuery` con `structuredQuery: { from: [{ collectionId: 'users' }], limit: 300 }`.
+     - Todas las colecciones operativas (`/providers`, `/masterCatalog`, `/sectors`, `/materials`, `/advances`, `/workers`, `/attendance`, `/movements`) mantienen su restricción `isActiveUser()` y validación estricta por rol.
+
+

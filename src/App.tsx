@@ -6471,7 +6471,6 @@ export default function App() {
                   <thead className="bg-[#0f6b38] text-white font-bold uppercase text-[11px]">
                     <tr>
                       <th className="py-3 px-3">Código</th>
-                      <th className="py-3 px-3">Área</th>
                       <th className="py-3 px-3">Ubicación / Sistema</th>
                       <th className="py-3 px-3">Estructura</th>
                       <th className="py-3 px-3">Actividad</th>
@@ -6508,9 +6507,6 @@ export default function App() {
                           <tr key={act.id} className="hover:bg-slate-50">
                             <td className="py-2.5 px-3 font-mono font-bold">
                               {act.code}
-                            </td>
-                            <td className="py-2.5 px-3 font-bold text-[#0f6b38]">
-                              {act.areaName}
                             </td>
                             <td className="py-2.5 px-3">
                               {act.sistemaName

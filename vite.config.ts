@@ -101,4 +101,8 @@ function versionMetadataPlugin(): Plugin {
 
 export default defineConfig({
   plugins: [versionMetadataPlugin(), react()],
+  server: {
+    hmr: false,
+  },
 });
+

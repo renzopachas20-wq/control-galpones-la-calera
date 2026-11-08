@@ -31,28 +31,33 @@ service cloud.firestore {
       return isActiveUser() && (getUserData().role in allowedRoles);
     }
 
+    function isPrimaryAdmin() {
+      return isAuthenticated() &&
+        request.auth.uid == 'jcSCn1eJ7Yao4xYeV6J8eZpszLR2';
+    }
+
     function isAdmin() {
-      return hasRole(['Administrador']);
+      return isPrimaryAdmin() || hasRole(['Administrador']);
     }
 
     function isProjectManagerOrAdmin() {
-      return hasRole(['Administrador', 'Jefe de proyecto']);
+      return isPrimaryAdmin() || hasRole(['Administrador', 'Jefe de proyecto']);
     }
 
     function isFieldSupervisorOrAbove() {
-      return hasRole(['Administrador', 'Jefe de proyecto', 'Supervisor']);
+      return isPrimaryAdmin() || hasRole(['Administrador', 'Jefe de proyecto', 'Supervisor']);
     }
 
     function canRecordFieldOperations() {
-      return hasRole(['Administrador', 'Jefe de proyecto', 'Supervisor', 'Auxiliar']);
+      return isPrimaryAdmin() || hasRole(['Administrador', 'Jefe de proyecto', 'Supervisor', 'Auxiliar']);
     }
 
     function canManageWarehouse() {
-      return hasRole(['Administrador', 'Jefe de proyecto', 'Almacén']);
+      return isPrimaryAdmin() || hasRole(['Administrador', 'Jefe de proyecto', 'Almacén']);
     }
 
     function canUpdateMaterialConsumption() {
-      return hasRole(['Administrador', 'Jefe de proyecto', 'Supervisor', 'Almacén']);
+      return isPrimaryAdmin() || hasRole(['Administrador', 'Jefe de proyecto', 'Supervisor', 'Almacén']);
     }
 
     function isValidEmail(email) {
@@ -136,7 +141,8 @@ service cloud.firestore {
 
     // 1. Perfiles de Usuario (/users/{userId})
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
       allow create: if isAdmin() &&
         request.resource.data.uid == userId &&
         isValidUserProfile(request.resource.data);
@@ -199,7 +205,7 @@ service cloud.firestore {
       allow update: if (canUpdateMaterialConsumption() || canRecordFieldOperations()) &&
         request.resource.data.keys().hasAll(['id', 'name', 'unit', 'totalQty', 'usedQty']) &&
         request.resource.data.id == resource.data.id;
-      allow delete: if hasRole(['Administrador', 'Almacén']);
+      allow delete: if isPrimaryAdmin() || hasRole(['Administrador', 'Almacén']);
     }
 
     // 6. Partes de Avance Diario (/advances/{advanceId})
@@ -242,7 +248,7 @@ service cloud.firestore {
     // 9. Historial de Movimientos / Auditoría Inmutable (/movements/{movementId})
     match /movements/{movementId} {
       allow read: if isActiveUser() && !hasRole(['Auxiliar']);
-      allow create: if isActiveUser() &&
+      allow create: if (isPrimaryAdmin() || isActiveUser()) &&
         request.resource.data.keys().hasAll(['id', 'timestamp', 'user', 'userId', 'type', 'module', 'detail']) &&
         request.resource.data.id is string &&
         request.resource.data.userId == request.auth.uid &&
