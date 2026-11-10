@@ -1,0 +1,15 @@
+{
+  "id": "/",
+  "name": "Control Galpones La Calera",
+  "short_name": "La Calera",
+  "lang": "es",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f1f5f9",
+  "theme_color": "#0f6b38",
+  "icons": [
+    { "src": "/icons/calera-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/calera-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

@@ -53,7 +53,7 @@ export interface DashboardRenderContext {
     locationType?: string;
     sistemaName?: string;
     structureName?: string;
-    activityCode?: string;
+    activityId?: string;
   }) => void;
   activeFilters?: DashboardFilterCriteria;
 }

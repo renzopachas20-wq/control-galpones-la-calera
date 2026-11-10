@@ -13,6 +13,7 @@ import {
   evaluateActivityProgress,
   type ProgressModality
 } from '../firebase/offlineSyncEngine';
+import { ambiguousActivityCodes } from '../firebase/advanceActivity';
 
 export const ALL_CONSTRUCTIVE_AREAS = [
   'Obra Civil',
@@ -289,6 +290,7 @@ export function filterDashboardActivities(
   const hasDateOrSupervisorFilter = Boolean(
     criteria.dateFrom || criteria.dateTo || criteria.supervisor?.trim()
   );
+  const ambiguousCodes = ambiguousActivityCodes(evaluatedActivities);
 
   return evaluatedActivities
     .filter((act) => {
@@ -322,9 +324,8 @@ export function filterDashboardActivities(
 
       const matchingLogs = (dailyAdvances || []).filter((log) => {
         if (criteria.galponId && log.galponId !== criteria.galponId) return false;
-        const matchesAct =
-          (log.activityId && log.activityId === act.id) ||
-          log.activityCode === act.code;
+        const matchesAct = log.activityId ? log.activityId === act.id
+          : log.activityCode === act.code && !ambiguousCodes.has(act.code);
         if (!matchesAct) return false;
         if (criteria.dateFrom && log.date < criteria.dateFrom) return false;
         if (criteria.dateTo && log.date > criteria.dateTo) return false;

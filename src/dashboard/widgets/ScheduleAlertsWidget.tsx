@@ -16,7 +16,7 @@ export interface ScheduleAlertsWidgetProps {
     locationType: string;
     sistemaName: string;
     structureName: string;
-    activityCode: string;
+    activityId: string;
   }) => void;
 }
 
@@ -104,7 +104,7 @@ export const ScheduleAlertsWidget: React.FC<ScheduleAlertsWidgetProps> = ({
                       locationType: act.locationType || 'Todos',
                       sistemaName: act.sistemaName || '',
                       structureName: act.structureName || '',
-                      activityCode: act.code
+                      activityId: act.id
                     })
                   }
                   className="px-2.5 py-1 rounded-lg bg-[#0f6b38] text-white font-bold text-[11px]"

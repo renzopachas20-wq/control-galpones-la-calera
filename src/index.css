@@ -2,6 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
+.modal-viewport {
+  align-items: flex-start;
+  align-items: safe center;
+  overflow-y: auto;
+}
+
 html {
   min-width: 320px;
   background: #f1f5f9;

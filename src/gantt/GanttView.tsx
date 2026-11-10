@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
-import * as XLSX from 'xlsx';
+import { indexActivityAdvances } from '../dashboard/advanceIndex';
+import { ambiguousActivityCodes, ganttPlannedActivities } from '../firebase/advanceActivity';
 import {
   ChevronLeft,
   ChevronRight,
@@ -33,6 +34,9 @@ interface GanttViewProps {
   todayStr: string;
   canCreateActivity: boolean;
   canEditGantt: boolean;
+  canExportGantt: boolean;
+  canDeleteGantt: boolean;
+  onWithdrawActivity: (id: string) => void;
   onOpenNewActivity: () => void;
   onDateChange: (
     activityId: string,
@@ -49,6 +53,9 @@ export const GanttView: React.FC<GanttViewProps> = ({
   todayStr,
   canCreateActivity,
   canEditGantt,
+  canExportGantt,
+  canDeleteGantt,
+  onWithdrawActivity,
   onOpenNewActivity,
   onDateChange
 }) => {
@@ -65,13 +72,9 @@ export const GanttView: React.FC<GanttViewProps> = ({
   // preservando el índice original de Gestión de Actividades para desempates de fecha.
   const ganttActivities: EvaluatedGanttActivity[] = useMemo(() => {
     if (!currentGalpon || !Array.isArray(rawActivities)) return [];
-    return rawActivities.map((act, originalIndex) => {
-      const logsForAct = (Array.isArray(dailyAdvances) ? dailyAdvances : []).filter(
-        (l) =>
-          l &&
-          l.galponId === currentGalpon.id &&
-          ((l.activityId && l.activityId === act.id) || l.activityCode === act.code)
-      );
+    const byActivity = indexActivityAdvances(dailyAdvances ?? [], new Map([[currentGalpon.id, ambiguousActivityCodes(rawActivities)]]));
+    return ganttPlannedActivities(rawActivities, currentGalpon.ganttExcludedActivityIds).map((act, originalIndex) => {
+      const logsForAct = byActivity(currentGalpon.id, act.id, act.code);
       return evaluateGanttActivity(act, logsForAct, todayStr, originalIndex);
     });
   }, [currentGalpon, rawActivities, dailyAdvances, todayStr]);
@@ -173,7 +176,8 @@ export const GanttView: React.FC<GanttViewProps> = ({
   };
 
   // Exportar cronograma a Excel (.xlsx) respetando las columnas oficiales y el ordenamiento
-  const handleExportExcel = () => {
+  const handleExportExcel = async () => {
+    if (!canExportGantt) return;
     if (!currentGalpon) return;
     const rowsData = visibleActivities.map((act) => ({
       Código: act.code,
@@ -196,6 +200,7 @@ export const GanttView: React.FC<GanttViewProps> = ({
       'Fechas con Ejecución Real': act.executedDates.join(', ') || 'Sin registros'
     }));
 
+    const XLSX = await import('xlsx');
     const ws = XLSX.utils.json_to_sheet(rowsData);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Cronograma Gantt');
@@ -321,7 +326,7 @@ export const GanttView: React.FC<GanttViewProps> = ({
 
           {/* Bloque derecho: Exportar, Ampliar vista y Nueva Actividad */}
           <div className="flex flex-wrap items-center gap-1.5">
-            <button
+            {canExportGantt && <button
               type="button"
               data-testid="gantt-btn-export"
               disabled={!currentGalpon || visibleActivities.length === 0}
@@ -331,7 +336,7 @@ export const GanttView: React.FC<GanttViewProps> = ({
             >
               <Download className="w-3.5 h-3.5 text-[#0f6b38]" />
               <span>Exportar</span>
-            </button>
+            </button>}
 
             <button
               type="button"
@@ -773,6 +778,10 @@ export const GanttView: React.FC<GanttViewProps> = ({
                           }
                           className="w-full px-1 py-0.5 rounded border border-slate-200 bg-slate-50 hover:border-slate-300 text-[10px] font-mono tabular-nums text-slate-800 focus:outline-none focus:ring-1 focus:ring-[#0f6b38]"
                         />
+                        {canDeleteGantt && (
+                          <button type="button" className="mt-1 text-[10px] text-red-700 underline"
+                            onClick={() => onWithdrawActivity(act.id)}>Retirar del plan</button>
+                        )}
                       </td>
 
                       {/* COLUMNA 8: Fin */}

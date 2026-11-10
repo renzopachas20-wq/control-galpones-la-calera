@@ -1,5 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
-import * as XLSX from 'xlsx';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Building2,
   CheckCircle2,
@@ -34,23 +33,30 @@ import {
   ShieldCheck
 } from 'lucide-react';
 import { useAuthProfile } from './components/AuthGate';
+import { bindOperationalData, duplicateCatalogTemplate, importHistoricalMovements, operationalScopeKey } from './firebase/operationalData';
+import { readMovementFile } from './firebase/movementImport';
+import { indexMaterialConsumption } from './firebase/materialConsumption';
+import { ambiguousActivityCodes, barnActivities, barnResponsible, findAdvanceActivity } from './firebase/advanceActivity';
+import { invalidWorkerField, normalizeWorkerCode, workerAtLocation, workerForDisplay } from './firebase/workerData';
 import { useFirestoreOperationalSync } from './firebase/firestoreDataService';
 import {
   hasModulePermission,
-  canAccessSector,
-  canAccessGalpon,
-  filterSectorsByScope,
+  resolveModule,
   MODULE_LABELS,
   ACTION_LABELS,
   type AppModuleId,
   type PermissionAction
 } from './firebase/permissions';
 import { DashboardView } from './dashboard/DashboardView';
-import { GanttView } from './gantt/GanttView';
+import { PortfolioOverview } from './dashboard/PortfolioOverview';
+import { indexActivityAdvances } from './dashboard/advanceIndex';
+import { fieldReport } from './dashboard/fieldReport';
+import { escapeCsvCell } from './dashboard/csvExport';
 import {
   computeWeightedProgress,
   computeAreaProgressMetrics,
-  computeSistemaProgressMetrics
+  computeSistemaProgressMetrics,
+  type EvaluatedActivityItem
 } from './dashboard/dashboardSelectors';
 import {
   evaluateActivityProgress,
@@ -61,7 +67,8 @@ import {
   createOperationId,
   getOrCreateDeviceId,
   recordActivityDeletionTombstone,
-  recordGalponDeletionTombstone,
+  isGanttWithdrawal,
+  sameOperationalScope,
   resolveDynamicSectorGalponContext,
   type ProgressModality
 } from './firebase/offlineSyncEngine';
@@ -74,6 +81,7 @@ import { GalponLogoIcon } from './components/GalponLogoIcon';
 import {
   NO_SISTEMA_VALUE,
   getActiveMasterCatalog,
+  catalogCodeKey,
   getCatalogAreas,
   getCatalogSystemsByArea,
   getCatalogStructuresByAreaAndSystem,
@@ -92,6 +100,16 @@ import {
 // ============================================================================
 // UTILIDADES Y CONSTANTES BASE (SIN DATOS DE DEMOSTRACIÓN)
 // ============================================================================
+
+const GanttView = React.lazy(() => import('./gantt/GanttView').then(module => ({ default: module.GanttView })));
+const MAX_IMPORT_BYTES = 2_000_000;
+const MAX_BULK_ROWS = 1000;
+const MOVEMENTS_PAGE_SIZE = 50;
+const BULK_COLUMNS = {
+  catalogo: ['Proveedor', 'Codigo', 'Area', 'Ubicacion', 'Sistema', 'Estructura', 'Actividad', 'Meta', 'Unidad', 'Peso', 'HH', 'Modalidad', 'DuracionDias'],
+  materiales: ['Proveedor', 'Codigo', 'Material', 'Area', 'Sistema', 'Estructura', 'CantidadTotal', 'Unidad', 'Galpon'],
+  personal: ['Codigo', 'DNI', 'Nombre', 'Especialidad', 'Cargo', 'Galpon']
+};
 
 const generateId = (prefix = 'id'): string => {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -491,43 +509,12 @@ function mergeAreasWithCatalog(
   });
 }
 
-// Calcula el consumo acumulado de un material de forma determinística a partir de todos los partes diarios (C-1)
-function computeMaterialUsedQty(mat: any, advances: any[]): number {
-  const baseInitial = Number(mat.initialUsedQty || 0);
-  const consumedFromAdvances = (advances || []).reduce((acc: number, adv: any) => {
-    if (!adv || adv.isSecondarySharedCopy || !Array.isArray(adv.materialsUsedToday)) {
-      return acc;
-    }
-    const matSumInAdvance = adv.materialsUsedToday.reduce((subAcc: number, u: any) => {
-      if (!u) return subAcc;
-      if (u.materialId) {
-        return u.materialId === mat.id ? subAcc + Number(u.qty || 0) : subAcc;
-      }
-      // Soporte retrocompatible para registros antiguos sin materialId verificando el galpón
-      const sameCode =
-        String(u.code || '').trim().toUpperCase() ===
-        String(mat.code || '').trim().toUpperCase();
-      const sameGalpon = !mat.galponId || adv.galponId === mat.galponId;
-      return sameCode && sameGalpon ? subAcc + Number(u.qty || 0) : subAcc;
-    }, 0);
-    return acc + matSumInAdvance;
-  }, 0);
-  return Math.max(0, Math.round((baseInitial + consumedFromAdvances) * 100) / 100);
-}
-
 function recalculateMaterialsFromAdvances(materialsList: any[], advancesList: any[]): any[] {
+  const usedQuantity = indexMaterialConsumption(advancesList);
   return (materialsList || []).map((mat) => ({
     ...mat,
-    usedQty: computeMaterialUsedQty(mat, advancesList)
+    usedQty: usedQuantity(mat)
   }));
-}
-
-// Exportación CSV compatible con Excel con BOM UTF-8 y escape completo de comillas, comas, punto y coma y saltos de línea (C-8)
-function escapeCsvCell(value: any): string {
-  if (value === null || value === undefined) return '""';
-  const str = String(value).replace(/\r\n/g, ' ').replace(/[\r\n]/g, ' ');
-  const escaped = str.replace(/"/g, '""');
-  return `"${escaped}"`;
 }
 
 function downloadCsvFile(
@@ -607,8 +594,22 @@ function normalizeHeaderKey(str: string): string {
 // ============================================================================
 
 export default function App() {
+  const { profile, openUserAdminModal, canManageUsers, logout } = useAuthProfile();
+  const scopeKey = operationalScopeKey(profile);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [currentTab, setCurrentTab] = useState('dashboard');
+  const [requestedTab, setRequestedTab] = useState(() => window.location.hash.replace(/^#\/?/, ''));
+  const currentTab = resolveModule(profile, requestedTab);
+  const setCurrentTab = (module: string) => {
+    const allowed = resolveModule(profile, module);
+    if (allowed !== module) return;
+    window.location.hash = '/' + allowed;
+    setRequestedTab(allowed);
+  };
+  useEffect(() => {
+    const readRoute = () => setRequestedTab(window.location.hash.replace(/^#\/?/, ''));
+    window.addEventListener('hashchange', readRoute);
+    return () => window.removeEventListener('hashchange', readRoute);
+  }, []);
 
   useEffect(() => {
     setSidebarOpen(false);
@@ -617,7 +618,7 @@ export default function App() {
   // Plantillas / Proveedores (Inician vacíos)
   const [technologies, setTechnologies] = useState<string[]>(() => {
     try {
-      const s = localStorage.getItem('calera_technologies_clean');
+      const s = localStorage.getItem(scopeKey + ':calera_technologies_clean');
       return s ? JSON.parse(s) : DEFAULT_TECHNOLOGIES;
     } catch {
       return DEFAULT_TECHNOLOGIES;
@@ -627,7 +628,7 @@ export default function App() {
   // Catálogo Maestro de Actividades (Inicia vacío y filtra únicamente registros activos)
   const [masterCatalog, setMasterCatalog] = useState<any[]>(() => {
     try {
-      const s = localStorage.getItem('calera_master_catalog_clean');
+      const s = localStorage.getItem(scopeKey + ':calera_master_catalog_clean');
       return s ? getActiveMasterCatalog(JSON.parse(s)) : [];
     } catch {
       return [];
@@ -642,7 +643,7 @@ export default function App() {
   // Sectores y Galpones (Inician vacíos)
   const [sectors, setSectors] = useState<any[]>(() => {
     try {
-      const s = localStorage.getItem('calera_sectors_clean');
+      const s = localStorage.getItem(scopeKey + ':calera_sectors_clean');
       return s ? JSON.parse(s) : [];
     } catch {
       return [];
@@ -651,7 +652,7 @@ export default function App() {
 
   const [selectedSectorId, setSelectedSectorId] = useState<string>(() => {
     try {
-      const saved = localStorage.getItem('calera_active_selection_v1');
+      const saved = localStorage.getItem(scopeKey + ':calera_active_selection_v1');
       if (saved) {
         const parsed = JSON.parse(saved);
         return typeof parsed?.sectorId === 'string' ? parsed.sectorId : '';
@@ -663,7 +664,7 @@ export default function App() {
   });
   const [selectedGalponId, setSelectedGalponId] = useState<string>(() => {
     try {
-      const saved = localStorage.getItem('calera_active_selection_v1');
+      const saved = localStorage.getItem(scopeKey + ':calera_active_selection_v1');
       if (saved) {
         const parsed = JSON.parse(saved);
         return typeof parsed?.galponId === 'string' ? parsed.galponId : '';
@@ -678,7 +679,7 @@ export default function App() {
   // Avances Diarios (Inician vacíos)
   const [dailyAdvances, setDailyAdvances] = useState<any[]>(() => {
     try {
-      const s = localStorage.getItem('calera_advances_clean');
+      const s = localStorage.getItem(scopeKey + ':calera_advances_clean');
       return s ? JSON.parse(s) : [];
     } catch {
       return [];
@@ -688,8 +689,9 @@ export default function App() {
   // Planilla de Personal (Inicia vacía)
   const [masterWorkforce, setMasterWorkforce] = useState<any[]>(() => {
     try {
-      const s = localStorage.getItem('calera_workforce_clean');
-      return s ? JSON.parse(s) : [];
+      const s = localStorage.getItem(scopeKey + ':calera_workforce_clean');
+      const saved = s ? JSON.parse(s) : [];
+      return Array.isArray(saved) ? saved.filter(worker => worker && typeof worker.id === 'string').map(workerForDisplay) : [];
     } catch {
       return [];
     }
@@ -698,7 +700,7 @@ export default function App() {
   // Materiales por Estructura (Inician vacíos)
   const [materials, setMaterials] = useState<any[]>(() => {
     try {
-      const s = localStorage.getItem('calera_materials_clean');
+      const s = localStorage.getItem(scopeKey + ':calera_materials_clean');
       return s ? JSON.parse(s) : [];
     } catch {
       return [];
@@ -710,7 +712,7 @@ export default function App() {
     Record<string, Record<string, string>>
   >(() => {
     try {
-      const s = localStorage.getItem('calera_attendance_clean');
+      const s = localStorage.getItem(scopeKey + ':calera_attendance_clean');
       return s ? JSON.parse(s) : {};
     } catch {
       return {};
@@ -733,10 +735,15 @@ export default function App() {
       action: 'REGISTRO' | 'MODIFICACIÓN' | 'ELIMINACIÓN';
       module: string;
       description: string;
+      targetId?: string;
+      projectCode?: string;
+      sectorId?: string;
+      galponId?: string;
+      requestId?: string;
     }[]
   >(() => {
     try {
-      const s = localStorage.getItem('calera_audit_logs_clean');
+      const s = localStorage.getItem(scopeKey + ':calera_audit_logs_clean');
       return s ? JSON.parse(s) : [];
     } catch {
       return [];
@@ -745,7 +752,7 @@ export default function App() {
 
   const [activeUserName, setActiveUserName] = useState<string>(() => {
     try {
-      return localStorage.getItem('calera_active_user_clean') || '';
+      return localStorage.getItem(scopeKey + ':calera_active_user_clean') || '';
     } catch {
       return '';
     }
@@ -754,6 +761,18 @@ export default function App() {
   const [filterLogAction, setFilterLogAction] = useState<string>('Todas');
   const [filterLogModule, setFilterLogModule] = useState<string>('Todos');
   const [searchLogText, setSearchLogText] = useState<string>('');
+  const [movementPage, setMovementPage] = useState(1);
+  const movementModules = useMemo(() => [...new Set(auditLogs.map(log => log.module))].sort(), [auditLogs]);
+  const visibleMovements = useMemo(() => {
+    const search = searchLogText.trim().toLowerCase();
+    return auditLogs.filter(log => (filterLogAction === 'Todas' || log.action === filterLogAction) &&
+      (filterLogModule === 'Todos' || log.module === filterLogModule) &&
+      (!search || [log.description, log.user, log.module, log.action, log.projectCode, log.sectorId, log.galponId, log.targetId, log.requestId]
+        .some(value => String(value ?? '').toLowerCase().includes(search))));
+  }, [auditLogs, filterLogAction, filterLogModule, searchLogText]);
+  const movementPageCount = Math.max(1, Math.ceil(visibleMovements.length / MOVEMENTS_PAGE_SIZE));
+  const visibleMovementPage = Math.min(movementPage, movementPageCount);
+  const movementPageStart = (visibleMovementPage - 1) * MOVEMENTS_PAGE_SIZE;
 
   // Filtros
   const [dashSistemaLocFilter, setDashSistemaLocFilter] = useState<
@@ -788,6 +807,7 @@ export default function App() {
   const [editingCatalogId, setEditingCatalogId] = useState<string | null>(null);
   const [modalManageTemplates, setModalManageTemplates] = useState(false);
   const [modalNewMaterial, setModalNewMaterial] = useState(false);
+  const [materialError, setMaterialError] = useState('');
   const [editingMaterialId, setEditingMaterialId] = useState<string | null>(null);
   const [modalBulkUpload, setModalBulkUpload] = useState<
     'catalogo' | 'materiales' | 'personal' | null
@@ -795,6 +815,9 @@ export default function App() {
   const [bulkCsvText, setBulkCsvText] = useState<string>('');
   const [bulkRawRows, setBulkRawRows] = useState<string[][]>([]);
   const [bulkFileName, setBulkFileName] = useState<string>('');
+  const [bulkFileError, setBulkFileError] = useState('');
+  const [queuingPersonalImport, setQueuingPersonalImport] = useState(false);
+  const bulkReadId = useRef(0);
   const [bulkTargetGalponId, setBulkTargetGalponId] = useState<string>('');
 
   // Estados de Filtros y Paginación para Informes Globales (Etapa 3.1)
@@ -812,6 +835,7 @@ export default function App() {
       | 'sector'
       | 'galpon'
       | 'activity'
+      | 'gantt_withdrawal'
       | 'material'
       | 'worker'
       | 'advance'
@@ -839,9 +863,9 @@ export default function App() {
       catalogItems?: number;
       extraInfo?: string;
     };
-    mode?: 'preserve_unassign' | 'cascade_delete';
     deleteLinkedSharedAdvance?: boolean;
   } | null>(null);
+  const [queuingGanttWithdrawal, setQueuingGanttWithdrawal] = useState(false);
 
   // Estados de Formularios (Sin valores predeterminados forzados)
   const [formProject, setFormProject] = useState({
@@ -858,7 +882,7 @@ export default function App() {
     code: '',
     name: '',
     description: '',
-    supervisorsStr: '',
+    responsible: '',
     startDate: '',
     endDate: '',
     technology: ''
@@ -874,7 +898,7 @@ export default function App() {
     locationType: 'Todos',
     sistemaName: '',
     structureName: '',
-    activityCode: '',
+    activityId: '',
     date: '',
     quantityToday: '',
     hoursWorked: '',
@@ -885,6 +909,7 @@ export default function App() {
     sharedAcrossTwoGalpones: false,
     secondGalponId: '',
     splitMode: '100_both' as '100_both' | '50_50',
+    workerIds: [] as string[],
     manualMaterialInputs: {} as Record<string, string>
   });
 
@@ -961,15 +986,19 @@ export default function App() {
   });
 
   const [newTemplateName, setNewTemplateName] = useState('');
+  const [templateCopyBusy, setTemplateCopyBusy] = useState(false);
+  const [templateCopyError, setTemplateCopyError] = useState('');
+  const templateCopyRequest = useRef<{ source: string; name: string; id: string }>();
   const [editingTemplateIndex, setEditingTemplateIndex] = useState<number | null>(null);
   const [editingTemplateValue, setEditingTemplateValue] = useState('');
 
   // Contexto de Autenticación, Matriz de Roles y Sincronización Firestore en Tiempo Real
-  const { profile, openUserAdminModal, logout } = useAuthProfile();
   const [permissionNotice, setPermissionNotice] = useState<string | null>(null);
 
   const {
     syncStatus,
+    syncStorageError,
+    confirmedAdvances,
     lastSyncedAt,
     isNetworkOnline,
     connectionIndicatorState,
@@ -980,8 +1009,11 @@ export default function App() {
     lastSyncSummary,
     isManualSyncing,
     triggerManualSync,
-    resolveSyncConflict,
-    recordAuditMovement
+    refreshOperationalData,
+    queueOperationLocally,
+    dismissAttendanceConflict,
+    retryGanttWithdrawal,
+    resolveSyncConflict
   } = useFirestoreOperationalSync({
     profile,
     technologies,
@@ -1025,33 +1057,28 @@ export default function App() {
     return false;
   };
 
-  // Filtrado de Sectores y Galpones según el alcance asignado al usuario (Sector / Galpón / Proyecto)
-  const scopedSectors = useMemo(() => {
-    return filterSectorsByScope(sectors, profile);
-  }, [sectors, profile]);
-
   // Caché local de respaldo (Firestore es la fuente principal de verdad)
   useEffect(() => {
-    localStorage.setItem('calera_technologies_clean', JSON.stringify(technologies));
+    localStorage.setItem(scopeKey + ':calera_technologies_clean', JSON.stringify(technologies));
   }, [technologies]);
 
   useEffect(() => {
-    localStorage.setItem('calera_master_catalog_clean', JSON.stringify(masterCatalog));
+    localStorage.setItem(scopeKey + ':calera_master_catalog_clean', JSON.stringify(masterCatalog));
   }, [masterCatalog]);
 
   useEffect(() => {
-    localStorage.setItem('calera_sectors_clean', JSON.stringify(sectors));
-    if (scopedSectors.length === 0) {
+    localStorage.setItem(scopeKey + ':calera_sectors_clean', JSON.stringify(sectors));
+    if (sectors.length === 0) {
       if (selectedSectorId !== '') setSelectedSectorId('');
       if (selectedGalponId !== '') setSelectedGalponId('');
       return;
     }
 
-    const existingSector = scopedSectors.find((s) => s.id === selectedSectorId);
+    const existingSector = sectors.find((s) => s.id === selectedSectorId);
     if (!existingSector) {
       if (!hasInitializedSelectionRef.current) {
         hasInitializedSelectionRef.current = true;
-        const firstSec = scopedSectors[0];
+        const firstSec = sectors[0];
         setSelectedSectorId(firstSec.id);
         const galStillValid = firstSec.galpones?.some(
           (g: any) => g.id === selectedGalponId
@@ -1063,7 +1090,7 @@ export default function App() {
         );
       } else {
         // Si el sector seleccionado fue eliminado o dejó de estar autorizado, seleccionar el primero válido pero limpiar galpón inválido
-        const fallbackSec = scopedSectors[0];
+        const fallbackSec = sectors[0];
         setSelectedSectorId(fallbackSec.id);
         const galValidInFallback = fallbackSec.galpones?.some(
           (g: any) => g.id === selectedGalponId
@@ -1083,12 +1110,12 @@ export default function App() {
       // El galpón seleccionado ya no pertenece al sector actual: limpiar sin elegir otro silenciosamente
       setSelectedGalponId('');
     }
-  }, [sectors, scopedSectors, selectedSectorId, selectedGalponId]);
+  }, [sectors, selectedSectorId, selectedGalponId]);
 
   useEffect(() => {
     try {
       localStorage.setItem(
-        'calera_active_selection_v1',
+        scopeKey + ':calera_active_selection_v1',
         JSON.stringify({
           sectorId: selectedSectorId,
           galponId: selectedGalponId
@@ -1100,56 +1127,28 @@ export default function App() {
   }, [selectedSectorId, selectedGalponId]);
 
   useEffect(() => {
-    localStorage.setItem('calera_advances_clean', JSON.stringify(dailyAdvances));
+    localStorage.setItem(scopeKey + ':calera_advances_clean', JSON.stringify(dailyAdvances));
   }, [dailyAdvances]);
 
   useEffect(() => {
-    localStorage.setItem('calera_workforce_clean', JSON.stringify(masterWorkforce));
+    localStorage.setItem(scopeKey + ':calera_workforce_clean', JSON.stringify(masterWorkforce));
   }, [masterWorkforce]);
 
   useEffect(() => {
-    localStorage.setItem('calera_materials_clean', JSON.stringify(materials));
+    localStorage.setItem(scopeKey + ':calera_materials_clean', JSON.stringify(materials));
   }, [materials]);
 
   useEffect(() => {
-    localStorage.setItem('calera_attendance_clean', JSON.stringify(attendanceRecords));
+    localStorage.setItem(scopeKey + ':calera_attendance_clean', JSON.stringify(attendanceRecords));
   }, [attendanceRecords]);
 
   useEffect(() => {
-    localStorage.setItem('calera_audit_logs_clean', JSON.stringify(auditLogs));
+    localStorage.setItem(scopeKey + ':calera_audit_logs_clean', JSON.stringify(auditLogs));
   }, [auditLogs]);
 
   useEffect(() => {
-    localStorage.setItem('calera_active_user_clean', activeUserName);
+    localStorage.setItem(scopeKey + ':calera_active_user_clean', activeUserName);
   }, [activeUserName]);
-
-  const recordUserMovement = (
-    action: 'REGISTRO' | 'MODIFICACIÓN' | 'ELIMINACIÓN',
-    module: string,
-    description: string,
-    _customUser?: string
-  ) => {
-    if (profile) {
-      recordAuditMovement(action, module, description);
-      return;
-    }
-    const now = new Date();
-    const timestamp = `${getSystemToday()} ${String(now.getHours()).padStart(
-      2,
-      '0'
-    )}:${String(now.getMinutes()).padStart(2, '0')}:${String(
-      now.getSeconds()
-    ).padStart(2, '0')}`;
-    const entry = {
-      id: generateId('log'),
-      timestamp,
-      user: (activeUserName || 'Administrador').trim(),
-      action,
-      module,
-      description
-    };
-    setAuditLogs((prev) => [entry, ...prev]);
-  };
 
   // ==========================================================================
   // SELECTORES Y CÁLCULOS PRINCIPALES (RESPETANDO ALCANCE POR SECTOR Y GALPÓN)
@@ -1157,11 +1156,11 @@ export default function App() {
   const dynamicContext = useMemo(
     () =>
       resolveDynamicSectorGalponContext(
-        scopedSectors,
+        sectors,
         selectedSectorId,
         selectedGalponId
       ),
-    [scopedSectors, selectedSectorId, selectedGalponId]
+    [sectors, selectedSectorId, selectedGalponId]
   );
 
   const currentSector = dynamicContext.currentSector;
@@ -1171,7 +1170,7 @@ export default function App() {
   const handleSelectSector = (secId: string) => {
     hasInitializedSelectionRef.current = true;
     setSelectedSectorId(secId);
-    const sec = scopedSectors.find((s) => s.id === secId);
+    const sec = sectors.find((s) => s.id === secId);
     const isStillValid = Boolean(
       sec &&
         selectedGalponId &&
@@ -1196,7 +1195,7 @@ export default function App() {
       sectorName: string;
       areas: any[];
     }[] = [];
-    scopedSectors.forEach((sec) => {
+    sectors.forEach((sec) => {
       (sec.galpones || []).forEach((g: any) => {
         list.push({
           id: g.id,
@@ -1211,7 +1210,7 @@ export default function App() {
       });
     });
     return list;
-  }, [scopedSectors]);
+  }, [sectors]);
 
   // Estructuras activas en el Catálogo Maestro según el Área y Sistema del editor del catálogo
   const availableCatalogEditorStructures = useMemo(() => {
@@ -1399,7 +1398,12 @@ export default function App() {
   ]);
 
   // Actividades evaluadas del galpón activo (Unificando modalidad por Cantidades y por Porcentaje)
-  const evaluatedActivities = useMemo(() => {
+  const ambiguousCodesByBarn = useMemo(() => new Map(allGalponesList.map(barn =>
+    [barn.id, ambiguousActivityCodes(barnActivities(barn))])), [allGalponesList]);
+  const activityAdvances = useMemo(() => indexActivityAdvances(confirmedAdvances, ambiguousCodesByBarn),
+    [confirmedAdvances, ambiguousCodesByBarn]);
+  const usedMaterialQuantity = useMemo(() => indexMaterialConsumption(dailyAdvances), [dailyAdvances]);
+  const evaluatedActivities: EvaluatedActivityItem[] = useMemo(() => {
     if (!currentGalpon || !currentGalpon.areas) return [];
     const list: any[] = [];
     const todayStr = getSystemToday();
@@ -1409,12 +1413,7 @@ export default function App() {
         area.sistemas.forEach((sis: any) => {
           sis.structures?.forEach((str: any) => {
             str.activities?.forEach((act: any) => {
-              const logsForAct = dailyAdvances.filter(
-                (l) =>
-                  l.galponId === currentGalpon.id &&
-                  ((l.activityId && l.activityId === act.id) ||
-                    l.activityCode === act.code)
-              );
+              const logsForAct = activityAdvances(currentGalpon.id, act.id, act.code);
               const evalRes = evaluateActivityProgress(act, logsForAct, todayStr);
 
               // Asociación inequívoca: Galpón + Área + Sistema + Estructura (por ID único cuando está disponible)
@@ -1443,7 +1442,7 @@ export default function App() {
                 })
                 .map((m) => ({
                   ...m,
-                  usedQty: computeMaterialUsedQty(m, dailyAdvances)
+                  usedQty: usedMaterialQuantity(m)
                 }));
 
               list.push({
@@ -1482,12 +1481,7 @@ export default function App() {
       } else if (area.structures) {
         area.structures.forEach((str: any) => {
           str.activities?.forEach((act: any) => {
-            const logsForAct = dailyAdvances.filter(
-              (l) =>
-                l.galponId === currentGalpon.id &&
-                ((l.activityId && l.activityId === act.id) ||
-                  l.activityCode === act.code)
-            );
+            const logsForAct = activityAdvances(currentGalpon.id, act.id, act.code);
             const evalRes = evaluateActivityProgress(act, logsForAct, todayStr);
 
             // Asociación inequívoca: Galpón + Área + Estructura (por ID único cuando está disponible)
@@ -1511,7 +1505,7 @@ export default function App() {
               })
               .map((m) => ({
                 ...m,
-                usedQty: computeMaterialUsedQty(m, dailyAdvances)
+                usedQty: usedMaterialQuantity(m)
               }));
 
             list.push({
@@ -1549,7 +1543,7 @@ export default function App() {
     });
 
     return list;
-  }, [currentGalpon, dailyAdvances, materials]);
+  }, [currentGalpon, activityAdvances, materials, usedMaterialQuantity]);
 
   // Avance Ponderado General del Galpón (reutilizando selector puro compartido con el Dashboard)
   const galponWeightedProgress = useMemo(() => {
@@ -1644,12 +1638,30 @@ export default function App() {
     const clean = newTemplateName.trim();
     if (!clean || technologies.includes(clean)) return;
     setTechnologies((prev) => [...prev, clean]);
-    recordUserMovement(
-      'REGISTRO',
-      'Catálogo Maestro',
-      `Registró plantilla/proveedor "${clean}"`
-    );
     setNewTemplateName('');
+  };
+
+  const handleDuplicateTemplate = async (source: string) => {
+    if (!requirePermission('catalogo', 'create') || templateCopyBusy) return;
+    const name = newTemplateName.trim();
+    if (!name) { setTemplateCopyError('Ingrese el nombre de la copia.'); return; }
+    let operation = templateCopyRequest.current;
+    if (!operation || operation.source !== source || operation.name !== name) {
+      operation = { source, name, id: crypto.randomUUID() };
+      templateCopyRequest.current = operation;
+    }
+    setTemplateCopyBusy(true);
+    setTemplateCopyError('');
+    try {
+      await duplicateCatalogTemplate(bindOperationalData(profile), source, name, operation.id);
+      await refreshOperationalData();
+      templateCopyRequest.current = undefined;
+      setNewTemplateName('');
+    } catch (error) {
+      setTemplateCopyError(error instanceof Error ? error.message : 'No se pudo confirmar la copia.');
+    } finally {
+      setTemplateCopyBusy(false);
+    }
   };
 
   const handleSaveRenameTemplate = (idx: number) => {
@@ -1674,11 +1686,6 @@ export default function App() {
           g.technology === oldName ? { ...g, technology: newName } : g
         )
       }))
-    );
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Catálogo Maestro',
-      `Renombró plantilla/proveedor de "${oldName}" a "${newName}"`
     );
     setEditingTemplateIndex(null);
     setEditingTemplateValue('');
@@ -1724,13 +1731,13 @@ export default function App() {
     setModalNewCatalogItem(true);
   };
 
-  const openEditCatalogModal = (item: any) => {
-    if (!requirePermission('catalogo', 'edit')) return;
-    setEditingCatalogId(item.id);
+  const openEditCatalogModal = (item: any, duplicate = false) => {
+    if (!requirePermission('catalogo', duplicate ? 'create' : 'edit')) return;
+    setEditingCatalogId(duplicate ? null : item.id);
     const mode = normalizeProgressMode(item.progressMode);
     setFormCatalogItem({
       technology: item.technology || '',
-      code: item.code || '',
+      code: duplicate ? '' : item.code || '',
       progressMode: mode,
       areaName: item.areaName || '',
       locationType: item.locationType || '',
@@ -1793,23 +1800,18 @@ export default function App() {
       plannedHH: Number(formCatalogItem.plannedHH) || 0,
       durationDays: Number(formCatalogItem.durationDays) || 1
     };
+    const catalogKey = catalogCodeKey(payload.technology, payload.code);
+    if (activeMasterCatalog.some(item => item.id !== editingCatalogId && catalogCodeKey(item.technology, item.code) === catalogKey)) {
+      setPermissionNotice('Ese código ya existe en la plantilla.');
+      return;
+    }
 
     if (editingCatalogId) {
       setMasterCatalog((prev) =>
         prev.map((c) => (c.id === editingCatalogId ? payload : c))
       );
-      recordUserMovement(
-        'MODIFICACIÓN',
-        'Catálogo Maestro',
-        `Modificó actividad maestra [${payload.code}] ${payload.name} (${getProgressModeLabel(mode)} • ${payload.technology} • ${payload.areaName})`
-      );
     } else {
       setMasterCatalog((prev) => [...prev, payload]);
-      recordUserMovement(
-        'REGISTRO',
-        'Catálogo Maestro',
-        `Registró actividad maestra [${payload.code}] ${payload.name} (${getProgressModeLabel(mode)} • ${payload.technology} • ${payload.areaName})`
-      );
     }
 
     setModalNewCatalogItem(false);
@@ -1873,11 +1875,6 @@ export default function App() {
     };
 
     setSectors((prev) => [...prev, newSecObj]);
-    recordUserMovement(
-      'REGISTRO',
-      'Sectores y Galpones',
-      `Registró nuevo sector [${newSecObj.code}] ${newSecObj.name}`
-    );
     setSelectedSectorId(newSecObj.id);
     setSelectedGalponId('');
     setModalNewProject(false);
@@ -1889,7 +1886,7 @@ export default function App() {
     if (!requirePermission('proyectos', 'edit')) return;
     if (!formProject.id || !formProject.name) return;
     const targetSec = sectors.find((s) => s.id === formProject.id);
-    if (!targetSec || !canAccessSector(profile, targetSec)) return;
+    if (!targetSec) return;
 
     const updatedCode = formProject.code.trim().toUpperCase();
     const updatedName = formProject.name.trim().toUpperCase();
@@ -1907,18 +1904,13 @@ export default function App() {
           : s
       )
     );
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Sectores y Galpones',
-      `Modificó sector [${updatedCode}] ${updatedName}`
-    );
     setModalEditProject(false);
   };
 
   const requestDeleteSector = (secId: string) => {
     if (!requirePermission('proyectos', 'delete')) return;
     const targetSec = sectors.find((s) => s.id === secId);
-    if (!targetSec || !canAccessSector(profile, targetSec)) return;
+    if (!targetSec) return;
 
     const galponIds = new Set<string>(
       (targetSec.galpones || []).map((g: any) => g.id)
@@ -1962,7 +1954,6 @@ export default function App() {
         materials: materialsCount,
         workers: workersCount
       },
-      mode: 'preserve_unassign'
     });
   };
 
@@ -1973,7 +1964,7 @@ export default function App() {
     if (!formGalpon.code || !formGalpon.name || !targetSecId || !formGalpon.technology)
       return;
     const targetSecObj = sectors.find((s) => s.id === targetSecId);
-    if (!targetSecObj || !canAccessSector(profile, targetSecObj)) return;
+    if (!targetSecObj) return;
 
     const chosenTech = formGalpon.technology.trim();
     const generatedAreas = buildAreasFromCatalog(
@@ -1982,12 +1973,6 @@ export default function App() {
       formGalpon.startDate
     );
 
-    const supList = formGalpon.supervisorsStr
-      ? formGalpon.supervisorsStr
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : [];
 
     const newGalponObj = {
       id: generateId('gal'),
@@ -1996,7 +1981,7 @@ export default function App() {
       name: formGalpon.name.trim().toUpperCase(),
       technology: chosenTech,
       description: formGalpon.description.trim(),
-      supervisors: supList,
+      responsible: formGalpon.responsible.trim(),
       startDate: formGalpon.startDate,
       endDate: formGalpon.endDate,
       status: 'En ejecución',
@@ -2009,11 +1994,6 @@ export default function App() {
           ? { ...s, galpones: [...(s.galpones || []), newGalponObj] }
           : s
       )
-    );
-    recordUserMovement(
-      'REGISTRO',
-      'Sectores y Galpones',
-      `Registró nuevo galpón [${newGalponObj.code}] ${newGalponObj.name} en sector ${targetSecObj?.name || ''} (Proveedor: ${chosenTech})`
     );
     setSelectedSectorId(targetSecId);
     setSelectedGalponId(newGalponObj.id);
@@ -2028,15 +2008,9 @@ export default function App() {
       (s.galpones || []).some((g: any) => g.id === formGalpon.id)
     );
     const targetGalObj = parentSec?.galpones?.find((g: any) => g.id === formGalpon.id);
-    if (!parentSec || !targetGalObj || !canAccessGalpon(profile, targetGalObj, parentSec.id))
+    if (!parentSec || !targetGalObj)
       return;
 
-    const supList = formGalpon.supervisorsStr
-      ? formGalpon.supervisorsStr
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : [];
 
     const updatedCode = formGalpon.code.trim().toUpperCase();
     const updatedName = formGalpon.name.trim().toUpperCase();
@@ -2055,7 +2029,7 @@ export default function App() {
             name: updatedName,
             technology: cleanTech,
             description: formGalpon.description.trim(),
-            supervisors: supList,
+            responsible: formGalpon.responsible.trim(),
             startDate: formGalpon.startDate,
             endDate: formGalpon.endDate,
             // Sincronización aditiva cuando cambia la plantilla, conservando actividades personalizadas e IDs de estructuras (C-3)
@@ -2073,11 +2047,6 @@ export default function App() {
       }))
     );
 
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Sectores y Galpones',
-      `Modificó galpón [${updatedCode}] ${updatedName} (Proveedor: ${cleanTech})`
-    );
     setModalEditGalpon(false);
   };
 
@@ -2085,7 +2054,7 @@ export default function App() {
     if (!requirePermission('proyectos', 'delete')) return;
     const sec = sectors.find((s) => s.id === secId);
     const targetGal = sec?.galpones?.find((g: any) => g.id === galId);
-    if (!sec || !targetGal || !canAccessGalpon(profile, targetGal, secId)) return;
+    if (!sec || !targetGal) return;
 
     let activitiesCount = 0;
     (targetGal.areas || []).forEach((area: any) => {
@@ -2119,131 +2088,37 @@ export default function App() {
         materials: materialsCount,
         workers: workersCount
       },
-      mode: 'preserve_unassign'
     });
   };
 
-  const handleConfirmDeleteEntity = () => {
-    if (!deleteConfirmModal) return;
-    const { type, entityId, sectorId, galponId, code, name, mode } = deleteConfirmModal;
+  const handleConfirmDeleteEntity = async () => {
+    if (!deleteConfirmModal || queuingGanttWithdrawal) return;
+    const { type, entityId, sectorId, galponId, code, name } = deleteConfirmModal;
+    const module: AppModuleId = type === 'gantt_withdrawal' ? 'gantt' : type === 'activity' ? 'actividades' :
+      type === 'sector' || type === 'galpon' ? 'proyectos' : type === 'advance' ? 'avance_diario' :
+      type === 'material' ? 'materiales' : type === 'worker' ? 'personal' : 'catalogo';
+    if (!requirePermission(module, 'delete')) return;
 
-    if (type === 'sector') {
-      const targetSec = sectors.find((s) => s.id === sectorId);
-      const galponIds = new Set<string>(
-        (targetSec?.galpones || []).map((g: any) => g.id)
-      );
-
-      const nextAdvances = dailyAdvances.filter(
-        (a) => a.sectorId !== sectorId && !galponIds.has(a.galponId)
-      );
-      setDailyAdvances(nextAdvances);
-
-      setMaterials((prevMats) => {
-        const updatedMats =
-          mode === 'cascade_delete'
-            ? prevMats.filter(
-                (m) =>
-                  m.sectorId !== sectorId &&
-                  (!m.galponId || !galponIds.has(m.galponId))
-              )
-            : prevMats.map((m) => {
-                if (
-                  m.sectorId === sectorId ||
-                  (m.galponId && galponIds.has(m.galponId))
-                ) {
-                  return {
-                    ...m,
-                    sectorId: '',
-                    galponId: '',
-                    areaId: '',
-                    sistemaId: '',
-                    structureId: ''
-                  };
-                }
-                return m;
-              });
-        return recalculateMaterialsFromAdvances(updatedMats, nextAdvances);
+    if ((type === 'sector' || type === 'galpon' || type === 'gantt_withdrawal') && sectorId) {
+      const sector = sectors.find(item => item.id === sectorId);
+      if (!sector || (type !== 'sector' && !sector.galpones.some((barn: any) => barn.id === galponId))) return;
+      const revision = sector._revision ?? 0;
+      const queuedOperation = type === 'gantt_withdrawal' ? {
+        ganttWithdrawal: true as const, galponId, activityId: entityId, operationType: 'upsert' as const
+      } : type === 'sector' ? { structuralDeletion: true as const, operationType: 'delete' as const } : {
+        structuralDeletion: true as const, galponId, operationType: 'upsert' as const,
+        baseSector: sector, payload: { ...sector, galpones: sector.galpones.filter((barn: any) => barn.id !== galponId) }
+      };
+      setQueuingGanttWithdrawal(true);
+      const queued = await queueOperationLocally({
+        ...queuedOperation, collectionName: 'sectors', documentId: sectorId, expectedRevision: revision, status: 'pending_sync'
       });
-
-      setMasterWorkforce((prevWorkers) =>
-        prevWorkers.map((w) => {
-          if (
-            w.sectorId === sectorId ||
-            (w.galponId && galponIds.has(w.galponId))
-          ) {
-            return { ...w, sectorId: '', galponId: '' };
-          }
-          return w;
-        })
-      );
-
-      setSectors((prev) => {
-        const next = prev.filter((s) => s.id !== sectorId);
-        if (selectedSectorId === sectorId) {
-          setSelectedSectorId(next[0]?.id || '');
-          setSelectedGalponId('');
-        }
-        return next;
-      });
-
-      recordUserMovement(
-        'ELIMINACIÓN',
-        'Sectores y Galpones',
-        `Eliminó sector [${code}] ${name} (${mode === 'preserve_unassign' ? 'materiales y operarios conservados como Sin galpón asignado' : 'eliminación en cascada de registros asociados'})`
-      );
-    } else if (type === 'galpon' && galponId) {
-      const nextAdvances = dailyAdvances.filter((a) => a.galponId !== galponId);
-      setDailyAdvances(nextAdvances);
-
-      setMaterials((prevMats) => {
-        const updatedMats =
-          mode === 'cascade_delete'
-            ? prevMats.filter((m) => m.galponId !== galponId)
-            : prevMats.map((m) => {
-                if (m.galponId === galponId) {
-                  return {
-                    ...m,
-                    sectorId: '',
-                    galponId: '',
-                    areaId: '',
-                    sistemaId: '',
-                    structureId: ''
-                  };
-                }
-                return m;
-              });
-        return recalculateMaterialsFromAdvances(updatedMats, nextAdvances);
-      });
-
-      setMasterWorkforce((prevWorkers) =>
-        prevWorkers.map((w) =>
-          w.galponId === galponId ? { ...w, galponId: '' } : w
-        )
-      );
-
-      const targetGal = allGalponesList.find((g) => g.id === galponId);
-      setSectors((prev) =>
-        prev.map((s) => {
-          if (s.id !== sectorId) return s;
-          const nextGals = (s.galpones || []).filter((g: any) => g.id !== galponId);
-          if (selectedGalponId === galponId) {
-            setSelectedGalponId('');
-          }
-          return recordGalponDeletionTombstone(
-            { ...s, galpones: nextGals },
-            galponId,
-            activeUserName
-          );
-        })
-      );
-
-      recordUserMovement(
-        'ELIMINACIÓN',
-        'Sectores y Galpones',
-        `Eliminó galpón [${code}] ${name} del sector ${targetGal?.sectorName || ''} (${mode === 'preserve_unassign' ? 'materiales y operarios conservados como Sin galpón asignado' : 'eliminación en cascada de registros asociados'})`
-      );
+      setQueuingGanttWithdrawal(false);
+      if (!queued) {
+        setDeleteConfirmModal(current => current ? { ...current, extraDetails: 'No se pudo guardar la operación en la cola. Vuelva a intentar.' } : null);
+        return;
+      }
     } else if (type === 'activity' && entityId && sectorId && galponId) {
-      const targetAct = evaluatedActivities.find((a) => a.id === entityId);
       setSectors((prev) =>
         prev.map((s) => {
           if (s.id !== sectorId) return s;
@@ -2288,40 +2163,10 @@ export default function App() {
         })
       );
 
-      // Si el usuario confirma eliminar la actividad, también limpiamos sus avances diarios en este galpón y recalculamos materiales
-      const nextAdvances = dailyAdvances.filter(
-        (a) =>
-          !(
-            a.galponId === galponId &&
-            (a.activityId === entityId ||
-              (targetAct?.code && a.activityCode === targetAct.code))
-          )
-      );
-      setDailyAdvances(nextAdvances);
-      setMaterials((prevMats) =>
-        recalculateMaterialsFromAdvances(prevMats, nextAdvances)
-      );
-
-      const targetGal = allGalponesList.find((g) => g.id === galponId);
-      recordUserMovement(
-        'ELIMINACIÓN',
-        'Actividades',
-        `Eliminó actividad [${code}] ${name} del galpón ${targetGal?.code || galponId}`
-      );
     } else if (type === 'material' && entityId) {
       setMaterials((prev) => prev.filter((m) => m.id !== entityId));
-      recordUserMovement(
-        'ELIMINACIÓN',
-        'Materiales',
-        `Eliminó material [${code}] ${name}`
-      );
     } else if (type === 'worker' && entityId) {
       setMasterWorkforce((prev) => prev.filter((w) => w.id !== entityId));
-      recordUserMovement(
-        'ELIMINACIÓN',
-        'Personal y Asistencia',
-        `Eliminó operario [${code}] ${name}`
-      );
     } else if (type === 'advance' && entityId) {
       const targetAdv = dailyAdvances.find((a) => a.id === entityId);
       if (targetAdv) {
@@ -2334,26 +2179,10 @@ export default function App() {
           recalculateMaterialsFromAdvances(prevMats, nextAdvances)
         );
 
-        const revertedMatsText =
-          targetAdv.materialsUsedToday?.length > 0
-            ? ` (Stock revertido: ${targetAdv.materialsUsedToday
-                .map((u: any) => `${u.name} +${u.qty} ${u.unit}`)
-                .join(', ')})`
-            : '';
 
-        recordUserMovement(
-          'ELIMINACIÓN',
-          'Avance Diario',
-          `Eliminó parte diario de [${targetAdv.activityCode}] ${name} (${targetAdv.date} • Cantidad: ${targetAdv.quantityToday})${targetAdv.sharedGroupId ? ' [Trabajo Biproyecto sincronizado en ambos galpones]' : ''}${revertedMatsText}`
-        );
       }
     } else if (type === 'catalog_item' && entityId) {
       setMasterCatalog((prev) => getActiveMasterCatalog(prev).filter((c) => c.id !== entityId));
-      recordUserMovement(
-        'ELIMINACIÓN',
-        'Catálogo Maestro',
-        `Eliminó actividad maestra [${code}] ${name}`
-      );
     } else if (
       type === 'catalog_structure' &&
       deleteConfirmModal.areaName &&
@@ -2368,20 +2197,10 @@ export default function App() {
         }
       );
       setMasterCatalog(remainingCatalog);
-      recordUserMovement(
-        'ELIMINACIÓN',
-        'Catálogo Maestro',
-        `Eliminó estructura "${deleteConfirmModal.structureName}" (${deleteConfirmModal.areaName}${deleteConfirmModal.sistemaName ? ` • ${deleteConfirmModal.sistemaName}` : ''}) y sus ${removedItems.length} actividad(es) maestra(s)`
-      );
     } else if (type === 'template_provider' && code) {
       setTechnologies((prev) => prev.filter((t) => t !== code));
       setMasterCatalog((prev) =>
         getActiveMasterCatalog(prev).filter((item) => item.technology !== code)
-      );
-      recordUserMovement(
-        'ELIMINACIÓN',
-        'Catálogo Maestro',
-        `Eliminó plantilla/proveedor "${code}"`
       );
     }
 
@@ -2390,7 +2209,8 @@ export default function App() {
 
   const handleReloadGalponFromCatalog = (secId: string, galponObj: any) => {
     if (!requirePermission('proyectos', 'edit')) return;
-    if (!canAccessGalpon(profile, galponObj, secId)) return;
+    const sector = sectors.find(item => item.id === secId);
+    if (!sector) return;
     const cleanTech = (galponObj.technology || '').trim();
     setSectors((prev) =>
       prev.map((s) =>
@@ -2414,18 +2234,15 @@ export default function App() {
           : s
       )
     );
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Sectores y Galpones',
-      `Sincronizó actividades del galpón [${galponObj.code}] desde el Catálogo Maestro (${cleanTech || 'Sin proveedor'}) conservando estructuras y actividades personalizadas`
-    );
   };
 
   // ==========================================================================
   // HANDLERS: GESTIÓN DE ACTIVIDADES EN EL GALPÓN (SELECCIÓN PROGRESIVA DESDE CATÁLOGO)
   // ==========================================================================
-  const openNewActivityModal = () => {
-    if (!requirePermission('actividades', 'create')) return;
+  const [activityEditorModule, setActivityEditorModule] = useState<'gantt' | 'actividades'>('actividades');
+  const openNewActivity = (module: 'gantt' | 'actividades') => {
+    if (!requirePermission(module, 'create')) return;
+    setActivityEditorModule(module);
     const today = getSystemToday();
     setFormActivity({
       useCatalog: true,
@@ -2452,9 +2269,11 @@ export default function App() {
     setModalNewActivity(true);
   };
 
+  const openNewActivityModal = () => openNewActivity('actividades');
+
   const handleSaveNewActivity = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!requirePermission('actividades', 'create')) return;
+    if (!requirePermission(activityEditorModule, 'create')) return;
     const primaryGalponId = formActivity.targetGalponId || currentGalpon?.id || '';
     if (!primaryGalponId) return;
     if (!formActivity.areaName || !formActivity.sistemaName || !formActivity.structureName) {
@@ -2514,22 +2333,8 @@ export default function App() {
       setSelectedGalponId(targetGalInfo.id);
     }
 
-    const targetGalLabels = targetGalponIds
-      .map((gid) => {
-        const gObj = allGalponesList.find((g) => g.id === gid);
-        return gObj ? `${gObj.sectorName} • ${gObj.code}` : gid;
-      })
-      .join(', ');
 
-    const assignedSummary = assignmentResult.assignedActivities
-      .map((a) => `[${a.code}] ${a.name}`)
-      .join(', ');
 
-    recordUserMovement(
-      'REGISTRO',
-      'Actividades',
-      `Asignó ${assignmentResult.assignedActivities.length} actividad(es) del Catálogo Maestro (${assignedSummary} • ${formActivity.areaName} • ${formActivity.structureName}) en ${targetGalLabels}`
-    );
 
     // Sincronizar filtros de la tabla de actividades para que siempre sea visible inmediatamente
     if (filterActArea !== 'Todas' && filterActArea !== formActivity.areaName) {
@@ -2650,8 +2455,8 @@ export default function App() {
       prevAdvances.map((adv) => {
         if (
           adv.galponId === currentGalpon.id &&
-          (adv.activityId === modalEditGalponActivity.id ||
-            (oldCode && adv.activityCode === oldCode))
+          (adv.activityId ? adv.activityId === modalEditGalponActivity.id
+            : oldCode && !ambiguousCodesByBarn.get(currentGalpon.id)?.has(oldCode) && adv.activityCode === oldCode)
         ) {
           return {
             ...adv,
@@ -2663,12 +2468,20 @@ export default function App() {
       })
     );
 
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Actividades',
-      `Modificó actividad [${oldCode && oldCode !== newCode ? `${oldCode} → ${newCode}` : newCode}] ${newName} (${getProgressModeLabel(mode)}) en galpón ${currentGalpon.code}`
-    );
     setModalEditGalponActivity(null);
+  };
+
+  const requestWithdrawGanttActivity = (actId: string) => {
+    if (!requirePermission('gantt', 'delete') || !currentGalpon || !currentSector) return;
+    if (pendingOperations.some(op => op.userId === profile?.uid && sameOperationalScope(op.scopeKey, scopeKey) && isGanttWithdrawal(op) &&
+      op.documentId === currentSector.id && op.galponId === currentGalpon.id && op.activityId === actId)) {
+      setPermissionNotice('Ya hay un retiro en la cola. Revise el Centro de Sincronización.');
+      return;
+    }
+    const activity = evaluatedActivities.find(item => item.id === actId);
+    if (!activity) return;
+    setDeleteConfirmModal({ type: 'gantt_withdrawal', entityId: actId, sectorId: currentSector.id,
+      galponId: currentGalpon.id, code: activity.code, name: activity.name });
   };
 
   const requestDeleteGalponActivity = (actId: string) => {
@@ -2679,7 +2492,8 @@ export default function App() {
     const relatedAdvancesCount = dailyAdvances.filter(
       (a) =>
         a.galponId === currentGalpon.id &&
-        (a.activityId === actId || a.activityCode === targetAct.code)
+        (a.activityId ? a.activityId === actId
+          : !ambiguousCodesByBarn.get(currentGalpon.id)?.has(targetAct.code) && a.activityCode === targetAct.code)
     ).length;
 
     setDeleteConfirmModal({
@@ -2704,7 +2518,13 @@ export default function App() {
   ) => {
     if (!requirePermission('gantt', 'edit')) return;
     if (!currentGalpon || !currentSector) return;
-    const targetAct = evaluatedActivities.find((a) => a.id === actId);
+    const activity = evaluatedActivities.find(item => item.id === actId);
+    const startDate = field === 'startDate' ? value : activity?.startDate;
+    const dueDate = field === 'dueDate' ? value : activity?.dueDate;
+    if (startDate && dueDate && startDate > dueDate) {
+      setPermissionNotice('La fecha de inicio no puede ser posterior al fin de la actividad.');
+      return;
+    }
     const ganttNowIso = new Date().toISOString();
     setSectors((prev) =>
       prev.map((s) => {
@@ -2762,11 +2582,6 @@ export default function App() {
         };
       })
     );
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Actividades',
-      `Actualizó fecha de ${field === 'startDate' ? 'Inicio' : 'Fin'} (${value}) en actividad [${targetAct?.code || actId}] del galpón ${currentGalpon.code}`
-    );
   };
 
   // ==========================================================================
@@ -2794,6 +2609,7 @@ export default function App() {
       usedQty: 0,
       unit: ''
     });
+    setMaterialError('');
     setModalNewMaterial(true);
   };
 
@@ -2819,12 +2635,14 @@ export default function App() {
       usedQty: Number(mat.usedQty || 0),
       unit: mat.unit || ''
     });
+    setMaterialError('');
     setModalNewMaterial(true);
   };
 
   const handleSaveMaterial = (e: React.FormEvent) => {
     e.preventDefault();
     if (!requirePermission('materiales', editingMaterialId ? 'edit' : 'create')) return;
+    setMaterialError('');
     const cleanCode = formMaterial.code.trim().toUpperCase();
     const cleanName = formMaterial.name.trim();
     const cleanTech = formMaterial.technology.trim();
@@ -2844,9 +2662,11 @@ export default function App() {
         : formMaterial.structureName.trim();
 
     if (!cleanCode || !cleanName || !cleanTech || !cleanArea || !finalStructure || !cleanUnit) {
+      setMaterialError('Complete el código, nombre, proveedor, área, estructura y unidad.');
       return;
     }
     if (hasSistemas && !finalSistema) {
+      setMaterialError('Seleccione el sistema correspondiente a esta área.');
       return;
     }
 
@@ -2858,7 +2678,12 @@ export default function App() {
     const resolvedLocType = hasSistemas ? formMaterial.locationType || 'Interno' : '';
 
     if (resolvedGalponId) {
+      let structureExists = false;
       const galInfo = allGalponesList.find((g) => g.id === resolvedGalponId);
+      if (!galInfo) {
+        setMaterialError('El galpón seleccionado ya no está disponible.');
+        return;
+      }
       if (galInfo) {
         resolvedSectorId = galInfo.sectorId;
         const areaObj = galInfo.areas?.find((a: any) => a.name === cleanArea);
@@ -2878,6 +2703,7 @@ export default function App() {
                   (st.name || '').toLowerCase() === finalStructure.toLowerCase()
               );
               if (strObj) {
+                structureExists = true;
                 resolvedStructureId = strObj.id || resolvedStructureId;
               }
             }
@@ -2887,10 +2713,15 @@ export default function App() {
                 (st.name || '').toLowerCase() === finalStructure.toLowerCase()
             );
             if (strObj) {
+              structureExists = true;
               resolvedStructureId = strObj.id || resolvedStructureId;
             }
           }
         }
+      }
+      if (!structureExists && !canDo('actividades', 'create') && !canDo('gantt', 'create')) {
+        setMaterialError('Seleccione una estructura existente en el galpón. Su rol puede registrar materiales en la estructura vigente.');
+        return;
       }
 
       // Si el área/sistema/estructura aún no tenía nodo en el galpón, lo garantizamos con IDs únicos
@@ -2898,7 +2729,7 @@ export default function App() {
       if (hasSistemas && !resolvedSistemaId) resolvedSistemaId = generateId('sis');
       if (!resolvedStructureId) resolvedStructureId = generateId('str');
 
-      setSectors((prev) =>
+      if (!structureExists) setSectors((prev) =>
         prev.map((sec) => {
           if (sec.id !== resolvedSectorId) return sec;
           return {
@@ -3019,32 +2850,19 @@ export default function App() {
     };
     const newMatPayload = {
       ...baseMatPayload,
-      usedQty: computeMaterialUsedQty(baseMatPayload, dailyAdvances)
+      usedQty: usedMaterialQuantity(baseMatPayload)
     };
 
     const assignedGalForLog = allGalponesList.find(
       (g) => g.id === newMatPayload.galponId
     );
-    const galLabelForLog = assignedGalForLog
-      ? `${assignedGalForLog.sectorName} • ${assignedGalForLog.code}`
-      : 'Sin galpón asignado';
 
     if (editingMaterialId) {
       setMaterials((prev) =>
         prev.map((m) => (m.id === editingMaterialId ? newMatPayload : m))
       );
-      recordUserMovement(
-        'MODIFICACIÓN',
-        'Materiales',
-        `Modificó material [${newMatPayload.code}] ${newMatPayload.name} (${newMatPayload.totalQty} ${newMatPayload.unit} • Proveedor: ${newMatPayload.technology}) en ${galLabelForLog} / ${newMatPayload.structureName}`
-      );
     } else {
       setMaterials((prev) => [...prev, newMatPayload]);
-      recordUserMovement(
-        'REGISTRO',
-        'Materiales',
-        `Registró material [${newMatPayload.code}] ${newMatPayload.name} (${newMatPayload.totalQty} ${newMatPayload.unit} • Proveedor: ${newMatPayload.technology}) en ${galLabelForLog} / ${newMatPayload.structureName}`
-      );
     }
 
     // Sincronizar filtros para que el material recién guardado siempre quede visible inmediatamente
@@ -3119,7 +2937,7 @@ export default function App() {
       locationType: prefill?.locationType || 'Todos',
       sistemaName: prefill?.sistemaName || '',
       structureName: prefill?.structureName || '',
-      activityCode: prefill?.activityCode || '',
+      activityId: prefill?.activityId || '',
       date: '',
       quantityToday: '',
       hoursWorked: '',
@@ -3128,6 +2946,7 @@ export default function App() {
       sharedAcrossTwoGalpones: false,
       secondGalponId: '',
       splitMode: '100_both',
+      workerIds: [],
       manualMaterialInputs: {},
       isAuthorizedCorrection: false,
       correctionReason: ''
@@ -3139,9 +2958,7 @@ export default function App() {
     if (!requirePermission('avance_diario', 'edit')) return;
     setEditingAdvanceId(adv.id);
     setAdvanceValidationError(null);
-    const act = evaluatedActivities.find(
-      (a) => (adv.activityId && a.id === adv.activityId) || a.code === adv.activityCode
-    );
+    const act = findAdvanceActivity(evaluatedActivities, adv.activityId, adv.activityCode);
     const manualInputs: Record<string, string> = {};
 
     // Si es un avance compartido (Trabajo Biproyecto), reconstruir los insumos totales del grupo compartido
@@ -3209,7 +3026,7 @@ export default function App() {
       locationType: act?.locationType || 'Todos',
       sistemaName: act?.sistemaName || '',
       structureName: act?.structureName || '',
-      activityCode: adv.activityCode || '',
+      activityId: act?.id || '',
       date: adv.date || '',
       quantityToday: String(rawTotalQty ?? ''),
       hoursWorked: String(rawTotalHH ?? ''),
@@ -3222,6 +3039,8 @@ export default function App() {
           : secondarySharedLog.galponId
         : '',
       splitMode: savedSplitMode,
+      workerIds: [...new Set<string>((groupLogs.length ? groupLogs : [adv])
+        .flatMap(item => Array.isArray(item.workerIds) ? item.workerIds.filter((id: unknown) => typeof id === 'string') : []))],
       manualMaterialInputs: manualInputs,
       isAuthorizedCorrection: Boolean(adv.isAuthorizedCorrection),
       correctionReason: adv.correctionReason || ''
@@ -3232,7 +3051,7 @@ export default function App() {
   const handleSaveAdvance = (e: React.FormEvent) => {
     e.preventDefault();
     if (!requirePermission('avance_diario', editingAdvanceId ? 'edit' : 'create')) return;
-    if (!formAdvance.activityCode || formAdvance.quantityToday === '' || !currentGalpon)
+    if (!formAdvance.activityId || formAdvance.quantityToday === '' || !currentGalpon)
       return;
 
     const rawQty = Number(formAdvance.quantityToday);
@@ -3241,10 +3060,14 @@ export default function App() {
       return;
     }
 
-    const selectedAct = evaluatedActivities.find(
-      (a) => a.code === formAdvance.activityCode
-    );
-    const actMode = normalizeProgressMode(selectedAct?.progressMode);
+    const selectedAct = findAdvanceActivity(evaluatedActivities, formAdvance.activityId);
+    if (!selectedAct) {
+      setAdvanceValidationError('La actividad ya no está disponible en este galpón.');
+      return;
+    }
+    const actMode = normalizeProgressMode(selectedAct.progressMode);
+    const activityCode = selectedAct.code;
+    const legacyCodeIsUnique = Boolean(findAdvanceActivity(evaluatedActivities, undefined, activityCode));
 
     // Si es modalidad Porcentaje, validar rango 0% - 100% y que no disminuya salvo corrección histórica autorizada
     if (actMode === 'percentage') {
@@ -3252,8 +3075,7 @@ export default function App() {
       const logsForValidation = dailyAdvances.filter(
         (l) =>
           l.galponId === currentGalpon.id &&
-          ((l.activityId && l.activityId === selectedAct?.id) ||
-            l.activityCode === formAdvance.activityCode)
+          (l.activityId ? l.activityId === selectedAct.id : legacyCodeIsUnique && l.activityCode === activityCode)
       );
 
       const validation = validatePercentageAdvanceRegistration({
@@ -3299,30 +3121,15 @@ export default function App() {
       ? allGalponesList.find((g) => g.id === formAdvance.secondGalponId)
       : null;
 
-    // Encontrar actividad equivalente en el segundo galpón (si existe) para vincular su activityId
-    let secondGalponActId: string | undefined = undefined;
-    if (secondGalponObj) {
-      (secondGalponObj.areas || []).forEach((area: any) => {
-        if (area.hasSistemas && area.sistemas) {
-          area.sistemas.forEach((sis: any) => {
-            (sis.structures || []).forEach((str: any) => {
-              (str.activities || []).forEach((act: any) => {
-                if (act.code === formAdvance.activityCode) {
-                  secondGalponActId = act.id;
-                }
-              });
-            });
-          });
-        } else {
-          (area.structures || []).forEach((str: any) => {
-            (str.activities || []).forEach((act: any) => {
-              if (act.code === formAdvance.activityCode) {
-                secondGalponActId = act.id;
-              }
-            });
-          });
-        }
-      });
+    const existingGroup = dailyAdvances.find(advance => advance.id === editingAdvanceId)?.sharedGroupId;
+    const previousCounterpart = existingGroup && dailyAdvances.find(advance =>
+      advance.sharedGroupId === existingGroup && advance.galponId === secondGalponObj?.id && advance.activityCode === activityCode);
+    const secondGalponActId = findAdvanceActivity(barnActivities(secondGalponObj),
+      previousCounterpart?.activityId, activityCode)?.id;
+
+    if (isShared && !secondGalponActId) {
+      setAdvanceValidationError('El segundo galpón necesita una única actividad equivalente para registrar el avance compartido.');
+      return;
     }
 
     const totalUsedMatsList: {
@@ -3406,9 +3213,27 @@ export default function App() {
       });
     }
 
+    const previousPart = dailyAdvances.find(item => item.id === editingAdvanceId);
+    const previousGroup = previousPart?.sharedGroupId
+      ? dailyAdvances.filter(item => item.sharedGroupId === previousPart.sharedGroupId)
+      : previousPart ? [previousPart] : [];
+    const previousWorkerLocations = new Map<string, string>();
+    for (const part of previousGroup) for (const id of Array.isArray(part.workerIds) ? part.workerIds : []) {
+      previousWorkerLocations.set(id, part.galponId);
+    }
+    const workerIdsFor = (galponId: string, sectorId: string) => formAdvance.workerIds.filter(id => {
+      const previousLocation = previousWorkerLocations.get(id);
+      if (previousLocation) return previousLocation === galponId;
+      const worker = masterWorkforce.find(item => item.id === id);
+      return worker && workerAtLocation(worker, sectorId, galponId) &&
+        (galponId === currentGalpon.id || !workerAtLocation(worker, currentSector?.id, currentGalpon.id));
+    });
+    const primaryWorkerIds = workerIdsFor(currentGalpon.id, currentSector?.id);
+    const secondaryWorkerIds = isShared && secondGalponObj ? workerIdsFor(secondGalponObj.id, secondGalponObj.sectorId) : [];
+
     const finalSupervisor =
       formAdvance.supervisor.trim() ||
-      currentGalpon.supervisors?.[0] ||
+      barnResponsible(currentGalpon) ||
       activeUserName ||
       '';
 
@@ -3446,7 +3271,7 @@ export default function App() {
         sectorId: currentSector?.id,
         galponId: currentGalpon.id,
         activityId: selectedAct?.id || oldAdv?.activityId,
-        activityCode: formAdvance.activityCode,
+        activityCode,
         date: formAdvance.date || getSystemToday(),
         progressMode: actMode,
         percentageReached: actMode === 'percentage' ? qtyPerGalpon : undefined,
@@ -3456,6 +3281,7 @@ export default function App() {
         note: isShared
           ? `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${secondGalponObj?.code || formAdvance.secondGalponId}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`
           : cleanUserNote,
+        workerIds: primaryWorkerIds,
         materialsUsedToday: primaryGalponMatsList,
         isAuthorizedCorrection: formAdvance.isAuthorizedCorrection || undefined,
         correctionReason: formAdvance.correctionReason?.trim() || undefined,
@@ -3472,14 +3298,16 @@ export default function App() {
           profile?.displayName ||
           activeUserName,
         lastEditedBy: profile?.uid || 'local_user',
-        syncState: isNetworkOnline ? 'synced' : 'pending_sync'
+        syncState: 'pending_sync'
       };
 
       const replacementLogs: any[] = [updatedPrimaryLog];
 
       if (isShared && secondGalponObj) {
+        const oldSecondary = previousGroup.find(item => item.id !== editingAdvanceId && item.galponId === secondGalponObj.id);
         replacementLogs.push({
-          id: generateId('adv'),
+          ...(oldSecondary ?? {}),
+          id: oldSecondary?.id ?? generateId('adv'),
           sharedGroupId,
           isSecondarySharedCopy: true,
           sharedWithGalponId: currentGalpon.id,
@@ -3490,7 +3318,7 @@ export default function App() {
           sectorId: secondGalponObj.sectorId,
           galponId: secondGalponObj.id,
           activityId: secondGalponActId,
-          activityCode: formAdvance.activityCode,
+          activityCode,
           date: formAdvance.date || getSystemToday(),
           progressMode: actMode,
           percentageReached: actMode === 'percentage' ? qtyPerGalpon : undefined,
@@ -3498,18 +3326,19 @@ export default function App() {
           hoursWorked: hhPerGalpon,
           supervisor: finalSupervisor,
           note: `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${currentGalpon.code}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`,
+          workerIds: secondaryWorkerIds,
           materialsUsedToday: secondaryGalponMatsList,
           isAuthorizedCorrection: formAdvance.isAuthorizedCorrection || undefined,
           correctionReason: formAdvance.correctionReason?.trim() || undefined,
-          createdAt: nowIso,
+          createdAt: oldSecondary?.createdAt ?? nowIso,
           updatedAt: nowIso,
           baseTimestamp: nowIso,
           basePercentage: 0,
           operationId: createOperationId('op_adv_sec'),
           deviceId,
-          userId: profile?.uid || 'local_user',
-          userDisplayName: profile?.displayName || activeUserName,
-          syncState: isNetworkOnline ? 'synced' : 'pending_sync'
+          userId: oldSecondary?.userId || profile?.uid || 'local_user',
+          userDisplayName: oldSecondary?.userDisplayName || profile?.displayName || activeUserName,
+          syncState: 'pending_sync'
         });
       }
 
@@ -3519,21 +3348,7 @@ export default function App() {
         recalculateMaterialsFromAdvances(prevMats, nextAdvances)
       );
 
-      const matsSummary =
-        totalUsedMatsList.length > 0
-          ? ` | Materiales: ${totalUsedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
-          : '';
-      const modeDetail =
-        actMode === 'percentage'
-          ? `Porcentaje Total Alcanzado: ${qtyPerGalpon}%${formAdvance.isAuthorizedCorrection ? ` [Corrección histórica autorizada: ${formAdvance.correctionReason}]` : ''}`
-          : `+${qtyPerGalpon} ${selectedAct?.unit || ''} c/u`;
 
-      recordUserMovement(
-        'MODIFICACIÓN',
-        'Avance Diario',
-        `Modificó parte diario${isShared ? ` Biproyecto (${currentGalpon.code} + ${secondGalponObj?.code || ''})` : ''} de [${formAdvance.activityCode}] ${selectedAct?.name || ''}: ${modeDetail}, ${hhPerGalpon} HH c/u (Fecha: ${updatedPrimaryLog.date})${matsSummary}`,
-        finalSupervisor || activeUserName
-      );
     } else {
       const sharedGroupId = isShared ? generateId('shared_grp') : undefined;
       const newLogs: any[] = [
@@ -3550,7 +3365,7 @@ export default function App() {
           sectorId: currentSector?.id,
           galponId: currentGalpon.id,
           activityId: selectedAct?.id,
-          activityCode: formAdvance.activityCode,
+          activityCode,
           date: formAdvance.date || getSystemToday(),
           progressMode: actMode,
           percentageReached: actMode === 'percentage' ? qtyPerGalpon : undefined,
@@ -3560,6 +3375,7 @@ export default function App() {
           note: isShared
             ? `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${secondGalponObj?.code || formAdvance.secondGalponId}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`
             : cleanUserNote,
+          workerIds: primaryWorkerIds,
           materialsUsedToday: primaryGalponMatsList,
           isAuthorizedCorrection: formAdvance.isAuthorizedCorrection || undefined,
           correctionReason: formAdvance.correctionReason?.trim() || undefined,
@@ -3571,7 +3387,7 @@ export default function App() {
           deviceId,
           userId: profile?.uid || 'local_user',
           userDisplayName: profile?.displayName || activeUserName,
-          syncState: isNetworkOnline ? 'synced' : 'pending_sync'
+          syncState: 'pending_sync'
         }
       ];
 
@@ -3588,7 +3404,7 @@ export default function App() {
           sectorId: secondGalponObj.sectorId,
           galponId: secondGalponObj.id,
           activityId: secondGalponActId,
-          activityCode: formAdvance.activityCode,
+          activityCode,
           date: formAdvance.date || getSystemToday(),
           progressMode: actMode,
           percentageReached: actMode === 'percentage' ? qtyPerGalpon : undefined,
@@ -3596,6 +3412,7 @@ export default function App() {
           hoursWorked: hhPerGalpon,
           supervisor: finalSupervisor,
           note: `[Trabajo Biproyecto ${formAdvance.splitMode === '50_50' ? '50/50' : '100% Ambos'} con ${currentGalpon.code}]${cleanUserNote ? ` ${cleanUserNote}` : ''}`,
+          workerIds: secondaryWorkerIds,
           materialsUsedToday: secondaryGalponMatsList,
           isAuthorizedCorrection: formAdvance.isAuthorizedCorrection || undefined,
           correctionReason: formAdvance.correctionReason?.trim() || undefined,
@@ -3607,7 +3424,7 @@ export default function App() {
           deviceId,
           userId: profile?.uid || 'local_user',
           userDisplayName: profile?.displayName || activeUserName,
-          syncState: isNetworkOnline ? 'synced' : 'pending_sync'
+          syncState: 'pending_sync'
         });
       }
 
@@ -3617,21 +3434,7 @@ export default function App() {
         recalculateMaterialsFromAdvances(prevMats, nextAdvances)
       );
 
-      const matsSummary =
-        totalUsedMatsList.length > 0
-          ? ` | Materiales: ${totalUsedMatsList.map((u) => `${u.name} (-${u.qty} ${u.unit})`).join(', ')}`
-          : '';
-      const modeDetail =
-        actMode === 'percentage'
-          ? `Porcentaje Total Alcanzado: ${qtyPerGalpon}%${formAdvance.isAuthorizedCorrection ? ` [Corrección histórica autorizada: ${formAdvance.correctionReason}]` : ''}`
-          : `+${qtyPerGalpon} ${selectedAct?.unit || ''} c/u`;
 
-      recordUserMovement(
-        'REGISTRO',
-        'Avance Diario',
-        `Registró parte diario${isShared ? ` Biproyecto (${currentGalpon.code} + ${secondGalponObj?.code || ''})` : ''} de [${formAdvance.activityCode}] ${selectedAct?.name || ''}: ${modeDetail}, ${hhPerGalpon} HH c/u (Fecha: ${newLogs[0].date})${matsSummary}`,
-        finalSupervisor || activeUserName
-      );
     }
 
     setModalNewAdvance(false);
@@ -3642,7 +3445,7 @@ export default function App() {
       locationType: 'Todos',
       sistemaName: '',
       structureName: '',
-      activityCode: '',
+      activityId: '',
       date: '',
       quantityToday: '',
       hoursWorked: '',
@@ -3651,6 +3454,7 @@ export default function App() {
       sharedAcrossTwoGalpones: false,
       secondGalponId: '',
       splitMode: '100_both',
+      workerIds: [],
       manualMaterialInputs: {},
       isAuthorizedCorrection: false,
       correctionReason: ''
@@ -3696,7 +3500,7 @@ export default function App() {
 
     const payload = {
       id: formWorker.id || generateId('w'),
-      workerCode: formWorker.workerCode.trim().toUpperCase(),
+      workerCode: normalizeWorkerCode(formWorker.workerCode),
       dni: formWorker.dni.trim(),
       name: formWorker.name.trim(),
       workArea: formWorker.workArea.trim(),
@@ -3705,23 +3509,18 @@ export default function App() {
       galponId: formWorker.galponId || '',
       active: true
     };
+    const invalid = invalidWorkerField(payload);
+    if (invalid) {
+      setPermissionNotice(`Campo de Personal inválido: ${invalid}.`);
+      return;
+    }
 
     if (formWorker.id) {
       setMasterWorkforce((prev) =>
         prev.map((w) => (w.id === formWorker.id ? payload : w))
       );
-      recordUserMovement(
-        'MODIFICACIÓN',
-        'Personal y Asistencia',
-        `Modificó operario [${payload.workerCode}] ${payload.name} (${payload.workArea})`
-      );
     } else {
       setMasterWorkforce((prev) => [...prev, payload]);
-      recordUserMovement(
-        'REGISTRO',
-        'Personal y Asistencia',
-        `Registró operario [${payload.workerCode}] ${payload.name} (${payload.workArea} • ${payload.role})`
-      );
     }
 
     setModalNewWorker(false);
@@ -3729,21 +3528,13 @@ export default function App() {
 
   const handleWorkerFieldChange = (workerId: string, field: string, value: any) => {
     if (!requirePermission('personal', 'edit')) return;
-    const targetW = masterWorkforce.find((w) => w.id === workerId);
     setMasterWorkforce((prev) =>
       prev.map((w) => (w.id === workerId ? { ...w, [field]: value } : w))
-    );
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Personal y Asistencia',
-      `Actualizó ${field} de operario [${targetW?.workerCode || workerId}] ${targetW?.name || ''}`
     );
   };
 
   const handleWorkerSectorChange = (workerId: string, newSectorId: string) => {
     if (!requirePermission('personal', 'edit')) return;
-    const targetW = masterWorkforce.find((w) => w.id === workerId);
-    const targetSector = sectors.find((s) => s.id === newSectorId);
 
     setMasterWorkforce((prev) =>
       prev.map((w) =>
@@ -3751,11 +3542,6 @@ export default function App() {
           ? { ...w, sectorId: newSectorId, galponId: '' }
           : w
       )
-    );
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Personal y Asistencia',
-      `Reasignó sector de operario [${targetW?.workerCode || workerId}] ${targetW?.name || ''} a ${targetSector?.name || 'Sin sector asignado'}`
     );
   };
 
@@ -3780,8 +3566,7 @@ export default function App() {
   };
 
   const handleSetWorkerAttendance = (workerId: string, status: string) => {
-    if (!requirePermission('asistencia', 'edit')) return;
-    const targetW = masterWorkforce.find((w) => w.id === workerId);
+    if (!requirePermission('asistencia', attendanceRecords[attendanceDate]?.[workerId] ? 'edit' : 'create')) return;
     setAttendanceRecords((prev) => {
       const dayMap = prev[attendanceDate] || {};
       return {
@@ -3792,11 +3577,15 @@ export default function App() {
         }
       };
     });
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Personal y Asistencia',
-      `Marcó asistencia "${status}" para [${targetW?.workerCode || workerId}] ${targetW?.name || ''} (${attendanceDate})`
-    );
+  };
+
+  const handleClearAttendance = (workerId: string) => {
+    if (!requirePermission('asistencia', 'delete')) return;
+    setAttendanceRecords(previous => {
+      const day = { ...previous[attendanceDate] };
+      delete day[workerId];
+      return { ...previous, [attendanceDate]: day };
+    });
   };
 
   const handleMarkAllAttended = () => {
@@ -3808,17 +3597,14 @@ export default function App() {
       });
       return { ...prev, [attendanceDate]: dayMap };
     });
-    recordUserMovement(
-      'MODIFICACIÓN',
-      'Personal y Asistencia',
-      `Marcó "Asistió" a ${filteredAttendanceWorkers.length} operarios en fecha ${attendanceDate}`
-    );
   };
 
   // ==========================================================================
   // CARGA MASIVA EXCEL (.XLSX / .CSV / PEGADO DIRECTO) CON VISTA PREVIA (C-6)
   // ==========================================================================
   const resetBulkUploadState = () => {
+    bulkReadId.current++;
+    setBulkFileError('');
     setBulkCsvText('');
     setBulkRawRows([]);
     setBulkFileName('');
@@ -3828,42 +3614,61 @@ export default function App() {
 
   const handleBulkFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
-    setBulkFileName(file.name);
-
+    const readId = ++bulkReadId.current;
+    setBulkFileName('');
+    setBulkRawRows([]);
+    setBulkCsvText('');
+    setBulkFileError('');
     try {
+      if (file.size > MAX_IMPORT_BYTES) throw new Error('El archivo supera el límite de 2 MB.');
       const ext = file.name.split('.').pop()?.toLowerCase();
+      let rows: string[][];
       if (ext === 'csv' || ext === 'txt') {
-        const text = await file.text();
-        const rows = parsePastedTabularText(text);
-        setBulkRawRows(rows);
+        rows = parsePastedTabularText(await file.text());
       } else {
-        const buffer = await file.arrayBuffer();
-        const workbook = XLSX.read(buffer, { type: 'array' });
-        const firstSheetName = workbook.SheetNames[0];
-        if (!firstSheetName) {
-          setBulkRawRows([]);
-          return;
-        }
-        const sheet = workbook.Sheets[firstSheetName];
-        const jsonMatrix = XLSX.utils.sheet_to_json<any[]>(sheet, {
-          header: 1,
-          defval: '',
-          raw: false
-        });
-        const cleanRows = (jsonMatrix || [])
-          .map((row) =>
-            (Array.isArray(row) ? row : []).map((cell) => String(cell ?? '').trim())
-          )
-          .filter((row) => row.some((c) => c !== ''));
-        setBulkRawRows(cleanRows);
+        const XLSX = await import('xlsx');
+        const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array', sheetRows: MAX_BULK_ROWS + 2 });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        if (!sheet?.['!ref']) throw new Error('La primera hoja está vacía.');
+        const range = XLSX.utils.decode_range(sheet['!fullref'] ?? sheet['!ref']);
+        if (range.e.r - range.s.r > MAX_BULK_ROWS) throw new Error('Importe hasta 1000 filas de datos por archivo.');
+        if (range.e.c - range.s.c >= 64) throw new Error('El archivo supera el límite de 64 columnas.');
+        rows = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: '', raw: false, blankrows: false })
+          .map(row => row.map(cell => String(cell ?? '').trim()));
       }
+      if (rows.length < 2) throw new Error('Incluya los encabezados y al menos una fila de datos.');
+      if (rows.length > MAX_BULK_ROWS + 1) throw new Error('Importe hasta 1000 filas de datos por archivo.');
+      if (readId !== bulkReadId.current) return;
+      setBulkFileName(file.name);
+      setBulkRawRows(rows);
     } catch (err) {
-      console.error('Error al leer archivo de importación:', err);
-      setBulkRawRows([]);
-    } finally {
-      e.target.value = '';
+      if (readId === bulkReadId.current) setBulkFileError(err instanceof Error && [
+        'El archivo supera el límite de 2 MB.', 'La primera hoja está vacía.', 'El archivo supera el límite de 64 columnas.',
+        'Importe hasta 1000 filas de datos por archivo.', 'Incluya los encabezados y al menos una fila de datos.'
+      ].includes(err.message) ? err.message : 'No se pudo leer el archivo. Revise su formato.');
     }
+  };
+
+  const downloadBulkTemplate = async () => {
+    if (!modalBulkUpload || !requirePermission(modalBulkUpload, 'import')) return;
+    const XLSX = await import('xlsx');
+    const book = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(book, XLSX.utils.aoa_to_sheet([BULK_COLUMNS[modalBulkUpload]]), 'Plantilla');
+    XLSX.writeFile(book, 'Plantilla_' + modalBulkUpload + '.xlsx');
+  };
+
+  const exportCatalogWorkbook = async () => {
+    if (!requirePermission('catalogo', 'export')) return;
+    const rows = activeMasterCatalog.filter(item => selectedCatalogTech === 'Todas' || item.technology === selectedCatalogTech)
+      .map(item => [item.technology ?? '', item.code, item.areaName, item.locationType ?? '', item.sistemaName ?? '',
+        item.structureName, item.name, item.targetUnits ?? '', item.unit ?? '', item.weight ?? '', item.plannedHH ?? '',
+        item.progressMode === 'percentage' ? 'Porcentaje' : 'Cantidades', item.durationDays ?? '']);
+    const XLSX = await import('xlsx');
+    const book = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(book, XLSX.utils.aoa_to_sheet([BULK_COLUMNS.catalogo, ...rows]), 'Actividades');
+    XLSX.writeFile(book, 'Catalogo_actividades.xlsx');
   };
 
   const bulkImportAnalysis = useMemo(() => {
@@ -3881,6 +3686,10 @@ export default function App() {
         ? bulkRawRows
         : parsePastedTabularText(bulkCsvText);
 
+    if (rawMatrix.length > MAX_BULK_ROWS + 1) {
+      return { allRows: [], validRows: [], duplicateRows: [], rejectedRows: [],
+        error: 'Pegue hasta 1000 filas de datos por lote.' };
+    }
     if (rawMatrix.length === 0) {
       return {
         allRows: [] as any[],
@@ -3946,9 +3755,10 @@ export default function App() {
       const idxWeight = findColIndex(['peso', 'ponderacion'], 9);
       const idxHH = findColIndex(['hh', 'horas'], 10);
       const idxMode = findColIndex(['modalidad', 'mode', 'tipo_avance', 'tipoavance', 'metodo_avance', 'metodo'], -1);
+      const idxDuration = findColIndex(['duraciondias', 'duracion', 'dias'], -1);
 
       const existingCodes = new Set(
-        masterCatalog.map((c) => `${(c.technology || '').toLowerCase()}::${(c.code || '').toUpperCase()}`)
+        getActiveMasterCatalog(masterCatalog).map(c => catalogCodeKey(c.technology, c.code))
       );
 
       dataRows.forEach((cols, i) => {
@@ -3965,6 +3775,8 @@ export default function App() {
         const rawWeight = (cols[idxWeight] || '').trim();
         const rawHH = (cols[idxHH] || '').trim();
         const rawMode = idxMode >= 0 ? (cols[idxMode] || '').trim().toLowerCase() : '';
+        const rawDuration = idxDuration >= 0 ? (cols[idxDuration] || '').trim() : '';
+        const durationDays = rawDuration ? Number(rawDuration) : 5;
 
         // Parsing y normalización de Modalidad (Cantidades vs Porcentaje)
         let progressMode: 'quantity' | 'percentage' = 'quantity';
@@ -4013,6 +3825,7 @@ export default function App() {
         }
         if (!structureName) errors.push('Falta Estructura');
         if (!name) errors.push('Falta Nombre de Actividad');
+        if (!Number.isSafeInteger(durationDays) || durationDays < 1 || durationDays > 3650) errors.push('Duración inválida');
 
         if (modeInvalid) {
           errors.push(`Modalidad inválida ("${cols[idxMode]}"). Debe ser "Cantidades" o "Porcentaje".`);
@@ -4033,7 +3846,7 @@ export default function App() {
           ? 'Fila válida lista para importar (Modalidad: Porcentaje 100%)'
           : 'Fila válida lista para importar (Modalidad: Cantidades)';
 
-        const compositeKey = `${technology.toLowerCase()}::${code}`;
+        const compositeKey = catalogCodeKey(technology, code);
         if (errors.length > 0) {
           status = 'rejected';
           statusReason = errors.join(' • ');
@@ -4071,7 +3884,7 @@ export default function App() {
             unit: finalUnit,
             weight: isNaN(weight) || weight <= 0 ? 1.0 : weight,
             plannedHH: isNaN(plannedHH) || plannedHH < 0 ? 0 : plannedHH,
-            durationDays: 5
+            durationDays
           }
         });
       });
@@ -4264,12 +4077,12 @@ export default function App() {
       const idxGalpon = findColIndex(['galpon', 'destino'], 5);
 
       const existingWorkerCodes = new Set(
-        masterWorkforce.map((w) => (w.workerCode || '').toUpperCase())
+        masterWorkforce.map((w) => normalizeWorkerCode(w.workerCode))
       );
 
       dataRows.forEach((cols, i) => {
         const rowNumber = hasHeader ? i + 2 : i + 1;
-        const workerCode = (cols[idxCode] || '').trim().toUpperCase();
+        const workerCode = normalizeWorkerCode(cols[idxCode]);
         const dni = (cols[idxDni] || '').trim();
         const name = (cols[idxName] || '').trim();
         const workArea = (cols[idxArea] || '').trim();
@@ -4292,6 +4105,8 @@ export default function App() {
         if (!name) errors.push('Falta Nombre Completo');
         if (!workArea) errors.push('Falta Especialidad');
         if (!role) errors.push('Falta Cargo');
+        const invalid = invalidWorkerField({ workerCode, dni, name, workArea, role }, true);
+        if (invalid && errors.length === 0) errors.push(`Campo ${invalid} inválido`);
         if (rawGalponCol && !targetGalObj) {
           errors.push(`Galpón "${rawGalponCol}" no existe`);
         }
@@ -4350,9 +4165,9 @@ export default function App() {
     allGalponesList
   ]);
 
-  const handleConfirmBulkUpload = (e: React.FormEvent) => {
+  const handleConfirmBulkUpload = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!modalBulkUpload) return;
+    if (!modalBulkUpload || queuingPersonalImport) return;
     if (!requirePermission(modalBulkUpload, 'import')) return;
     const validPayloads = bulkImportAnalysis.validRows.map((r) => r.payload);
     if (validPayloads.length === 0) return;
@@ -4362,32 +4177,28 @@ export default function App() {
       validPayloads.forEach((item) => {
         if (item.technology) newTechs.add(item.technology);
       });
-      setTechnologies(Array.from(newTechs));
+      if (canDo('catalogo', 'create')) setTechnologies(Array.from(newTechs));
       setMasterCatalog((prev) => [...prev, ...validPayloads]);
-      recordUserMovement(
-        'REGISTRO',
-        'Carga Masiva',
-        `Importó ${validPayloads.length} actividades válidas al Catálogo Maestro (${bulkImportAnalysis.duplicateRows.length} duplicadas omitidas, ${bulkImportAnalysis.rejectedRows.length} rechazadas)`
-      );
     } else if (modalBulkUpload === 'materiales') {
       const newTechs = new Set(technologies);
       validPayloads.forEach((mat) => {
         if (mat.technology) newTechs.add(mat.technology);
       });
-      setTechnologies(Array.from(newTechs));
+      if (canDo('catalogo', 'create')) setTechnologies(Array.from(newTechs));
       setMaterials((prev) => [...prev, ...validPayloads]);
-      recordUserMovement(
-        'REGISTRO',
-        'Carga Masiva',
-        `Importó ${validPayloads.length} materiales válidos en Control de Materiales (${bulkImportAnalysis.duplicateRows.length} duplicados omitidos, ${bulkImportAnalysis.rejectedRows.length} rechazados)`
-      );
     } else if (modalBulkUpload === 'personal') {
-      setMasterWorkforce((prev) => [...prev, ...validPayloads]);
-      recordUserMovement(
-        'REGISTRO',
-        'Carga Masiva',
-        `Importó ${validPayloads.length} operarios válidos a la Planilla de Personal (${bulkImportAnalysis.duplicateRows.length} duplicados omitidos, ${bulkImportAnalysis.rejectedRows.length} rechazados)`
-      );
+      setQueuingPersonalImport(true);
+      const writeGroupId = crypto.randomUUID();
+      const queued = await queueOperationLocally(bulkImportAnalysis.validRows.map(({ payload, rowNumber }) => ({
+        collectionName: 'workers', documentId: payload.id, operationType: 'upsert',
+        writeGroupId, payload, sourceRow: rowNumber, status: 'pending_sync'
+      })));
+      setQueuingPersonalImport(false);
+      if (!queued) {
+        setBulkFileError('No se pudo guardar el lote en la cola. Vuelva a intentar.');
+        return;
+      }
+      setPermissionNotice('Importación de Personal guardada en la cola. Consulte su confirmación en el Centro de Sincronización.');
     }
 
     resetBulkUploadState();
@@ -4434,7 +4245,7 @@ export default function App() {
     const list: GlobalReportRowItem[] = [];
     const today = getSystemToday();
 
-    scopedSectors.forEach((sec) => {
+    sectors.forEach((sec) => {
       (sec.galpones || []).forEach((gal: any) => {
         (gal.areas || []).forEach((area: any) => {
           const pushRow = (
@@ -4443,17 +4254,15 @@ export default function App() {
             strName: string,
             act: any
           ) => {
-            const logs = dailyAdvances.filter(
-              (l) =>
-                l.galponId === gal.id &&
-                ((l.activityId && l.activityId === act.id) ||
-                  l.activityCode === act.code)
-            );
+            const logs = activityAdvances(gal.id, act.id, act.code);
             const evaluated = evaluateActivityProgress(act, logs, today);
             const isPct = evaluated.progressMode === 'percentage';
+            const computedStatus = evaluated.progressPercent >= 100 ? 'Completado'
+              : act.dueDate && act.dueDate < today ? 'Atrasado'
+              : evaluated.progressPercent > 0 ? 'En proceso' : 'No iniciado';
             list.push({
               id: `${gal.id}_${act.id || act.code}_${list.length}`,
-              projectName: sec.projectName || 'Proyecto La Calera',
+              projectName: gal.projectCode || sec.projectName || sec.code || sec.name || 'Proyecto La Calera',
               sectorId: sec.id,
               sectorName: sec.name || '',
               galponId: gal.id,
@@ -4476,7 +4285,7 @@ export default function App() {
               progressPercent: evaluated.progressPercent,
               plannedHH: act.plannedHH || 0,
               accumulatedHH: evaluated.accumulatedHH,
-              computedStatus: evaluated.computedStatus as any
+              computedStatus
             });
           };
 
@@ -4505,7 +4314,7 @@ export default function App() {
     });
 
     return list;
-  }, [scopedSectors, dailyAdvances]);
+  }, [sectors, activityAdvances]);
 
   const uniqueInformesAreas = useMemo(() => {
     const set = new Set<string>();
@@ -4526,19 +4335,21 @@ export default function App() {
   const informesGalponesOptions = useMemo(() => {
     if (filterInformesSectorId === 'ALL') {
       const list: any[] = [];
-      scopedSectors.forEach((s) => {
+      sectors.forEach((s) => {
         (s.galpones || []).forEach((g: any) => {
           list.push({ ...g, sectorName: s.name });
         });
       });
       return list;
     }
-    const sec = scopedSectors.find((s) => s.id === filterInformesSectorId);
+    const sec = sectors.find((s) => s.id === filterInformesSectorId);
     return sec ? (sec.galpones || []).map((g: any) => ({ ...g, sectorName: sec.name })) : [];
-  }, [scopedSectors, filterInformesSectorId]);
+  }, [sectors, filterInformesSectorId]);
 
+  const [filterInformesProject, setFilterInformesProject] = useState('ALL');
   const filteredGlobalReportRows = useMemo(() => {
     return allGlobalReportRows.filter((row) => {
+      if (filterInformesProject !== 'ALL' && row.projectName !== filterInformesProject) return false;
       if (filterInformesSectorId !== 'ALL' && row.sectorId !== filterInformesSectorId) {
         return false;
       }
@@ -4585,6 +4396,7 @@ export default function App() {
     });
   }, [
     allGlobalReportRows,
+    filterInformesProject,
     filterInformesSectorId,
     filterInformesGalponId,
     filterInformesAreaName,
@@ -4593,6 +4405,18 @@ export default function App() {
     filterInformesStatus,
     searchInformesText
   ]);
+
+  const fieldRows = useMemo(() => fieldReport(sectors, filteredGlobalReportRows, materials, masterWorkforce,
+    attendanceRecords[attendanceDate] ?? {}, {
+      project: filterInformesProject, sector: filterInformesSectorId, galpon: filterInformesGalponId,
+      activityFiltered: filterInformesAreaName !== 'ALL' || filterInformesSistemaName !== 'ALL' ||
+        filterInformesMode !== 'ALL' || filterInformesStatus !== 'ALL' || Boolean(searchInformesText.trim())
+    }), [sectors, filteredGlobalReportRows, materials, masterWorkforce, attendanceRecords, attendanceDate,
+    filterInformesProject, filterInformesSectorId, filterInformesGalponId, filterInformesAreaName, filterInformesSistemaName,
+    filterInformesMode, filterInformesStatus, searchInformesText]);
+  const fieldHeaders = ['Proyecto', 'Sector', 'Galpón', 'Actividades', 'Personal', 'Asistieron', 'Registrados', 'Materiales', 'Sin stock'];
+  const fieldValues = (row: typeof fieldRows[number]) => [row.project, row.sector, row.galpon, row.activities, row.personnel,
+    row.present, row.registered, row.materials, row.outOfStock];
 
   const informesMetrics = useMemo(() => {
     const total = filteredGlobalReportRows.length;
@@ -4698,7 +4522,7 @@ export default function App() {
     );
   };
 
-  const handleExportGlobalXLSX = (exportFiltered: boolean = false) => {
+  const handleExportGlobalXLSX = async (exportFiltered: boolean = false) => {
     if (!requirePermission('informes', 'export')) return;
     const headers = [
       'Proyecto',
@@ -4744,6 +4568,7 @@ export default function App() {
       r.computedStatus
     ]);
 
+    const XLSX = await import('xlsx');
     const worksheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Informe Global');
@@ -4806,7 +4631,7 @@ export default function App() {
         ? allGalponesList.find((g) => g.id === m.galponId)
         : null;
       const total = Number(m.totalQty) || 0;
-      const used = computeMaterialUsedQty(m, dailyAdvances);
+      const used = usedMaterialQuantity(m);
       const avail = Math.max(0, Math.round((total - used) * 100) / 100);
       const status =
         total > 0 && avail / total <= 0.15
@@ -4876,36 +4701,45 @@ export default function App() {
     );
   };
 
+  const [movementImport, setMovementImport] = useState({ busy: false, message: '' });
+  const handleImportMovements = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || !requirePermission('movimientos', 'import')) return;
+    if (file.size > MAX_IMPORT_BYTES) {
+      setMovementImport({ busy: false, message: 'El archivo supera el límite de 2 MB.' });
+      return;
+    }
+    const session = bindOperationalData(profile);
+    setMovementImport({ busy: true, message: '' });
+    try {
+      const entries = await readMovementFile(file);
+      await importHistoricalMovements(session, entries);
+      setMovementImport({ busy: false, message: 'Archivo confirmado. La bitácora se actualizará automáticamente.' });
+    } catch (error) {
+      setMovementImport({ busy: false, message: error instanceof Error ? error.message : 'No se pudo confirmar la importación.' });
+    }
+  };
+
   const handleExportMovementsCSV = () => {
     if (!requirePermission('movimientos', 'export')) return;
     const headers = [
+      'ID',
       'Fecha y Hora',
       'Usuario',
       'Tipo de Movimiento',
       'Módulo',
-      'Detalle del Movimiento'
+      'Detalle del Movimiento',
+      'Proyecto', 'Sector', 'Galpón', 'Recurso', 'Operación'
     ];
-    const visibleLogs = auditLogs.filter((log) => {
-      if (filterLogAction !== 'Todas' && log.action !== filterLogAction) return false;
-      if (filterLogModule !== 'Todos' && log.module !== filterLogModule) return false;
-      if (searchLogText.trim()) {
-        const q = searchLogText.toLowerCase().trim();
-        const match =
-          (log.description || '').toLowerCase().includes(q) ||
-          (log.user || '').toLowerCase().includes(q) ||
-          (log.module || '').toLowerCase().includes(q) ||
-          (log.action || '').toLowerCase().includes(q);
-        if (!match) return false;
-      }
-      return true;
-    });
-
-    const rows = visibleLogs.map((log: any) => [
+    const rows = visibleMovements.map(log => [
+      log.id,
       log.timestamp || '',
       log.user || '',
       log.action || '',
       log.module || '',
-      log.description || ''
+      log.description || '',
+      log.projectCode, log.sectorId, log.galponId, log.targetId, log.requestId
     ]);
 
     downloadCsvFile(
@@ -4933,8 +4767,8 @@ export default function App() {
   }, [evaluatedActivities, formAdvance]);
 
   const selectedAdvanceActivityObj = useMemo(() => {
-    return evaluatedActivities.find((a) => a.code === formAdvance.activityCode) || null;
-  }, [evaluatedActivities, formAdvance.activityCode]);
+    return findAdvanceActivity(evaluatedActivities, formAdvance.activityId) ?? null;
+  }, [evaluatedActivities, formAdvance.activityId]);
 
   const adminSidebarModules: Array<{
     id: AppModuleId;
@@ -5004,7 +4838,7 @@ export default function App() {
                 code: '',
                 name: '',
                 description: '',
-                supervisorsStr: '',
+                responsible: '',
                 startDate: '',
                 endDate: '',
                 technology: ''
@@ -5140,7 +4974,7 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-1.5 pt-0.5">
-              {profile.role === 'Administrador' && (
+              {canManageUsers && (
                 <button
                   type="button"
                   onClick={() => {
@@ -5231,7 +5065,7 @@ export default function App() {
                 >
                   Sector:
                 </label>
-                {scopedSectors.length === 0 ? (
+                {sectors.length === 0 ? (
                   canDo('proyectos', 'create') ? (
                     <button
                       type="button"
@@ -5265,7 +5099,7 @@ export default function App() {
                       {!currentSector && (
                         <option value="">Seleccione sector...</option>
                       )}
-                      {scopedSectors.map((sec) => (
+                      {sectors.map((sec) => (
                         <option key={sec.id} value={sec.id} className="bg-slate-900 text-white">
                           {sec.name}
                         </option>
@@ -5318,7 +5152,7 @@ export default function App() {
 
               {profile && (
                 <div className="flex items-center gap-1.5 border-l border-white/20 pl-2">
-                  {profile.role === 'Administrador' ? (
+                  {canManageUsers ? (
                     <button
                       type="button"
                       data-testid="header-btn-user-menu"
@@ -5411,7 +5245,7 @@ export default function App() {
               className="flex-1 min-w-0 bg-emerald-900/90 text-white text-xs font-semibold rounded-lg px-2.5 py-1.5 border border-emerald-600/60 focus:outline-none focus:ring-1 focus:ring-white"
             >
               {!currentSector && <option value="">Seleccione sector...</option>}
-              {scopedSectors.map((sec) => (
+              {sectors.map((sec) => (
                 <option key={sec.id} value={sec.id} className="bg-slate-900 text-white">
                   {sec.name}
                 </option>
@@ -5530,6 +5364,11 @@ export default function App() {
           currentTab === 'gantt' ? 'max-w-[1600px]' : 'max-w-7xl'
         }`}
       >
+        {syncStorageError && (
+          <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">
+            El navegador rechazó guardar una operación en este dispositivo. Conserve la pestaña abierta y revise el almacenamiento antes de continuar.
+          </p>
+        )}
         {permissionNotice && (
           <div className="mb-4 bg-amber-50 border border-amber-300 text-amber-900 px-4 py-3 rounded-xl text-xs font-bold flex items-center justify-between shadow-xs">
             <div className="flex items-center gap-2">
@@ -5549,6 +5388,14 @@ export default function App() {
         {/* VISTA 1: DASHBOARD MODULAR                                         */}
         {/* ================================================================== */}
         {currentTab === 'dashboard' && (
+          <div className="space-y-4">
+            <PortfolioOverview rows={allGlobalReportRows} onExport={canDo('dashboard', 'export') ? rows => {
+              if (!requirePermission('dashboard', 'export')) return;
+              downloadCsvFile('Avance_proyectos_' + getSystemToday() + '.csv',
+                ['Proyecto', 'Sector', 'Galpón', 'Área', 'Sistema', 'Actividad', 'Avance %', 'Estado'],
+                rows.map(row => [row.projectName, row.sectorName, row.galponCode || row.galponName, row.areaName, row.sistemaName,
+                  row.activityName, row.progressPercent, row.computedStatus]));
+            } : undefined} />
           <DashboardView
             currentSector={currentSector}
             currentGalpon={currentGalpon}
@@ -5566,23 +5413,29 @@ export default function App() {
             onNavigateTab={(tab) => setCurrentTab(tab as any)}
             onOpenNewAdvanceModal={(prefill) => openNewAdvanceModal(prefill)}
           />
+          </div>
         )}
 
         {/* ================================================================== */}
         {/* VISTA 2: CRONOGRAMA GANTT DINÁMICO (OPCIÓN C: PLANIFICACIÓN + REAL) */}
         {/* ================================================================== */}
         {currentTab === 'gantt' && (
+          <React.Suspense fallback={<p role="status" className="p-4 text-sm text-slate-600">Cargando cronograma…</p>}>
           <GanttView
             currentSector={currentSector}
             currentGalpon={currentGalpon}
             rawActivities={evaluatedActivities}
-            dailyAdvances={dailyAdvances}
+            dailyAdvances={confirmedAdvances}
             todayStr={getSystemToday()}
-            canCreateActivity={canDo('actividades', 'create')}
+            canCreateActivity={canDo('gantt', 'create')}
             canEditGantt={canDo('gantt', 'edit')}
-            onOpenNewActivity={openNewActivityModal}
+            canExportGantt={canDo('gantt', 'export')}
+            canDeleteGantt={canDo('gantt', 'delete')}
+            onWithdrawActivity={requestWithdrawGanttActivity}
+            onOpenNewActivity={() => openNewActivity('gantt')}
             onDateChange={handleGanttDateChange}
           />
+          </React.Suspense>
         )}
 
         {/* ================================================================== */}
@@ -5600,14 +5453,14 @@ export default function App() {
                   con soporte Offline, sincronización multiusuario y recálculo automático de stock
                 </p>
               </div>
-              <button
+              {canDo('avance_diario', 'create') && (<button
                 disabled={!currentGalpon}
                 onClick={() => openNewAdvanceModal()}
                 className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold text-xs flex items-center gap-1.5"
               >
                 <Plus className="w-4 h-4" />
                 <span>+ Registrar Parte de Hoy</span>
-              </button>
+              </button>)}
             </div>
 
             <div className="space-y-3">
@@ -5725,22 +5578,22 @@ export default function App() {
                             </span>
                           </div>
                           <div className="flex items-center gap-1 border-l border-slate-200 pl-3">
-                            <button
+                            {canDo('avance_diario', 'edit') && (<button
                               type="button"
                               onClick={() => openEditAdvanceModal(adv)}
                               className="p-2 rounded-lg text-slate-600 hover:bg-slate-100 transition"
                               title="Modificar Avance Diario"
                             >
                               <Edit2 className="w-4 h-4" />
-                            </button>
-                            <button
+                            </button>)}
+                            {canDo('avance_diario', 'delete') && (<button
                               type="button"
                               onClick={() => requestDeleteAdvance(adv.id)}
                               className="p-2 rounded-lg text-rose-600 hover:bg-rose-50 transition"
                               title="Eliminar Avance Diario (Revierte consumo de materiales)"
                             >
                               <Trash2 className="w-4 h-4" />
-                            </button>
+                            </button>)}
                           </div>
                         </div>
                       </div>
@@ -5809,22 +5662,22 @@ export default function App() {
                   className="px-3 py-1.5 border border-slate-300 rounded-xl font-bold bg-slate-50"
                 />
 
-                <button
+                {canDo('asistencia', 'edit') && (<button
                   onClick={handleMarkAllAttended}
                   className="px-3 py-1.5 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] text-white font-bold flex items-center gap-1"
                 >
                   <Check className="w-3.5 h-3.5" />
                   <span>Marcar Todos Asistió</span>
-                </button>
+                </button>)}
 
-                <button
+                {canDo('asistencia', 'export') && (<button
                   type="button"
                   onClick={handleExportAttendanceCSV}
                   className="px-3 py-1.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold flex items-center gap-1"
                 >
                   <Download className="w-3.5 h-3.5 text-[#0f6b38]" />
                   <span>Exportar Asistencia (.CSV)</span>
-                </button>
+                </button>)}
               </div>
             </div>
 
@@ -5915,7 +5768,7 @@ export default function App() {
                           <span className="px-2 py-0.5 rounded bg-emerald-50 text-[#0f6b38] font-mono font-bold text-[10px] border border-emerald-200">
                             {w.workerCode}
                           </span>
-                          <h4 className="text-xs font-bold text-slate-900">{w.name}</h4>
+                          <h4 className="text-xs font-bold text-slate-900">{w.name || 'Dato inválido'}</h4>
                           <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px] font-bold">
                             {w.workArea}
                           </span>
@@ -5940,6 +5793,7 @@ export default function App() {
                           return (
                             <button
                               key={stKey}
+                              disabled={!canDo('asistencia', currentStatus ? 'edit' : 'create')}
                               onClick={() => handleSetWorkerAttendance(w.id, stKey)}
                               className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition ${
                                 isSel
@@ -5951,6 +5805,12 @@ export default function App() {
                             </button>
                           );
                         })}
+                        {currentStatus && canDo('asistencia', 'delete') && (
+                          <button type="button" className="text-xs text-red-700 underline" onClick={() => handleClearAttendance(w.id)}>
+                            Quitar registro
+                          </button>
+                        )}
+
                       </div>
                     </div>
                   );
@@ -5977,7 +5837,7 @@ export default function App() {
               </div>
               {canDo('proyectos', 'create') && (
                 <div className="flex items-center gap-2">
-                  <button
+                  {canDo('proyectos', 'create') && (<button
                     onClick={() => {
                       setFormProject({
                         id: '',
@@ -5992,9 +5852,9 @@ export default function App() {
                   >
                     <FolderPlus className="w-4 h-4" />
                     <span>+ Nuevo Proyecto / Sector</span>
-                  </button>
-                  <button
-                    disabled={scopedSectors.length === 0}
+                  </button>)}
+                  {canDo('proyectos', 'create') && (<button
+                    disabled={sectors.length === 0}
                     onClick={() => {
                       setFormGalpon({
                         id: '',
@@ -6002,7 +5862,7 @@ export default function App() {
                         code: '',
                         name: '',
                         description: '',
-                        supervisorsStr: '',
+                        responsible: '',
                         startDate: '',
                         endDate: '',
                         technology: ''
@@ -6013,12 +5873,12 @@ export default function App() {
                   >
                     <Plus className="w-4 h-4" />
                     <span>+ Crear Galpón</span>
-                  </button>
+                  </button>)}
                 </div>
               )}
             </div>
 
-            {scopedSectors.length === 0 ? (
+            {sectors.length === 0 ? (
               <div className="bg-white rounded-2xl p-8 text-center border border-slate-200">
                 <p className="text-sm font-bold text-slate-700">
                   No existen Sectores / Galpones asignados a su alcance actual.
@@ -6026,7 +5886,7 @@ export default function App() {
               </div>
             ) : (
               <div className="space-y-4">
-                {scopedSectors.map((sec) => (
+                {sectors.map((sec) => (
                   <div
                     key={sec.id}
                     className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs"
@@ -6086,7 +5946,7 @@ export default function App() {
                                 code: '',
                                 name: '',
                                 description: '',
-                                supervisorsStr: '',
+                                responsible: '',
                                 startDate: '',
                                 endDate: '',
                                 technology: ''
@@ -6124,9 +5984,7 @@ export default function App() {
                               <p className="text-[11px] text-slate-500 mt-1">
                                 Supervisores:{' '}
                                 <strong>
-                                  {gal.supervisors?.length
-                                    ? gal.supervisors.join(', ')
-                                    : 'Sin asignar'}
+                                  {barnResponsible(gal) || 'Sin asignar'}
                                 </strong>
                               </p>
                             </div>
@@ -6141,9 +5999,7 @@ export default function App() {
                                       code: gal.code,
                                       name: gal.name,
                                       description: gal.description || '',
-                                      supervisorsStr: gal.supervisors
-                                        ? gal.supervisors.join(', ')
-                                        : '',
+                                      responsible: barnResponsible(gal),
                                       startDate: gal.startDate || getSystemToday(),
                                       endDate: gal.endDate || getSystemToday(),
                                       technology: gal.technology || ''
@@ -6219,33 +6075,37 @@ export default function App() {
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <button
+                {canDo('catalogo', 'create') && (<button
                   onClick={() => setModalManageTemplates(true)}
                   className="px-3 py-2 rounded-xl border border-slate-300 hover:bg-slate-100 text-slate-700 text-xs font-bold flex items-center gap-1.5"
                 >
                   <Settings className="w-4 h-4 text-[#0f6b38]" />
                   <span>Gestionar Plantillas / Proveedores</span>
-                </button>
-                <button
+                </button>)}
+                {canDo('catalogo', 'import') && (<button
                   onClick={() => {
                     setBulkCsvText('');
                     setBulkRawRows([]);
                     setBulkFileName('');
                     setBulkTargetGalponId('');
-                    setModalBulkUpload('catalogo');
+                    if (requirePermission('catalogo', 'import')) setModalBulkUpload('catalogo');
                   }}
                   className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1.5"
                 >
                   <UploadCloud className="w-4 h-4 text-[#0f6b38]" />
                   <span>Carga Masiva Excel/CSV</span>
-                </button>
-                <button
+                </button>)}
+                {canDo('catalogo', 'create') && (<button
                   onClick={openNewCatalogModal}
                   className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] text-white text-xs font-bold flex items-center gap-1.5"
                 >
                   <Plus className="w-4 h-4" />
                   <span>+ Nueva Actividad Maestra</span>
-                </button>
+                </button>)}
+                {canDo('catalogo', 'export') && <button type="button" className="rounded-xl border px-3 py-2 text-xs font-bold"
+                  onClick={() => void exportCatalogWorkbook().catch(() => setPermissionNotice('No se pudo exportar el catálogo.'))}>
+                  Exportar catálogo XLSX
+                </button>}
               </div>
             </div>
 
@@ -6362,20 +6222,29 @@ export default function App() {
                               </td>
                               <td className="py-2.5 px-3 text-center">
                                 <div className="flex items-center justify-center gap-1">
-                                  <button
+                                  {canDo('catalogo', 'edit') && (<button
                                     onClick={() => openEditCatalogModal(item)}
                                     className="p-1.5 rounded-lg text-slate-600 hover:bg-slate-200"
                                     title="Editar actividad maestra"
                                   >
                                     <Edit2 className="w-3.5 h-3.5" />
-                                  </button>
-                                  <button
+                                  </button>)}
+                                  {canDo('catalogo', 'create') && (<button
+                                    type="button"
+                                    onClick={() => openEditCatalogModal(item, true)}
+                                    className="p-1.5 rounded-lg text-slate-600 hover:bg-slate-200"
+                                    title="Duplicar actividad maestra"
+                                    aria-label="Duplicar actividad maestra"
+                                  >
+                                    Duplicar
+                                  </button>)}
+                                  {canDo('catalogo', 'delete') && (<button
                                     onClick={() => requestDeleteCatalogItem(item.id)}
                                     className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
                                     title="Eliminar actividad maestra"
                                   >
                                     <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
+                                  </button>)}
                                 </div>
                               </td>
                             </tr>
@@ -6405,14 +6274,14 @@ export default function App() {
                   avance (Cantidades o Porcentaje), edición y eliminación
                 </p>
               </div>
-              <button
+              {canDo('actividades', 'create') && (<button
                 disabled={allGalponesList.length === 0}
                 onClick={openNewActivityModal}
                 className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white text-xs font-bold flex items-center gap-1.5"
               >
                 <Plus className="w-4 h-4" />
                 <span>+ Agregar Actividad al Galpón</span>
-              </button>
+              </button>)}
             </div>
 
             <div className="bg-white p-3 rounded-2xl border border-slate-200 space-y-2.5">
@@ -6538,20 +6407,20 @@ export default function App() {
                             </td>
                           <td className="py-2.5 px-3 text-center">
                             <div className="flex items-center justify-center gap-1">
-                              <button
+                              {canDo('actividades', 'edit') && (<button
                                 onClick={() => setModalEditGalponActivity(act)}
                                 className="p-1.5 rounded-lg text-slate-600 hover:bg-slate-200"
                                 title="Editar actividad"
                               >
                                 <Edit2 className="w-3.5 h-3.5" />
-                              </button>
-                              <button
+                              </button>)}
+                              {canDo('actividades', 'delete') && (<button
                                 onClick={() => requestDeleteGalponActivity(act.id)}
                                 className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
                                 title="Eliminar actividad"
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+                              </button>)}
                             </div>
                           </td>
                         </tr>
@@ -6580,34 +6449,34 @@ export default function App() {
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <button
+                {canDo('materiales', 'export') && (<button
                   type="button"
                   onClick={handleExportMaterialsCSV}
                   className="px-3 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 text-xs font-bold flex items-center gap-1.5"
                 >
                   <Download className="w-4 h-4 text-[#0f6b38]" />
                   <span>Exportar Materiales (.CSV)</span>
-                </button>
-                <button
+                </button>)}
+                {canDo('materiales', 'import') && (<button
                   onClick={() => {
                     setBulkCsvText('');
                     setBulkRawRows([]);
                     setBulkFileName('');
                     setBulkTargetGalponId(currentGalpon?.id || '');
-                    setModalBulkUpload('materiales');
+                    if (requirePermission('materiales', 'import')) setModalBulkUpload('materiales');
                   }}
                   className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1.5"
                 >
                   <UploadCloud className="w-4 h-4 text-[#0f6b38]" />
                   <span>Carga Masiva Excel/CSV</span>
-                </button>
-                <button
+                </button>)}
+                {canDo('materiales', 'create') && (<button
                   onClick={openNewMaterialModal}
                   className="px-4 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] text-white text-xs font-bold flex items-center gap-1.5"
                 >
                   <Plus className="w-4 h-4" />
                   <span>+ Asignar / Agregar Material</span>
-                </button>
+                </button>)}
               </div>
             </div>
 
@@ -6783,10 +6652,7 @@ export default function App() {
                           return true;
                         })
                         .map((mat) => {
-                          const computedUsed = computeMaterialUsedQty(
-                            mat,
-                            dailyAdvances
-                          );
+                          const computedUsed = usedMaterialQuantity(mat);
                           const balance =
                             Number(mat.totalQty || 0) - computedUsed;
                           const assignedGalpon = mat.galponId
@@ -6839,20 +6705,20 @@ export default function App() {
                               </td>
                               <td className="py-2.5 px-3 text-center">
                                 <div className="flex items-center justify-center gap-1">
-                                  <button
+                                  {canDo('materiales', 'edit') && (<button
                                     onClick={() => openEditMaterialModal(mat)}
                                     className="p-1.5 rounded-lg text-slate-600 hover:bg-slate-200"
                                     title="Editar material"
                                   >
                                     <Edit2 className="w-3.5 h-3.5" />
-                                  </button>
-                                  <button
+                                  </button>)}
+                                  {canDo('materiales', 'delete') && (<button
                                     onClick={() => requestDeleteMaterial(mat.id)}
                                     className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
                                     title="Eliminar material"
                                   >
                                     <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
+                                  </button>)}
                                 </div>
                               </td>
                             </tr>
@@ -6882,20 +6748,20 @@ export default function App() {
                 </p>
               </div>
               <div className="flex items-center gap-2">
-                <button
+                {canDo('personal', 'import') && (<button
                   onClick={() => {
                     setBulkCsvText('');
                     setBulkRawRows([]);
                     setBulkFileName('');
                     setBulkTargetGalponId('');
-                    setModalBulkUpload('personal');
+                    if (requirePermission('personal', 'import')) setModalBulkUpload('personal');
                   }}
                   className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1.5"
                 >
                   <UploadCloud className="w-4 h-4 text-[#0f6b38]" />
                   <span>Carga Masiva Excel/CSV</span>
-                </button>
-                <button
+                </button>)}
+                {canDo('personal', 'create') && (<button
                   onClick={() => {
                     setFormWorker({
                       id: '',
@@ -6913,7 +6779,7 @@ export default function App() {
                 >
                   <Plus className="w-4 h-4" />
                   <span>+ Agregar Operario</span>
-                </button>
+                </button>)}
               </div>
             </div>
 
@@ -6929,13 +6795,14 @@ export default function App() {
                       <th className="py-3 px-3">Cargo</th>
                       <th className="py-3 px-3">Sector</th>
                       <th className="py-3 px-3">Galpón</th>
+                      <th className="py-3 px-3">Estado</th>
                       <th className="py-3 px-3 text-center">Acciones</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200 font-medium">
                     {masterWorkforce.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="py-8 text-center text-slate-400">
+                        <td colSpan={9} className="py-8 text-center text-slate-400">
                           No hay personal registrado en la planilla.
                         </td>
                       </tr>
@@ -6976,7 +6843,7 @@ export default function App() {
                               </td>
                               <td className="py-2.5 px-3 font-mono">{worker.dni}</td>
                               <td className="py-2.5 px-3 font-bold text-slate-900">
-                                {worker.name}
+                                {worker.name || 'Dato inválido'}
                               </td>
                               <td className="py-2.5 px-3">
                                 <select
@@ -7035,14 +6902,22 @@ export default function App() {
                                   ))}
                                 </select>
                               </td>
+                              <td className="py-2.5 px-3">
+                                <label className="inline-flex items-center gap-2">
+                                  <input type="checkbox" checked={worker.active} disabled={!canDo('personal', 'edit')}
+                                    aria-label={'Operario activo ' + worker.name}
+                                    onChange={event => handleWorkerFieldChange(worker.id, 'active', event.target.checked)} />
+                                  {worker.active ? 'Activo' : 'Inactivo'}
+                                </label>
+                              </td>
                               <td className="py-2.5 px-3 text-center">
-                                <button
+                                {canDo('personal', 'delete') && (<button
                                   onClick={() => requestDeleteWorker(worker.id)}
                                   className="p-1.5 rounded-lg text-rose-600 hover:bg-rose-100"
                                   title="Eliminar operario"
                                 >
                                   <Trash2 className="w-3.5 h-3.5" />
-                                </button>
+                                </button>)}
                               </td>
                             </tr>
                           );
@@ -7060,6 +6935,38 @@ export default function App() {
         {/* ================================================================== */}
         {currentTab === 'informes' && (
           <div className="space-y-4">
+            <label className="block text-xs font-semibold text-slate-700">
+              Proyecto
+              <select className="ml-2 rounded border border-slate-300 p-1" value={filterInformesProject}
+                onChange={event => { setFilterInformesProject(event.target.value); setInformesPage(1); }}>
+                <option value="ALL">Todos</option>
+                {[...new Set(allGlobalReportRows.map(row => row.projectName))].sort().map(project =>
+                  <option key={project}>{project}</option>)}
+              </select>
+            </label>
+            <section className="rounded-2xl border border-slate-200 bg-white p-4" aria-label="Resumen operativo">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-bold">Personal, asistencia e inventario por galpón</h3>
+                <label className="text-xs">Asistencia del día <input type="date" value={attendanceDate}
+                  onChange={event => setAttendanceDate(event.target.value)} className="rounded border p-1" /></label>
+                {canDo('informes', 'export') && <button type="button" className="rounded-lg bg-slate-100 p-2 text-xs font-bold"
+                  onClick={() => { if (requirePermission('informes', 'export')) downloadCsvFile(
+                    'Resumen_operativo_' + attendanceDate + '.csv', fieldHeaders, fieldRows.map(fieldValues)); }}>
+                  Exportar resumen CSV
+                </button>}
+              </div>
+              <div className="mt-3 overflow-x-auto">
+                <table className="w-full min-w-[620px] text-left text-xs">
+                  <thead><tr>{fieldHeaders.map(header => <th key={header} className="p-2">{header}</th>)}</tr></thead>
+                  <tbody>{fieldRows.map(row => <tr key={row.id} className="border-t">
+                    {fieldValues(row).map((value, index) => <td key={index} className="p-2">{value}</td>)}
+                  </tr>)}</tbody>
+                </table>
+                {!fieldRows.length && <p className="p-2 text-xs text-slate-500">No hay galpones para estos filtros.</p>}
+              </div>
+            </section>
+
+
             {/* Cabecera Principal y Botones de Exportación */}
             <div className="bg-white p-5 rounded-2xl border border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-4 shadow-xs">
               <div>
@@ -7276,7 +7183,7 @@ export default function App() {
                     className="w-full px-2.5 py-2 bg-slate-50 border border-slate-300 rounded-xl font-medium focus:bg-white text-xs"
                   >
                     <option value="ALL">Sector: Todos</option>
-                    {scopedSectors.map((s) => (
+                    {sectors.map((s) => (
                       <option key={s.id} value={s.id}>
                         {s.name}
                       </option>
@@ -7581,6 +7488,14 @@ export default function App() {
                     {profile?.displayName || activeUserName} ({profile?.role || 'Autenticado'})
                   </span>
                 </div>
+                {canDo('movimientos', 'import') && (
+                  <label className="rounded-lg border border-slate-300 px-3 py-2 font-bold">
+                    Importar historial (CSV o Excel)
+                    <input type="file" accept=".csv,.xlsx" className="block max-w-[220px] text-xs"
+                      disabled={movementImport.busy || !isNetworkOnline} onChange={handleImportMovements} />
+                    {movementImport.message && <span role="status" className="block mt-1 max-w-xs">{movementImport.message}</span>}
+                  </label>
+                )}
                 {canDo('movimientos', 'export') && (
                   <button
                     type="button"
@@ -7634,7 +7549,7 @@ export default function App() {
             <div className="bg-white p-4 rounded-2xl border border-slate-200 flex flex-wrap items-center gap-3 text-xs">
               <select
                 value={filterLogAction}
-                onChange={(e) => setFilterLogAction(e.target.value)}
+                onChange={(e) => { setFilterLogAction(e.target.value); setMovementPage(1); }}
                 className="px-3 py-2 border border-slate-300 rounded-xl font-bold bg-slate-50"
               >
                 <option value="Todas">Todas las Acciones</option>
@@ -7645,17 +7560,11 @@ export default function App() {
 
               <select
                 value={filterLogModule}
-                onChange={(e) => setFilterLogModule(e.target.value)}
+                onChange={(e) => { setFilterLogModule(e.target.value); setMovementPage(1); }}
                 className="px-3 py-2 border border-slate-300 rounded-xl font-bold bg-slate-50"
               >
                 <option value="Todos">Todos los Módulos</option>
-                <option value="Sectores y Galpones">Sectores y Galpones</option>
-                <option value="Catálogo Maestro">Catálogo Maestro</option>
-                <option value="Actividades">Actividades</option>
-                <option value="Materiales">Materiales</option>
-                <option value="Avance Diario">Avance Diario</option>
-                <option value="Personal y Asistencia">Personal y Asistencia</option>
-                <option value="Carga Masiva">Carga Masiva</option>
+                {movementModules.map(module => <option key={module} value={module}>{module}</option>)}
               </select>
 
               <div className="relative flex-1 min-w-[200px]">
@@ -7664,7 +7573,7 @@ export default function App() {
                   type="text"
                   placeholder="Buscar por detalle, código, galpón o usuario..."
                   value={searchLogText}
-                  onChange={(e) => setSearchLogText(e.target.value)}
+                  onChange={(e) => { setSearchLogText(e.target.value); setMovementPage(1); }}
                   className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-xl bg-slate-50"
                 />
               </div>
@@ -7684,51 +7593,14 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200 font-medium">
-                    {auditLogs.filter((log) => {
-                      if (filterLogAction !== 'Todas' && log.action !== filterLogAction)
-                        return false;
-                      if (filterLogModule !== 'Todos' && log.module !== filterLogModule)
-                        return false;
-                      if (searchLogText.trim()) {
-                        const q = searchLogText.toLowerCase().trim();
-                        const match =
-                          log.description.toLowerCase().includes(q) ||
-                          log.user.toLowerCase().includes(q) ||
-                          log.module.toLowerCase().includes(q) ||
-                          log.action.toLowerCase().includes(q);
-                        if (!match) return false;
-                      }
-                      return true;
-                    }).length === 0 ? (
+                    {visibleMovements.length === 0 ? (
                       <tr>
                         <td colSpan={5} className="py-8 text-center text-slate-400">
                           No hay movimientos registrados que coincidan con el filtro.
                         </td>
                       </tr>
                     ) : (
-                      auditLogs
-                        .filter((log) => {
-                          if (
-                            filterLogAction !== 'Todas' &&
-                            log.action !== filterLogAction
-                          )
-                            return false;
-                          if (
-                            filterLogModule !== 'Todos' &&
-                            log.module !== filterLogModule
-                          )
-                            return false;
-                          if (searchLogText.trim()) {
-                            const q = searchLogText.toLowerCase().trim();
-                            const match =
-                              log.description.toLowerCase().includes(q) ||
-                              log.user.toLowerCase().includes(q) ||
-                              log.module.toLowerCase().includes(q) ||
-                              log.action.toLowerCase().includes(q);
-                            if (!match) return false;
-                          }
-                          return true;
-                        })
+                      visibleMovements.slice(movementPageStart, movementPageStart + MOVEMENTS_PAGE_SIZE)
                         .map((log) => (
                           <tr key={log.id} className="hover:bg-slate-50">
                             <td className="py-2.5 px-3 font-mono text-[11px] text-slate-600 whitespace-nowrap">
@@ -7755,6 +7627,12 @@ export default function App() {
                             </td>
                             <td className="py-2.5 px-3 text-slate-800">
                               {log.description}
+                              {[log.projectCode, log.sectorId, log.galponId].some(Boolean) && (
+                                <p className="mt-0.5 break-all text-[11px] text-slate-600">
+                                  {[log.projectCode, log.sectorId, log.galponId].filter(Boolean).join(' · ')}
+                                </p>
+                              )}
+                              {log.requestId && <p className="break-all font-mono text-[11px] text-slate-600">{log.requestId}</p>}
                             </td>
                           </tr>
                         ))
@@ -7762,6 +7640,13 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
+              {movementPageCount > 1 && <div className="flex items-center justify-between gap-2 p-3 text-xs">
+                <button type="button" disabled={visibleMovementPage <= 1} className="rounded border px-2 py-1"
+                  onClick={() => setMovementPage(visibleMovementPage - 1)}>Anterior</button>
+                <span>Página {visibleMovementPage} de {movementPageCount}</span>
+                <button type="button" disabled={visibleMovementPage >= movementPageCount} className="rounded border px-2 py-1"
+                  onClick={() => setMovementPage(visibleMovementPage + 1)}>Siguiente</button>
+              </div>}
             </div>
           </div>
         )}
@@ -7776,7 +7661,7 @@ export default function App() {
         className="fixed bottom-0 left-0 right-0 z-40 bg-white border-t border-slate-200 shadow-[0_-2px_10px_rgba(15,23,42,0.05)]"
       >
         <div className="max-w-5xl mx-auto grid grid-cols-4 px-2 sm:px-6 py-1.5 gap-1">
-          <button
+          {canDo('dashboard', 'view') && (<button
             type="button"
             data-testid="bottom-nav-dashboard"
             onClick={() => {
@@ -7794,9 +7679,9 @@ export default function App() {
             )}
             <BarChart3 className="w-5 h-5 shrink-0" />
             <span>Dashboard</span>
-          </button>
+          </button>)}
 
-          <button
+          {canDo('gantt', 'view') && (<button
             type="button"
             data-testid="bottom-nav-gantt"
             onClick={() => {
@@ -7814,9 +7699,9 @@ export default function App() {
             )}
             <Layers className="w-5 h-5 shrink-0" />
             <span>Gantt</span>
-          </button>
+          </button>)}
 
-          <button
+          {canDo('avance_diario', 'view') && (<button
             type="button"
             data-testid="bottom-nav-avance"
             onClick={() => {
@@ -7834,9 +7719,9 @@ export default function App() {
             )}
             <TrendingUp className="w-5 h-5 shrink-0" />
             <span>Avance</span>
-          </button>
+          </button>)}
 
-          <button
+          {canDo('asistencia', 'view') && (<button
             type="button"
             data-testid="bottom-nav-asistencia"
             onClick={() => {
@@ -7854,7 +7739,7 @@ export default function App() {
             )}
             <Users className="w-5 h-5 shrink-0" />
             <span>Asistencia</span>
-          </button>
+          </button>)}
         </div>
       </nav>
 
@@ -7864,14 +7749,13 @@ export default function App() {
 
       {/* MODAL: GESTIONAR PLANTILLAS / PROVEEDORES */}
       {modalManageTemplates && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-md border border-slate-200 shadow-2xl">
             <h3 className="text-base font-black text-slate-900 mb-1">
               Gestionar Plantillas / Proveedores
             </h3>
             <p className="text-xs text-slate-500 mb-4">
-              Agrega, renombra o elimina plantillas de proveedores (ej. Big Dutchman, Big
-              Herdsman, Vidulma)
+              Escribe un nombre para agregar una plantilla o duplicar una existente.
             </p>
 
             <form onSubmit={handleAddTemplateProvider} className="flex gap-2 mb-4">
@@ -7889,6 +7773,7 @@ export default function App() {
                 + Agregar
               </button>
             </form>
+            {templateCopyError && <p role="alert" className="mb-3 text-xs text-rose-700">{templateCopyError}</p>}
 
             <div className="space-y-2 max-h-60 overflow-y-auto mb-4">
               {technologies.map((tech, idx) => (
@@ -7916,6 +7801,9 @@ export default function App() {
                     <>
                       <span className="font-bold text-slate-800">{tech}</span>
                       <div className="flex items-center gap-1">
+                        {canDo('catalogo', 'create') && <button type="button" title={'Duplicar plantilla ' + tech}
+                          disabled={templateCopyBusy} onClick={() => void handleDuplicateTemplate(tech)}
+                          className="rounded p-1.5 font-semibold text-slate-700 hover:bg-slate-200">Duplicar</button>}
                         <button
                           type="button"
                           onClick={() => {
@@ -7927,14 +7815,14 @@ export default function App() {
                         >
                           <Edit2 className="w-3.5 h-3.5" />
                         </button>
-                        <button
+                        {canDo('catalogo', 'delete') && (<button
                           type="button"
                           onClick={() => requestDeleteTemplateProvider(tech)}
                           className="p-1.5 rounded hover:bg-rose-100 text-rose-600"
                           title="Eliminar plantilla"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        </button>)}
                       </div>
                     </>
                   )}
@@ -7957,7 +7845,7 @@ export default function App() {
 
       {/* MODAL: CREAR / EDITAR ITEM DEL CATÁLOGO MAESTRO */}
       {modalNewCatalogItem && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl my-8">
             <h3 className="text-base font-black text-slate-900 mb-1">
               {editingCatalogId
@@ -8247,6 +8135,12 @@ export default function App() {
                     className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-slate-50 font-mono"
                   />
                 </div>
+                <div>
+                  <label className="block font-bold text-slate-700 mb-1">Duración planificada (días)</label>
+                  <input type="number" min={1} max={3650} step={1} value={formCatalogItem.durationDays}
+                    onChange={event => setFormCatalogItem({ ...formCatalogItem, durationDays: event.target.value })}
+                    className="w-full rounded-xl border border-slate-300 bg-slate-50 px-2.5 py-2" />
+                </div>
               </div>
 
               <div className="pt-3 flex justify-end gap-2">
@@ -8271,7 +8165,7 @@ export default function App() {
 
       {/* MODAL: ASIGNAR / EDITAR MATERIAL POR GALPÓN, ÁREA, SISTEMA Y ESTRUCTURA */}
       {modalNewMaterial && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl my-8">
             <h3 className="text-base font-black text-slate-900 mb-1">
               {editingMaterialId
@@ -8283,6 +8177,7 @@ export default function App() {
               pertenece este material
             </p>
             <form onSubmit={handleSaveMaterial} className="space-y-3 text-xs">
+              {materialError && <p role="alert" className="text-xs text-rose-700">{materialError}</p>}
               <div>
                 <label className="block font-bold text-slate-700 mb-1">
                   Galpón Destino: {allGalponesList.length > 0 && !editingMaterialId ? '*' : ''}
@@ -8597,7 +8492,7 @@ export default function App() {
 
       {/* MODAL: NUEVO PROYECTO / SECTOR */}
       {modalNewProject && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-md border border-slate-200 shadow-2xl">
             <h3 className="text-base font-black text-slate-900 mb-1">
               Crear Nuevo Proyecto / Sector
@@ -8677,7 +8572,7 @@ export default function App() {
 
       {/* MODAL: EDITAR PROYECTO / SECTOR */}
       {modalEditProject && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-md border border-slate-200 shadow-2xl">
             <h3 className="text-base font-black text-slate-900 mb-1">Editar Sector</h3>
             <form onSubmit={handleSaveEditProject} className="space-y-3 text-xs mt-3">
@@ -8753,7 +8648,7 @@ export default function App() {
 
       {/* MODAL: NUEVO GALPÓN */}
       {modalNewGalpon && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl">
             <h3 className="text-base font-black text-slate-900 mb-1">
               Crear Nuevo Galpón
@@ -8772,7 +8667,7 @@ export default function App() {
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
                 >
                   <option value="">-- Seleccionar Sector --</option>
-                  {scopedSectors.map((s) => (
+                  {sectors.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name}
                     </option>
@@ -8830,13 +8725,13 @@ export default function App() {
 
               <div>
                 <label className="block font-bold text-slate-700 mb-1">
-                  Supervisores Responsables (separados por coma):
+                  Responsable (texto libre)
                 </label>
                 <input
                   type="text"
-                  value={formGalpon.supervisorsStr}
+                  value={formGalpon.responsible}
                   onChange={(e) =>
-                    setFormGalpon({ ...formGalpon, supervisorsStr: e.target.value })
+                    setFormGalpon({ ...formGalpon, responsible: e.target.value })
                   }
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50"
                 />
@@ -8893,7 +8788,7 @@ export default function App() {
 
       {/* MODAL: EDITAR GALPÓN (CON CAMBIO DE PLANTILLA DE PROVEEDOR) */}
       {modalEditGalpon && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl">
             <h3 className="text-base font-black text-slate-900 mb-1">
               Editar Galpón y Plantilla de Proveedor
@@ -8949,13 +8844,13 @@ export default function App() {
 
               <div>
                 <label className="block font-bold text-slate-700 mb-1">
-                  Supervisores Responsables:
+                  Responsable (texto libre)
                 </label>
                 <input
                   type="text"
-                  value={formGalpon.supervisorsStr}
+                  value={formGalpon.responsible}
                   onChange={(e) =>
-                    setFormGalpon({ ...formGalpon, supervisorsStr: e.target.value })
+                    setFormGalpon({ ...formGalpon, responsible: e.target.value })
                   }
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50"
                 />
@@ -9012,7 +8907,7 @@ export default function App() {
 
       {/* MODAL: AGREGAR ACTIVIDAD AL GALPÓN (SELECCIÓN PROGRESIVA DESDE CATÁLOGO MAESTRO) */}
       {modalNewActivity && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-xl border border-slate-200 shadow-2xl my-8">
             <h3 className="text-base font-black text-slate-900 mb-1">
               Agregar Actividad a Galpón
@@ -9498,7 +9393,7 @@ export default function App() {
 
       {/* MODAL: EDITAR ACTIVIDAD DEL GALPÓN */}
       {modalEditGalponActivity && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-md border border-slate-200 shadow-2xl">
             <h3 className="text-base font-black text-slate-900 mb-1">
               Editar Actividad del Galpón
@@ -9634,13 +9529,13 @@ export default function App() {
                 </div>
               </div>
               <div className="pt-3 flex justify-end gap-2">
-                <button
+                {canDo('actividades', 'edit') && (<button
                   type="button"
                   onClick={() => setModalEditGalponActivity(null)}
                   className="px-4 py-2 font-bold text-slate-500"
                 >
                   Cancelar
-                </button>
+                </button>)}
                 <button
                   type="submit"
                   className="px-5 py-2 rounded-xl bg-[#0f6b38] text-white font-bold"
@@ -9655,7 +9550,7 @@ export default function App() {
 
       {/* MODAL: REGISTRAR / MODIFICAR AVANCE DIARIO EN CASCADA + CONSUMO MANUAL DE MATERIALES POR ID */}
       {modalNewAdvance && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl my-8">
             <h3 className="text-base font-black text-slate-900 mb-1">
               {editingAdvanceId
@@ -9694,7 +9589,7 @@ export default function App() {
                         areaName: e.target.value,
                         sistemaName: '',
                         structureName: '',
-                        activityCode: ''
+                        activityId: ''
                       })
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
@@ -9718,7 +9613,7 @@ export default function App() {
                       setFormAdvance({
                         ...formAdvance,
                         structureName: e.target.value,
-                        activityCode: ''
+                        activityId: ''
                       })
                     }
                     className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 font-bold"
@@ -9749,12 +9644,12 @@ export default function App() {
                 </label>
                 <select
                   required
-                  value={formAdvance.activityCode}
+                  value={formAdvance.activityId}
                   onChange={(e) => {
                     setAdvanceValidationError(null);
                     setFormAdvance({
                       ...formAdvance,
-                      activityCode: e.target.value,
+                      activityId: e.target.value,
                       isAuthorizedCorrection: false,
                       correctionReason: ''
                     });
@@ -9765,7 +9660,7 @@ export default function App() {
                   {cascadeAdvancesList.map((a) => {
                     const isPct = a.progressMode === 'percentage';
                     return (
-                      <option key={a.id} value={a.code}>
+                      <option key={a.id} value={a.id}>
                         [{a.code}] {a.structureName} → {a.name} (
                         {isPct
                           ? `Modalidad Porcentaje: Actual ${a.progressPercent}% / 100%`
@@ -9928,11 +9823,11 @@ export default function App() {
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">
-                    Supervisor Responsable:
+                    Responsable del parte (informativo)
                   </label>
                   <input
                     type="text"
-                    placeholder={currentGalpon?.supervisors?.[0] || activeUserName}
+                    placeholder={barnResponsible(currentGalpon) || activeUserName}
                     value={formAdvance.supervisor}
                     onChange={(e) =>
                       setFormAdvance({ ...formAdvance, supervisor: e.target.value })
@@ -10085,6 +9980,32 @@ export default function App() {
               )}
 
               {/* Consumo Manual Guiado de Materiales Vinculados por ID Único */}
+
+              <fieldset className="space-y-1 rounded-xl border border-slate-200 p-2.5">
+                <legend className="px-1 font-bold text-slate-700">Personal relacionado</legend>
+                {(() => {
+                  const second = formAdvance.sharedAcrossTwoGalpones
+                    ? allGalponesList.find(item => item.id === formAdvance.secondGalponId) : undefined;
+                  const visible = masterWorkforce.filter(worker => formAdvance.workerIds.includes(worker.id) ||
+                    (currentGalpon && workerAtLocation(worker, currentSector?.id, currentGalpon.id)) ||
+                    (second && workerAtLocation(worker, second.sectorId, second.id)));
+                  const ids = new Set(visible.map(worker => worker.id));
+                  const options = [...visible, ...formAdvance.workerIds.filter(id => !ids.has(id)).map(id => ({ id, name: 'Operario histórico' }))];
+                  return options.length ? (
+                    <div className="grid max-h-28 gap-1 overflow-auto sm:grid-cols-2">
+                      {options.map(worker => <label key={worker.id} className="flex items-center gap-2">
+                        <input type="checkbox" checked={formAdvance.workerIds.includes(worker.id)}
+                          onChange={event => {
+                            const checked = event.target.checked;
+                            setFormAdvance(previous => ({ ...previous, workerIds: checked
+                              ? [...previous.workerIds, worker.id] : previous.workerIds.filter(id => id !== worker.id) }));
+                          }} />
+                        {worker.name}{worker.workerCode ? ' · ' + worker.workerCode : ''}
+                      </label>)}
+                    </div>
+                  ) : <p className="text-slate-500">Sin personal activo asignado al galpón.</p>;
+                })()}
+              </fieldset>
               {selectedAdvanceActivityObj &&
                 selectedAdvanceActivityObj.linkedMaterials?.length > 0 && (
                   <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 space-y-2">
@@ -10169,7 +10090,7 @@ export default function App() {
 
       {/* MODAL: NUEVO OPERARIO (SIN VALORES PREDETERMINADOS FIJOS - C-7) */}
       {modalNewWorker && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-md border border-slate-200 shadow-2xl">
             <h3 className="text-base font-black text-slate-900 mb-1">
               Agregar Operario a la Planilla
@@ -10324,7 +10245,7 @@ export default function App() {
 
       {/* MODAL: CARGA MASIVA EXCEL (.XLSX / .CSV / PEGADO) CON VALIDACIÓN Y VISTA PREVIA (C-6) */}
       {modalBulkUpload && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-4xl border border-slate-200 shadow-2xl my-8 space-y-4">
             <div className="flex items-start justify-between gap-3">
               <div>
@@ -10356,6 +10277,11 @@ export default function App() {
             </div>
 
             <form onSubmit={handleConfirmBulkUpload} className="space-y-4 text-xs">
+              <button type="button" onClick={() => void downloadBulkTemplate().catch(() => setBulkFileError('No se pudo generar la plantilla.'))}
+                className="rounded border px-3 py-2 font-bold">Descargar plantilla Excel</button>
+              {(bulkFileError || bulkImportAnalysis.error) && <p role="alert" className="text-xs text-rose-700">
+                {bulkFileError || bulkImportAnalysis.error}
+              </p>}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {/* Selección directa de archivo .xlsx / .xls / .csv */}
                 <div className="p-3.5 rounded-xl border-2 border-dashed border-emerald-300 bg-emerald-50/40 flex flex-col justify-between gap-2">
@@ -10432,6 +10358,15 @@ export default function App() {
                   placeholder="Pega aquí las filas copiadas desde tu hoja de cálculo Excel o CSV..."
                   value={bulkCsvText}
                   onChange={(e) => {
+                    bulkReadId.current++;
+                    setBulkFileError('');
+                    if (e.target.value.length > MAX_IMPORT_BYTES) {
+                      setBulkFileError('El texto supera el límite de 2 MB.');
+                      setBulkCsvText('');
+                      setBulkRawRows([]);
+                      setBulkFileName('');
+                      return;
+                    }
                     setBulkCsvText(e.target.value);
                     if (e.target.value.trim()) {
                       setBulkRawRows([]);
@@ -10575,7 +10510,7 @@ export default function App() {
                 </button>
                 <button
                   type="submit"
-                  disabled={bulkImportAnalysis.validRows.length === 0}
+                  disabled={bulkImportAnalysis.validRows.length === 0 || queuingPersonalImport}
                   className="px-5 py-2 rounded-xl bg-[#0f6b38] hover:bg-[#0a4e28] disabled:opacity-40 text-white font-bold"
                 >
                   Importar {bulkImportAnalysis.validRows.length} Fila(s) Válida(s)
@@ -10588,7 +10523,7 @@ export default function App() {
 
       {/* MODAL: CONFIRMACIÓN SEGURA DE ELIMINACIÓN (SECTORES, GALPONES, ACTIVIDADES, MATERIALES, OPERARIOS, AVANCES, CATÁLOGO) */}
       {deleteConfirmModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-lg border border-slate-200 shadow-2xl space-y-4">
             <div className="flex items-start gap-3">
               <div className="p-2.5 rounded-xl bg-rose-100 text-rose-700 shrink-0">
@@ -10596,8 +10531,8 @@ export default function App() {
               </div>
               <div>
                 <h3 className="text-base font-black text-slate-900">
-                  Confirmar eliminación de{' '}
-                  {deleteConfirmModal.type === 'sector'
+                  {deleteConfirmModal.type === 'gantt_withdrawal' ? 'Retirar del plan' : 'Confirmar eliminación de'}{' '}
+                  {deleteConfirmModal.type === 'gantt_withdrawal' ? '' : deleteConfirmModal.type === 'sector'
                     ? 'Sector'
                     : deleteConfirmModal.type === 'galpon'
                       ? 'Galpón'
@@ -10617,8 +10552,9 @@ export default function App() {
                   : [{deleteConfirmModal.code}] {deleteConfirmModal.name}
                 </h3>
                 <p className="text-xs text-slate-500 mt-1">
-                  Verifica el impacto de esta acción antes de eliminar definitivamente el
-                  registro.
+                  {deleteConfirmModal.type === 'gantt_withdrawal'
+                    ? 'La actividad y sus avances seguirán disponibles en los demás módulos.'
+                    : 'Verifica el impacto de esta acción antes de eliminar definitivamente el registro.'}
                 </p>
               </div>
             </div>
@@ -10695,66 +10631,12 @@ export default function App() {
               </div>
             )}
 
-            {(deleteConfirmModal.type === 'sector' ||
-              deleteConfirmModal.type === 'galpon') &&
-              ((deleteConfirmModal.stats?.materials || 0) > 0 ||
-                (deleteConfirmModal.stats?.workers || 0) > 0 ||
-                (deleteConfirmModal.stats?.advances || 0) > 0) && (
-                <div className="space-y-2 text-xs">
-                  <p className="font-bold text-slate-700">
-                    ¿Cómo deseas manejar los materiales y registros vinculados?
-                  </p>
-                  <label className="flex items-start gap-2.5 p-3 rounded-xl border border-slate-200 bg-slate-50 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="deleteStrategyMode"
-                      checked={deleteConfirmModal.mode === 'preserve_unassign'}
-                      onChange={() =>
-                        setDeleteConfirmModal({
-                          ...deleteConfirmModal,
-                          mode: 'preserve_unassign'
-                        })
-                      }
-                      className="mt-0.5 accent-[#0f6b38]"
-                    />
-                    <div>
-                      <span className="font-bold text-slate-900 block">
-                        Conservar materiales y operarios como «Sin galpón asignado» (Recomendado)
-                      </span>
-                      <span className="text-slate-500 text-[11px]">
-                        Los materiales y operarios se conservan en el inventario/planilla sin
-                        galpón asignado, y se limpian los avances del galpón eliminado
-                        recalculando el stock.
-                      </span>
-                    </div>
-                  </label>
-
-                  <label className="flex items-start gap-2.5 p-3 rounded-xl border border-rose-200 bg-rose-50/40 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="deleteStrategyMode"
-                      checked={deleteConfirmModal.mode === 'cascade_delete'}
-                      onChange={() =>
-                        setDeleteConfirmModal({
-                          ...deleteConfirmModal,
-                          mode: 'cascade_delete'
-                        })
-                      }
-                      className="mt-0.5 accent-rose-600"
-                    />
-                    <div>
-                      <span className="font-bold text-rose-900 block">
-                        Eliminar también los materiales y avances vinculados
-                      </span>
-                      <span className="text-rose-700 text-[11px]">
-                        Elimina el {deleteConfirmModal.type === 'sector' ? 'sector' : 'galpón'}{' '}
-                        junto con sus partes diarios y materiales asignados, y desvincula a los
-                        operarios.
-                      </span>
-                    </div>
-                  </label>
-                </div>
-              )}
+            {(deleteConfirmModal.type === 'sector' || deleteConfirmModal.type === 'galpon') && (
+              <p className="text-xs text-slate-600">
+                La baja se confirmará si la ubicación carece de registros operativos vinculados.
+                Consulte el resultado en el Centro de Sincronización.
+              </p>
+            )}
 
             <div className="flex justify-end gap-2 pt-2">
               <button
@@ -10767,9 +10649,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleConfirmDeleteEntity}
+                disabled={queuingGanttWithdrawal}
                 className="px-5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs"
               >
-                Confirmar Eliminación
+                {deleteConfirmModal.type === 'gantt_withdrawal' ? 'Confirmar retiro del plan' : 'Confirmar Eliminación'}
               </button>
             </div>
           </div>
@@ -10788,7 +10671,10 @@ export default function App() {
         isManualSyncing={isManualSyncing}
         userRole={profile?.role}
         activeUserId={profile?.uid}
+        activeScopeKey={scopeKey}
         onTriggerManualSync={triggerManualSync}
+        onDismissAttendanceConflict={dismissAttendanceConflict}
+        onRetryGanttWithdrawal={retryGanttWithdrawal}
         onResolveConflict={resolveSyncConflict}
       />
     </div>

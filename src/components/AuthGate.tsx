@@ -1,4 +1,5 @@
-import React, { useState, useEffect, createContext, useContext } from 'react';
+import React, { useState, useEffect, useRef, createContext, useContext } from 'react';
+import type { User } from 'firebase/auth';
 import {
   Lock,
   Mail,
@@ -24,16 +25,22 @@ import {
 } from '../firebase/authService';
 import { UserAdminModal } from './UserAdminModal';
 import { GalponLogoIcon } from './GalponLogoIcon';
+import { preferCurrentProfile } from '../firebase/profileVersion';
+import { operationalScopeKey } from '../firebase/operationalData';
+import { resolveModule } from '../firebase/permissions';
+import { offlineAuthorizationMs } from '../firebase/offlineAuthorization';
 
 interface AuthContextValue {
   profile: UserProfile | null;
   openUserAdminModal: () => void;
+  canManageUsers: boolean;
   logout: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue>({
   profile: null,
   openUserAdminModal: () => {},
+  canManageUsers: false,
   logout: async () => {}
 });
 
@@ -49,6 +56,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
   const [initializing, setInitializing] = useState(true);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const sessionGeneration = useRef(0);
 
   // Login Form State
   const [mode, setMode] = useState<'login' | 'reset'>('login');
@@ -61,70 +69,110 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
 
   // User Admin Modal State (Only for Administrador)
   const [isUserAdminOpen, setIsUserAdminOpen] = useState(false);
+  const [authorizationReachable, setAuthorizationReachable] = useState(false);
 
   useEffect(() => {
     let unsubscribeProfile: (() => void) | null = null;
+    let unsubscribeReconnect: (() => void) | null = null;
+    let expiryTimer: ReturnType<typeof setTimeout>;
+    let expiresAt = 0;
+    const suspendAdministration = () => {
+      setAuthorizationReachable(false);
+      setIsUserAdminOpen(false);
+    };
 
+    const initialGeneration = sessionGeneration.current;
     handleGoogleRedirectResult().catch((err) => {
-      setAuthError(translateFirebaseAuthError(err));
+      if (sessionGeneration.current === initialGeneration || !auth.currentUser) {
+        setAuthError(translateFirebaseAuthError(err));
+      }
     });
 
-    const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
+    const verifyCurrent = async (firebaseUser: User | null) => {
+      const generation = ++sessionGeneration.current;
       if (unsubscribeProfile) {
         unsubscribeProfile();
         unsubscribeProfile = null;
       }
+      unsubscribeReconnect?.();
+      unsubscribeReconnect = null;
+      clearTimeout(expiryTimer);
+      expiresAt = 0;
+      setProfile(null);
+      suspendAdministration();
 
       if (!firebaseUser) {
-        setProfile(null);
         setInitializing(false);
         return;
       }
 
+      const isCurrentSession = () => sessionGeneration.current === generation && auth.currentUser === firebaseUser;
+      const publish = (received: UserProfile) => {
+        if (!isCurrentSession()) return;
+        expiresAt = Date.now() + offlineAuthorizationMs;
+        clearTimeout(expiryTimer);
+        expiryTimer = setTimeout(() => {
+          if (isCurrentSession()) void verifyCurrent(firebaseUser);
+        }, offlineAuthorizationMs);
+        setAuthorizationReachable(typeof navigator === 'undefined' || navigator.onLine);
+        setProfile(known => known?.uid === received.uid ? preferCurrentProfile(received, known) : received);
+      };
+      const endSession = (err: unknown) => {
+        if (!isCurrentSession()) return;
+        sessionGeneration.current++;
+        clearTimeout(expiryTimer);
+        expiresAt = 0;
+        setProfile(null);
+        suspendAdministration();
+        setInitializing(false);
+        setAuthError(translateFirebaseAuthError(err));
+        void logoutSession().catch(() => {});
+      };
       try {
         const verifiedProfile = await fetchOrBootstrapProfile(firebaseUser);
-        setProfile(verifiedProfile);
+        if (!isCurrentSession()) return;
+        publish(verifiedProfile);
         setAuthError(null);
 
         unsubscribeProfile = subscribeToUserProfile(
-          firebaseUser.uid,
-          async (liveProfile) => {
-            if (!liveProfile) {
-              setAuthError('Su perfil de usuario ya no se encuentra registrado en el sistema.');
-              await logoutSession();
-              setProfile(null);
-              return;
-            }
-            if (!liveProfile.active) {
-              setAuthError('Su cuenta ha sido desactivada por el Administrador. Sesión finalizada.');
-              await logoutSession();
-              setProfile(null);
-              return;
-            }
-            setProfile(liveProfile);
+          firebaseUser,
+          publish,
+          err => {
+            if (!isCurrentSession()) return;
+            const status = (err as { status?: number } | null)?.status;
+            if (status === 401 || status === 403) endSession(err);
+            else suspendAdministration();
           }
         );
       } catch (err: any) {
-        setProfile(null);
-        setAuthError(translateFirebaseAuthError(err));
+        if (isCurrentSession() && ![401, 403].includes(err?.status)) {
+          setAuthError(typeof navigator !== 'undefined' && !navigator.onLine
+            ? 'Conéctese para verificar la sesión. Sus operaciones pendientes siguen guardadas.'
+            : 'La autorización no está disponible. Volveremos a comprobar la sesión.');
+          const reconnect = () => { if (isCurrentSession()) void verifyCurrent(firebaseUser); };
+          const timer = setTimeout(reconnect, 10_000);
+          window.addEventListener('online', reconnect, { once: true });
+          unsubscribeReconnect = () => { clearTimeout(timer); window.removeEventListener('online', reconnect); };
+        } else endSession(err);
       } finally {
-        setInitializing(false);
-      }
-    });
-
-    const handleE2EPreview = (event: Event) => {
-      if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
-        const customEvent = event as CustomEvent<UserProfile | null>;
-        setProfile(customEvent.detail);
-        setInitializing(false);
+        if (isCurrentSession()) setInitializing(false);
       }
     };
-    window.addEventListener('calera-e2e-preview', handleE2EPreview);
+    function checkExpiry() {
+      if (expiresAt && Date.now() >= expiresAt) void verifyCurrent(auth.currentUser);
+    }
+    const unsubscribeAuth = onAuthStateChanged(auth, verifyCurrent);
+    window.addEventListener('focus', checkExpiry);
+    window.addEventListener('offline', suspendAdministration);
 
     return () => {
+      sessionGeneration.current++;
+      clearTimeout(expiryTimer);
+      window.removeEventListener('focus', checkExpiry);
+      window.removeEventListener('offline', suspendAdministration);
       unsubscribeAuth();
       if (unsubscribeProfile) unsubscribeProfile();
-      window.removeEventListener('calera-e2e-preview', handleE2EPreview);
+      unsubscribeReconnect?.();
     };
   }, []);
 
@@ -140,8 +188,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
 
     setSubmitting(true);
     try {
-      const { profile: loggedProfile } = await loginWithEmail(email, password);
-      setProfile(loggedProfile);
+      await loginWithEmail(email, password);
       setPassword('');
     } catch (err: any) {
       setAuthError(translateFirebaseAuthError(err));
@@ -155,10 +202,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
     setResetSuccessMsg(null);
     setGoogleSubmitting(true);
     try {
-      const res = await loginWithGoogle();
-      if (res && res.profile) {
-        setProfile(res.profile);
-      }
+      await loginWithGoogle();
     } catch (err: any) {
       setAuthError(translateFirebaseAuthError(err));
     } finally {
@@ -190,9 +234,10 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
   };
 
   const handleLogout = async () => {
+    sessionGeneration.current++;
     setIsUserAdminOpen(false);
-    await logoutSession();
     setProfile(null);
+    await logoutSession();
   };
 
   if (initializing) {
@@ -425,16 +470,29 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
     <AuthContext.Provider
       value={{
         profile,
-        openUserAdminModal: () => setIsUserAdminOpen(true),
+        canManageUsers: profile.role === 'Administrador' && authorizationReachable,
+        openUserAdminModal: () => {
+          if (profile.role === 'Administrador' && authorizationReachable) setIsUserAdminOpen(true);
+        },
         logout: handleLogout
       }}
     >
       <div className="min-h-screen flex flex-col bg-slate-100">
         {/* Contenido Principal de la Aplicación (la identificación de usuario y controles de sesión están integrados en la barra superior verde institucional) */}
-        <div className="flex-1 flex flex-col">{children}</div>
+        {resolveModule(profile, '') ? (
+          <div key={operationalScopeKey(profile)} className="flex-1 flex flex-col">{children}</div>
+        ) : (
+          <main className="m-auto w-full max-w-md p-6 text-center" data-testid="restricted-access">
+            <h1 className="text-xl font-bold text-slate-900">Acceso restringido</h1>
+            <p className="my-3 text-slate-600">Su rol no tiene módulos habilitados.</p>
+            <button type="button" className="rounded-lg bg-slate-900 px-4 py-2 text-white" onClick={handleLogout}>
+              Cerrar sesión
+            </button>
+          </main>
+        )}
 
         {/* Modal de Administración de Usuarios (Exclusivo Administrador) */}
-        {profile.role === 'Administrador' && isUserAdminOpen && (
+        {profile.role === 'Administrador' && authorizationReachable && isUserAdminOpen && (
           <UserAdminModal
             currentUserProfile={profile}
             onClose={() => setIsUserAdminOpen(false)}

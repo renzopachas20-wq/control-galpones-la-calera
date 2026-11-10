@@ -3,6 +3,16 @@ export type ProgressModality = 'quantity' | 'percentage';
 export const NO_SISTEMA_VALUE = '__SIN_SISTEMA__';
 export const NO_SISTEMA_LABEL = 'General (Aplicación directa en Área)';
 
+export function providerIdFromName(name: string): string {
+  const clean = name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return 'prov_' + (clean || 'DEFAULT');
+}
+
+export function catalogCodeKey(technology: unknown, code: unknown): string {
+  return typeof technology === 'string' && typeof code === 'string' && technology.trim() && code.trim()
+    ? JSON.stringify([technology.trim().toLowerCase(), code.trim().toUpperCase()]) : '';
+}
+
 export interface MasterCatalogRecord {
   id: string;
   technology?: string;

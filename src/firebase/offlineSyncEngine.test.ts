@@ -1027,6 +1027,8 @@ describe('ETAPA 2 — SEGURIDAD Y SINCRONIZACIÓN: C-3 (Reintentos Idempotentes 
     assert.equal(whenUserBLogsIn.foreignPendingOps.length, 1);
     assert.equal(whenUserBLogsIn.foreignPendingOps[0].userId, 'uid_user_A');
     assert.deepEqual(whenUserBLogsIn.foreignAuthors, ['Ana Supervisora (Usuario A)']);
+    const unattributed = { ...sharedDeviceQueue[0], operationId: 'legacy', userId: 'local_user' };
+    assert.equal(partitionQueueByUserIdentity([unattributed], 'uid_user_B').ownPendingOps.length, 0);
 
     // Incluso si Usuario B registra una operación offline en el mismo dispositivo (incluso sobre el mismo documentId),
     // NO sobrescribe ni altera el userId de la operación pendiente de Usuario A
@@ -1059,6 +1061,13 @@ describe('ETAPA 2 — SEGURIDAD Y SINCRONIZACIÓN: C-3 (Reintentos Idempotentes 
     assert.equal(partForUserB.ownPendingOps[0].userId, 'uid_user_B');
     assert.equal(partForUserB.foreignPendingOps.length, 1);
     assert.equal(partForUserB.foreignPendingOps[0].userId, 'uid_user_A');
+    const attendance = { ...sharedDeviceQueue[1], collectionName: 'attendance' as const,
+      documentId: '2026-11-05', scopeKey: 'uid_user_B:scope', requestId: 'receipt-one',
+      payload: { records: { workerA: 'Asistió' } } };
+    const patches = enqueueOfflineOperation(enqueueOfflineOperation([], attendance), {
+      ...attendance, requestId: 'receipt-two', payload: { records: { workerB: 'Asistió' } }
+    });
+    assert.deepEqual(patches.map(operation => operation.requestId), ['receipt-one', 'receipt-two']);
 
     // Simular que Usuario B sincroniza únicamente su propia operación y conserva intacta la cola de Usuario A
     const queueAfterUserBSync = [...partForUserB.foreignPendingOps];

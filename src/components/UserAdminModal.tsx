@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
   Users,
@@ -9,30 +9,37 @@ import {
   AlertCircle,
   Loader2,
   KeyRound,
-  Mail,
   Edit3,
   Copy,
   Check,
   RefreshCw,
-  Building2,
-  Layers,
   CreditCard,
-  FolderKanban,
   Table2
 } from 'lucide-react';
-import { collection, getDocs } from 'firebase/firestore';
-import { db } from '../firebase/config';
 import {
   OFFICIAL_ROLES,
+  PRIMARY_ADMIN_UID,
   adminListUsers,
   adminCreateUser,
   adminUpdateUser,
   adminGenerateTempPassword,
-  adminSendPasswordReset,
+  adminListReservations,
+  adminManageReservation,
+  adminListCredentialOperations,
+  adminListAuthMethods,
+  adminReconcileCredential,
+  adminCancelReadyPassword,
+  adminEmergencyDisable,
+  adminRevokeSessions,
+  type CredentialOperationStatus,
+  type ProvisioningReservation,
   type OfficialRole,
   type AuthMethod,
+  type UpdateUserInput,
   type UserProfile
 } from '../firebase/authService';
+import { preferCurrentProfile } from '../firebase/profileVersion';
+import { describeEmergencyStatus, type EmergencyStatus } from '../firebase/emergencyStatus';
 import {
   ROLE_PERMISSION_MATRIX,
   MODULE_LABELS,
@@ -46,25 +53,19 @@ interface UserAdminModalProps {
   onClose: () => void;
 }
 
-interface SectorOption {
-  id: string;
-  name: string;
-  sheds: { id: string; name: string; projectCode?: string }[];
-}
-
 const ROLE_DESCRIPTIONS: Record<OfficialRole, string> = {
   'Administrador':
     'Acceso total al sistema, gestión de usuarios, roles, catálogo maestro, sectores, galpones, materiales, personal y auditoría.',
   'Jefe de proyecto':
-    'Supervisión integral de proyecto, edición de cronograma, sectores, catálogo, avances, asistencia, informes y materiales.',
+    'Gestión de cronogramas, sectores, galpones, avances, asistencia e informes. Catálogo, actividades, materiales y personal en consulta.',
   'Supervisor':
-    'Gestión operativa de campo en sectores y galpones asignados: registro y edición de avances diarios, actividades, personal y asistencia.',
+    'Consulta de sectores y galpones, registro y edición de avances diarios y las demás acciones de la matriz del rol.',
   'Auxiliar':
-    'Apoyo operativo en campo: registro de avances diarios y control de asistencia en los sectores/galpones asignados.',
+    'Apoyo operativo en avances, asistencia, galpones y personal. Puede consultar la bitácora. Dashboard, Gantt y catálogo están restringidos.',
   'Almacén':
     'Control especializado de inventario de materiales: ingresos, salidas, stock mínimo, kardex y alertas por galpón.',
   'Solo lectura':
-    'Consulta y exportación de dashboards, cronogramas, avances e informes sin permisos de creación, edición ni eliminación.'
+    'El perfil puede autenticarse. La matriz vigente no habilita módulos operativos para este rol.'
 };
 
 const AUTH_METHOD_LABELS: Record<AuthMethod, string> = {
@@ -74,12 +75,8 @@ const AUTH_METHOD_LABELS: Record<AuthMethod, string> = {
 };
 
 function generateRandomPassword(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-  let suffix = '';
-  for (let i = 0; i < 6; i++) {
-    suffix += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return `Calera#${suffix}9`;
+  return 'Calera#9' + Array.from(crypto.getRandomValues(new Uint8Array(18)),
+    byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
 export const UserAdminModal: React.FC<UserAdminModalProps> = ({
@@ -87,13 +84,19 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
   onClose
 }) => {
   const [users, setUsers] = useState<UserProfile[]>([]);
+  const knownProfiles = useRef(new Map<string, UserProfile>());
+  const [reservations, setReservations] = useState<ProvisioningReservation[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [successBanner, setSuccessBanner] = useState<string | null>(null);
+  const [successBanner, setSuccessBanner] = useState<string | (EmergencyStatus & { additional: string }) | null>(null);
 
   // Vistas del modal: lista, crear, editar, matriz de permisos
   const [viewMode, setViewMode] = useState<'list' | 'create' | 'edit' | 'matrix'>('list');
   const [editingUser, setEditingUser] = useState<UserProfile | null>(null);
+  const editOperationIds = useRef(new Map<string, string>());
+  const sessionOperationIds = useRef(new Map<string, string>());
+  const passwordRequests = useRef(new Map<string, { id: string; password: string }>());
+  const [cancellablePassword, setCancellablePassword] = useState<string | null>(null);
   const [matrixSelectedRole, setMatrixSelectedRole] = useState<OfficialRole>('Administrador');
 
   // Formulario de Usuario (Crear / Editar)
@@ -101,108 +104,76 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
   const [formDni, setFormDni] = useState('');
   const [formEmail, setFormEmail] = useState('');
   const [formAuthMethod, setFormAuthMethod] = useState<AuthMethod>('password');
+  const [availableAuthMethods, setAvailableAuthMethods] = useState<AuthMethod[]>([]);
   const [formPassword, setFormPassword] = useState(generateRandomPassword());
   const [formRole, setFormRole] = useState<OfficialRole>('Supervisor');
   const [formActive, setFormActive] = useState(true);
-  const [formAssignedProject, setFormAssignedProject] = useState('TODOS');
-  const [formSectorIds, setFormSectorIds] = useState<string[]>([]);
-  const [formGalponIds, setFormGalponIds] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [copiedPass, setCopiedPass] = useState(false);
 
   // Modal de Contraseña Temporal Generada
   const [generatedTempCreds, setGeneratedTempCreds] = useState<{
+    uid: string;
+    operationId: string;
+    profileVersion: number;
+    credentialVersion: number;
     displayName: string;
     email: string;
     tempPassword: string;
   } | null>(null);
+  const visibleTempCreds = generatedTempCreds && users.some(user =>
+    user.uid === generatedTempCreds.uid && (user.profileVersion ?? 0) === generatedTempCreds.profileVersion &&
+    (user.credentialVersion ?? 0) === generatedTempCreds.credentialVersion
+  ) ? generatedTempCreds : null;
+  useEffect(() => {
+    if (generatedTempCreds && !visibleTempCreds) setGeneratedTempCreds(null);
+  }, [generatedTempCreds, visibleTempCreds]);
 
-  // Sectores y Galpones disponibles (desde Firestore o respaldo local)
-  const [availableSectors, setAvailableSectors] = useState<SectorOption[]>([]);
+  const rememberVersion = (received: UserProfile) => {
+    const known = knownProfiles.current.get(received.uid);
+    const current = known ? preferCurrentProfile(known, received) : received;
+    knownProfiles.current.set(received.uid, current);
+    return current;
+  };
+
+  const rememberUser = (updated: UserProfile) => {
+    const current = rememberVersion(updated);
+    setUsers(prev => prev.map(user => user.uid === current.uid ? preferCurrentProfile(user, current) : user));
+  };
 
   useEffect(() => {
-    const loadSectors = async () => {
-      try {
-        const snap = await getDocs(collection(db, 'sectors'));
-        if (!snap.empty) {
-          const parsed: SectorOption[] = [];
-          snap.forEach((docSnap) => {
-            const s = docSnap.data() as any;
-            const rawGalpones = Array.isArray(s.galpones)
-              ? s.galpones
-              : Array.isArray(s.sheds)
-              ? s.sheds
-              : [];
-            parsed.push({
-              id: String(s.id || docSnap.id),
-              name: String(s.name || s.code || s.id),
-              sheds: rawGalpones.map((g: any) => ({
-                id: String(g.id),
-                name: String(g.name || g.code || `Galpón ${g.id}`),
-                projectCode: g.projectCode || s.code ? String(g.projectCode || s.code) : undefined
-              }))
-            });
-          });
-          setAvailableSectors(parsed);
-          return;
-        }
-      } catch {
-        // Fallback a localStorage si aún no hay documentos en /sectors
+    if (!generatedTempCreds) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const verify = async () => {
+      const profile = await adminListUsers().then(list => list.find(user => user.uid === generatedTempCreds.uid)).catch(() => undefined);
+      if (stopped) return;
+      if (!profile) {
+        setGeneratedTempCreds(null);
+        return;
       }
-
-      try {
-        const raw =
-          localStorage.getItem('calera_sectors_clean') ||
-          localStorage.getItem('agro_sectors_v1');
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) {
-            setAvailableSectors(
-              parsed.map((s: any) => {
-                const rawGalpones = Array.isArray(s.galpones)
-                  ? s.galpones
-                  : Array.isArray(s.sheds)
-                  ? s.sheds
-                  : [];
-                return {
-                  id: String(s.id),
-                  name: String(s.name || s.code || s.id),
-                  sheds: rawGalpones.map((g: any) => ({
-                    id: String(g.id),
-                    name: String(g.name || g.code || `Galpón ${g.id}`),
-                    projectCode: g.projectCode || s.code ? String(g.projectCode || s.code) : undefined
-                  }))
-                };
-              })
-            );
-          }
-        }
-      } catch {
-        setAvailableSectors([]);
-      }
+      rememberUser(profile);
+      timer = setTimeout(verify, 5_000);
     };
-
-    loadSectors();
-  }, []);
-
-  const availableProjects = useMemo(() => {
-    const codes = new Set<string>();
-    availableSectors.forEach((s) => {
-      s.sheds.forEach((g) => {
-        if (g.projectCode && g.projectCode.trim()) {
-          codes.add(g.projectCode.trim());
-        }
-      });
-    });
-    return Array.from(codes);
-  }, [availableSectors]);
+    timer = setTimeout(verify, 5_000);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [generatedTempCreds]);
 
   const fetchUsers = async () => {
     setLoading(true);
     setError(null);
     try {
-      const list = await adminListUsers();
-      setUsers(list);
+      const [list, incomplete] = await Promise.all([adminListUsers(), adminListReservations()]);
+      const currentList = list.map(rememberVersion);
+      setUsers(prev => {
+        const existing = new Map<string, UserProfile>(prev.map(user => [user.uid, user]));
+        return currentList.map(user => {
+          const known = existing.get(user.uid);
+          return known ? preferCurrentProfile(known, user) : user;
+        });
+      });
+      setReservations(incomplete);
+      return currentList;
     } catch (err: any) {
       setError(err?.message || 'Error al cargar la lista de usuarios.');
     } finally {
@@ -210,9 +181,43 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
     }
   };
 
+  const applyProfileResult = async (result: { user: UserProfile | null; profileRefreshRequired: boolean }, uid?: string) => {
+    if (result.profileRefreshRequired) return (await fetchUsers())?.find(user => user.uid === uid) ?? null;
+    if (result.user) rememberUser(result.user);
+    return result.user;
+  };
+
+  function showEmergencyStatus(status: EmergencyStatus, additional = '') {
+    setSuccessBanner(previous => {
+      if (previous && typeof previous !== 'string' && previous.operation.id === status.operation.id &&
+          previous.operation.state === 'completed' && status.operation.state === 'pending') return previous;
+      return { ...status, additional };
+    });
+  }
+
+  function pendingOperationMessage(operation: CredentialOperationStatus) {
+    if (operation.profileApplied === true) {
+      return `Cambio aplicado en la aplicación. Revocación en Firebase Auth pendiente. Consulte Operaciones. Referencia ${operation.id}.`;
+    }
+    return `Cambio pendiente de confirmación. Consulte Operaciones. Referencia ${operation.id}.`;
+  }
+
   useEffect(() => {
     fetchUsers();
   }, []);
+
+  useEffect(() => {
+    let current = true;
+    setAvailableAuthMethods([]);
+    if (viewMode === 'edit' && editingUser) {
+      adminListAuthMethods(editingUser.uid).then(methods => {
+        if (current) setAvailableAuthMethods(methods);
+      }).catch(() => {
+        if (current) setError('No se pudieron verificar los proveedores de este usuario.');
+      });
+    }
+    return () => { current = false; };
+  }, [viewMode, editingUser]);
 
   const openCreateForm = () => {
     setError(null);
@@ -224,15 +229,13 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
     setFormPassword(generateRandomPassword());
     setFormRole('Supervisor');
     setFormActive(true);
-    setFormAssignedProject('TODOS');
-    setFormSectorIds([]);
-    setFormGalponIds([]);
     setViewMode('create');
   };
 
   const openEditForm = (u: UserProfile) => {
     setError(null);
     setSuccessBanner(null);
+    editOperationIds.current = new Map();
     setEditingUser(u);
     setFormDisplayName(u.displayName);
     setFormDni(u.dni || '');
@@ -240,22 +243,7 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
     setFormAuthMethod(u.authMethod || 'password');
     setFormRole(u.role);
     setFormActive(u.active);
-    setFormAssignedProject(u.assignedProject || 'TODOS');
-    setFormSectorIds(u.assignedSectorIds || []);
-    setFormGalponIds(u.assignedGalponIds || []);
     setViewMode('edit');
-  };
-
-  const toggleSector = (sectorId: string) => {
-    setFormSectorIds((prev) =>
-      prev.includes(sectorId) ? prev.filter((id) => id !== sectorId) : [...prev, sectorId]
-    );
-  };
-
-  const toggleGalpon = (galponId: string) => {
-    setFormGalponIds((prev) =>
-      prev.includes(galponId) ? prev.filter((id) => id !== galponId) : [...prev, galponId]
-    );
   };
 
   const handleCopyPassword = (text: string) => {
@@ -279,9 +267,6 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
         authMethod: formAuthMethod,
         role: formRole,
         active: formActive,
-        assignedProject: formRole === 'Administrador' ? 'TODOS' : formAssignedProject,
-        assignedSectorIds: formRole === 'Administrador' ? [] : formSectorIds,
-        assignedGalponIds: formRole === 'Administrador' ? [] : formGalponIds
       });
 
       setUsers((prev) => [created, ...prev.filter((u) => u.uid !== created.uid)]);
@@ -303,31 +288,55 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
     setSuccessBanner(null);
     setSaving(true);
 
+    const operationIds = editOperationIds.current;
     try {
-      const { user: updated, authEmailSyncNote } = await adminUpdateUser(editingUser.uid, {
+      const updates: UpdateUserInput = {
+        expectedProfileVersion: editingUser.profileVersion ?? 0,
         displayName: formDisplayName.trim(),
         dni: formDni.trim(),
         email: formEmail.trim().toLowerCase(),
         authMethod: formAuthMethod,
         role: formRole,
         active: formActive,
-        assignedProject: formRole === 'Administrador' ? 'TODOS' : formAssignedProject,
-        assignedSectorIds: formRole === 'Administrador' ? [] : formSectorIds,
-        assignedGalponIds: formRole === 'Administrador' ? [] : formGalponIds
+      };
+      const submission = JSON.stringify(updates);
+      const operationId = operationIds.get(submission) ?? crypto.randomUUID();
+      operationIds.set(submission, operationId);
+      const result = await adminUpdateUser(editingUser.uid, {
+        ...updates, operationId
       });
-
-      setUsers((prev) => prev.map((u) => (u.uid === updated.uid ? updated : u)));
+      const current = await applyProfileResult(result, editingUser.uid);
+      if (editOperationIds.current !== operationIds) return;
+      const { user: updated, authEmailSyncNote, operation } = result;
+      const known = knownProfiles.current.get(editingUser.uid);
+      const outdated = updated && known && preferCurrentProfile(known, updated) !== updated;
+      const additional = result.profileEdit && result.profileEdit.state !== 'completed'
+        ? ' La edición adicional requiere revisión. Referencia ' + result.profileEdit.id + '.'
+        : result.passwordRequiresSeparateRequest ? ' Use Clave Temp. para cambiar la contraseña por separado.' : '';
+      if (operation?.kind === 'emergency') {
+        showEmergencyStatus({ operation, user: current, currentAuthentication: result.currentAuthentication }, additional);
+        setEditingUser(null);
+        setViewMode('list');
+        return;
+      }
+      if (operation?.state === 'pending') {
+        setSuccessBanner(pendingOperationMessage(operation) + additional);
+        setViewMode('list');
+        return;
+      }
       const emailMsg =
-        editingUser.email !== updated.email
+        updated && !outdated && editingUser.email !== updated.email
           ? ` Correo actualizado a ${updated.email} (${authEmailSyncNote || 'UID preservado'}).`
           : '';
       setSuccessBanner(
-        `Perfil de ${updated.displayName} actualizado correctamente (UID: ${updated.uid}).${emailMsg}`
+        (outdated ? 'Operación confirmada. La lista conserva la versión más reciente.' :
+          'Perfil de ' + (updated?.displayName ?? editingUser.displayName) + ' actualizado correctamente.' + emailMsg) +
+        additional + (operation?.audit === 'pending' ? ' Bitácora pendiente.' : '')
       );
       setEditingUser(null);
       setViewMode('list');
     } catch (err: any) {
-      setError(err?.message || 'Error al actualizar el usuario.');
+      if (editOperationIds.current === operationIds) setError(err?.message || 'Error al actualizar el usuario.');
     } finally {
       setSaving(false);
     }
@@ -341,11 +350,26 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
     setError(null);
     setSuccessBanner(null);
     try {
-      const { user: updated } = await adminUpdateUser(u.uid, { active: !u.active });
-      setUsers((prev) => prev.map((item) => (item.uid === updated.uid ? updated : item)));
-      setSuccessBanner(
-        `Usuario ${updated.displayName} ${updated.active ? 'activado' : 'desactivado'} inmediatamente.`
-      );
+      const key = `${u.uid}:${u.profileVersion ?? 0}:${!u.active}`;
+      const operationId = sessionOperationIds.current.get(key) ?? crypto.randomUUID();
+      sessionOperationIds.current.set(key, operationId);
+      const result = u.active && !u.uid.startsWith('preauth_') ? await adminEmergencyDisable(u.uid, operationId) :
+        await adminUpdateUser(u.uid, {
+        expectedProfileVersion: u.profileVersion ?? 0, active: !u.active, operationId
+      });
+      const current = await applyProfileResult(result, u.uid);
+      if (result.operation?.state !== 'pending') {
+        sessionOperationIds.current.delete(key);
+      }
+      if (result.operation?.kind === 'emergency') {
+        showEmergencyStatus({ operation: result.operation, user: current, currentAuthentication: result.currentAuthentication });
+      } else if (result.operation?.state === 'pending') {
+        setSuccessBanner(pendingOperationMessage(result.operation));
+      } else if (current && preferCurrentProfile(current, knownProfiles.current.get(u.uid) ?? current).active === !u.active) {
+        setSuccessBanner(`Usuario ${u.displayName} ${!u.active ? 'activado' : 'desactivado'}.`);
+      } else {
+        setSuccessBanner('Operación confirmada. Consulte el estado de la cuenta en la lista.');
+      }
     } catch (err: any) {
       setError(err?.message || 'Error al cambiar el estado del usuario.');
     }
@@ -354,38 +378,123 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
   const handleGenerateTempPassword = async (u: UserProfile) => {
     setError(null);
     setSuccessBanner(null);
+    const request = passwordRequests.current.get(u.uid) ?? { id: crypto.randomUUID(), password: generateRandomPassword() };
+    setGeneratedTempCreds(current => current?.uid === u.uid ? null : current);
+    passwordRequests.current.set(u.uid, request);
     try {
-      const result = await adminGenerateTempPassword(u.uid);
-      if (result.mode === 'direct_update' && result.tempPassword) {
-        setGeneratedTempCreds({
-          displayName: u.displayName,
-          email: u.email,
-          tempPassword: result.tempPassword
-        });
-        setSuccessBanner(
-          `Contraseña temporal generada y asignada para ${u.displayName}. Cópiela y entréguela al usuario.`
-        );
-      } else {
-        setSuccessBanner(result.message);
-      }
+      const result = await adminGenerateTempPassword(u.uid, request.password, request.id);
+      await applyProfileResult(result, u.uid);
+      if (passwordRequests.current.get(u.uid) !== request) return;
+      const checked = result.tempPassword ? await fetchUsers() : undefined;
+      if (passwordRequests.current.get(u.uid) !== request) return;
+      showPasswordResult(u.uid, request.id, result, checked?.some(user => user.uid === u.uid) === true);
+      if (result.operation.state === 'completed') passwordRequests.current.delete(u.uid);
     } catch (err: any) {
+      if (err?.definitiveFailure) passwordRequests.current.delete(u.uid);
       setError(err?.message || 'Error al generar contraseña temporal.');
     }
   };
 
-  const handleSendResetEmail = async (u: UserProfile) => {
+  function showPasswordResult(uid: string, operationId: string, result: Awaited<ReturnType<typeof adminGenerateTempPassword>>, confirmed: boolean) {
+    const current = knownProfiles.current.get(uid);
+    if (confirmed && result.tempPassword && current && result.user?.uid === uid && result.operation.uid === uid &&
+        result.operation.id === operationId && (result.user.profileVersion ?? 0) === (current.profileVersion ?? 0) &&
+        result.operation.version === current.credentialVersion &&
+        (result.providerAcknowledged || result.operation.state === 'completed')) {
+      setGeneratedTempCreds({ uid, operationId, profileVersion: current.profileVersion ?? 0, credentialVersion: current.credentialVersion,
+        displayName: current.displayName, email: current.email, tempPassword: result.tempPassword });
+    }
+    const audit = result.operation.audit === 'pending' && result.operation.state === 'completed' ? ' Bitácora pendiente.' : '';
+    setSuccessBanner(`${result.message}${audit} Referencia ${result.operation.id}.`);
+  }
+
+  const handleReconcileOperations = async (u: UserProfile) => {
     setError(null);
     setSuccessBanner(null);
+    setCancellablePassword(null);
     try {
-      const msg = await adminSendPasswordReset(u.uid);
-      setSuccessBanner(msg);
+      const operations = await adminListCredentialOperations(u.uid);
+      if (!operations.length) {
+        setSuccessBanner('No hay operaciones pendientes que pueda gestionar.');
+        return;
+      }
+      for (const operation of operations) {
+        if (operation.kind === 'password' && operation.authentication === 'ready') {
+          const request = passwordRequests.current.get(u.uid);
+          if (request?.id !== operation.id) {
+            setError('La contraseña original ya no está disponible. Puede cancelar esta solicitud sin enviar una contraseña a Firebase.');
+            setCancellablePassword(operation.id);
+            continue;
+          }
+          await handleGenerateTempPassword(u);
+        } else {
+          const result = await adminReconcileCredential(operation.id);
+          const current = await applyProfileResult(result, result.operation.uid);
+          if (operation.kind === 'password' && result.operation.state === 'completed') passwordRequests.current.delete(u.uid);
+          if (result.operation.kind === 'emergency') {
+            showEmergencyStatus({ operation: result.operation, user: current, currentAuthentication: result.currentAuthentication });
+          } else {
+            setSuccessBanner(result.operation.state === 'completed'
+              ? `Operación confirmada. Bitácora ${result.operation.audit === 'recorded' ? 'registrada' : 'pendiente'}.`
+              : pendingOperationMessage(result.operation));
+          }
+        }
+      }
     } catch (err: any) {
-      setError(err?.message || 'Error al enviar correo de restablecimiento.');
+      setError(err?.message || 'Error al comprobar las operaciones.');
+    }
+  };
+
+  const handleCancelReadyPassword = async (id: string) => {
+    try {
+      await adminCancelReadyPassword(id);
+      setCancellablePassword(null);
+      setError(null);
+      setSuccessBanner('Solicitud cancelada. Ya puede generar una nueva contraseña temporal.');
+    } catch (err: any) {
+      setError(err?.message || 'No se pudo cancelar la solicitud.');
+    }
+  };
+
+  const handleReservation = async (reservation: ProvisioningReservation, action: 'resume' | 'cancel') => {
+    setError(null);
+    try {
+      const password = action === 'resume' && ['ready', 'rejected'].includes(reservation.state)
+        ? generateRandomPassword() : undefined;
+      const result = await adminManageReservation(reservation.uid, action, password);
+      await fetchUsers();
+      const current = knownProfiles.current.get(reservation.uid);
+      if (password && result.passwordApplied && current && result.user?.uid === current.uid &&
+          (result.user.profileVersion ?? 0) === (current.profileVersion ?? 0)) {
+        setGeneratedTempCreds({ uid: current.uid, operationId: reservation.uid, profileVersion: current.profileVersion ?? 0,
+          credentialVersion: current.credentialVersion ?? 0,
+          displayName: current.displayName, email: current.email, tempPassword: password });
+      }
+      setSuccessBanner(action === 'resume' ? 'Alta reconciliada.' : 'Reserva vencida cancelada.');
+    } catch (err: any) {
+      setError(err?.message || 'No se pudo gestionar la reserva.');
+    }
+  };
+
+  const handleRevokeSessions = async (u: UserProfile) => {
+    setError(null);
+    try {
+      const key = `revoke:${u.uid}`;
+      const operationId = sessionOperationIds.current.get(key) ?? crypto.randomUUID();
+      sessionOperationIds.current.set(key, operationId);
+      const result = await adminRevokeSessions(u.uid, operationId);
+      await applyProfileResult(result);
+      if (result.firebaseRevoked) sessionOperationIds.current.delete(key);
+      setSuccessBanner(result.firebaseRevoked
+        ? 'Sesiones revocadas en la aplicación y Firebase Auth.'
+        : pendingOperationMessage(result.operation));
+    } catch (err: any) {
+      setError(err?.message || 'No se pudieron revocar las sesiones.');
     }
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6 overflow-y-auto">
+    <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex justify-center p-3 sm:p-6">
       <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-6xl max-h-[92vh] flex flex-col overflow-hidden">
         {/* Cabecera */}
         <div className="px-6 py-4 bg-slate-900 text-white flex items-center justify-between border-b border-slate-800">
@@ -467,22 +576,28 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
           <div className="mx-6 mt-4 p-3 rounded-xl bg-red-50 border border-red-200 flex items-start gap-2.5 text-xs text-red-700">
             <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
             <span>{error}</span>
+            {cancellablePassword && (
+              <button type="button" className="font-semibold underline" onClick={() => handleCancelReadyPassword(cancellablePassword)}>
+                Cancelar solicitud de contraseña
+              </button>
+            )}
           </div>
         )}
 
         {successBanner && (
           <div className="mx-6 mt-4 p-3 rounded-xl bg-emerald-50 border border-emerald-200 flex items-start gap-2.5 text-xs text-emerald-800">
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-            <span>{successBanner}</span>
+            <span>{typeof successBanner === 'string' ? successBanner :
+              describeEmergencyStatus(successBanner, users.find(user => user.uid === successBanner.operation.uid)) + successBanner.additional}</span>
           </div>
         )}
 
         {/* Recuadro de Contraseña Temporal Generada */}
-        {generatedTempCreds && (
+        {visibleTempCreds && (
           <div className="mx-6 mt-4 p-4 rounded-xl bg-indigo-50 border border-indigo-200 flex flex-wrap items-center justify-between gap-3 text-xs">
             <div>
               <div className="font-bold text-indigo-950">
-                Contraseña temporal asignada para {generatedTempCreds.displayName} ({generatedTempCreds.email})
+                Contraseña temporal asignada para {visibleTempCreds.displayName} ({visibleTempCreds.email})
               </div>
               <div className="text-indigo-700 mt-0.5">
                 Por seguridad Zero Trust, esta clave no se almacena en Firestore. Cópiela ahora:
@@ -490,11 +605,11 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
             </div>
             <div className="flex items-center gap-2">
               <code className="px-3 py-1.5 rounded-lg bg-white border border-indigo-300 font-mono text-sm font-bold text-indigo-900">
-                {generatedTempCreds.tempPassword}
+                {visibleTempCreds.tempPassword}
               </code>
               <button
                 type="button"
-                onClick={() => handleCopyPassword(generatedTempCreds.tempPassword)}
+                onClick={() => handleCopyPassword(visibleTempCreds.tempPassword)}
                 className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold cursor-pointer"
               >
                 {copiedPass ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
@@ -513,6 +628,25 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
 
         {/* Cuerpo Principal */}
         <div className="p-6 overflow-y-auto flex-1">
+          {viewMode === 'list' && reservations.length > 0 && (
+            <section className="mb-4 space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs">
+              <h3 className="font-semibold">Altas pendientes de confirmación</h3>
+              {reservations.map(reservation => (
+                <div key={reservation.uid} className="flex flex-wrap items-center gap-2">
+                  <span>{reservation.displayName} · {reservation.email} · {reservation.state}</span>
+                  {reservation.manageable && (
+                    <button type="button" className="rounded bg-white px-2 py-1"
+                      onClick={() => handleReservation(reservation, 'resume')}>Reanudar</button>
+                  )}
+                  {reservation.manageable && Date.parse(reservation.expiresAt) <= Date.now() &&
+                    ['ready', 'rejected'].includes(reservation.state) && (
+                    <button type="button" className="rounded bg-white px-2 py-1"
+                      onClick={() => handleReservation(reservation, 'cancel')}>Cancelar reserva vencida</button>
+                  )}
+                </div>
+              ))}
+            </section>
+          )}
           {viewMode === 'matrix' ? (
             <div className="space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 p-4 rounded-xl border border-slate-200">
@@ -606,7 +740,6 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
                       <th className="py-3 px-4 font-semibold">Método Acceso</th>
                       <th className="py-3 px-4 font-semibold">Rol Oficial</th>
                       <th className="py-3 px-4 font-semibold">Estado</th>
-                      <th className="py-3 px-4 font-semibold">Alcance Asignado</th>
                       <th className="py-3 px-4 font-semibold">Último Acceso</th>
                       <th className="py-3 px-4 font-semibold text-right">Acciones</th>
                     </tr>
@@ -656,23 +789,6 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
                             </span>
                           )}
                         </td>
-                        <td className="py-3 px-4 text-slate-600">
-                          {u.role === 'Administrador' ? (
-                            <span className="text-emerald-700 font-semibold">
-                              Global (Todos los proyectos, sectores y galpones)
-                            </span>
-                          ) : (
-                            <div className="space-y-0.5">
-                              <div className="font-medium text-slate-800">
-                                Proyecto: {u.assignedProject || 'TODOS'}
-                              </div>
-                              <div className="text-[11px] text-slate-500">
-                                {u.assignedSectorIds?.length || 0} sector(es) •{' '}
-                                {u.assignedGalponIds?.length || 0} galpón(es)
-                              </div>
-                            </div>
-                          )}
-                        </td>
                         <td className="py-3 px-4 text-slate-500">
                           <div>
                             {u.lastLoginAt
@@ -700,7 +816,8 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
                               <Edit3 className="w-3.5 h-3.5" />
                               <span>Editar</span>
                             </button>
-                            {u.authMethod !== 'google' && (
+                            {u.authMethod !== 'google' && !u.uid.startsWith('preauth_') &&
+                              (u.uid !== PRIMARY_ADMIN_UID || u.uid === currentUserProfile.uid) && (
                               <button
                                 type="button"
                                 onClick={() => handleGenerateTempPassword(u)}
@@ -711,16 +828,17 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
                                 <span>Clave Temp.</span>
                               </button>
                             )}
-                            <button
-                              type="button"
-                              onClick={() => handleSendResetEmail(u)}
-                              className="px-2.5 py-1 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-800 font-medium inline-flex items-center gap-1 transition cursor-pointer"
-                              title="Enviar correo de restablecimiento de contraseña"
-                            >
-                              <Mail className="w-3.5 h-3.5" />
-                              <span>Reset Email</span>
-                            </button>
-                            {u.uid !== currentUserProfile.uid && (
+                            {!u.uid.startsWith('preauth_') &&
+                              (u.uid !== PRIMARY_ADMIN_UID || u.uid === currentUserProfile.uid || !u.active) && (
+                                <button type="button" className="px-2.5 py-1 rounded-lg bg-slate-100"
+                                  onClick={() => handleReconcileOperations(u)}>Operaciones</button>
+                            )}
+                            {!u.uid.startsWith('preauth_') &&
+                              (u.uid !== PRIMARY_ADMIN_UID || u.uid === currentUserProfile.uid) && (
+                                <button type="button" className="px-2.5 py-1 rounded-lg bg-amber-50"
+                                  onClick={() => handleRevokeSessions(u)}>Revocar sesiones</button>
+                            )}
+                            {u.uid !== currentUserProfile.uid && (u.uid !== PRIMARY_ADMIN_UID || !u.active) && (
                               <button
                                 type="button"
                                 onClick={() => handleQuickToggleActive(u)}
@@ -827,15 +945,23 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
                   </label>
                   <select
                     value={formAuthMethod}
+                    disabled={Boolean(editingUser && (editingUser.uid.startsWith('preauth_') ||
+                      (editingUser.uid === PRIMARY_ADMIN_UID && currentUserProfile.uid !== PRIMARY_ADMIN_UID)))}
                     onChange={(e) => setFormAuthMethod(e.target.value as AuthMethod)}
                     className="w-full px-3.5 py-2 border border-slate-300 rounded-xl text-sm bg-white focus:outline-none focus:border-indigo-500"
                   >
-                    <option value="password">Correo y contraseña</option>
-                    <option value="google">Solo Google (Pre-autorizar cuenta Google)</option>
-                    <option value="both">Ambos (Correo/contraseña + Google)</option>
+                    <option value="password" disabled={viewMode === 'edit' && !availableAuthMethods.includes('password')}>
+                      Correo y contraseña
+                    </option>
+                    <option value="google" disabled={viewMode === 'edit' && !availableAuthMethods.includes('google')}>
+                      {viewMode === 'create' ? 'Solo Google (Preautorizar)' : 'Solo Google'}
+                    </option>
+                    <option value="both" disabled={viewMode === 'edit' && !availableAuthMethods.includes('both')}>
+                      Ambos (Correo/contraseña + Google)
+                    </option>
                   </select>
                   <p className="text-[11px] text-slate-500 mt-1">
-                    Si selecciona Google o Ambos, el trabajador podrá ingresar con el botón "Continuar con Google" usando este correo.
+                    Google requiere una cuenta vinculada al mismo UID. Ambos permite usar cualquiera de los dos proveedores cuando esté configurado en Firebase.
                   </p>
                 </div>
 
@@ -848,7 +974,7 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
                       <input
                         type="text"
                         required
-                        minLength={6}
+                        minLength={20}
                         value={formPassword}
                         onChange={(e) => setFormPassword(e.target.value)}
                         className="flex-1 px-3 py-1.5 bg-white border border-amber-300 rounded-lg text-sm font-mono text-slate-900"
@@ -893,30 +1019,6 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
 
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Proyecto Asignado
-                  </label>
-                  <div className="relative">
-                    <FolderKanban className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      disabled={formRole === 'Administrador'}
-                      value={formRole === 'Administrador' ? 'TODOS' : formAssignedProject}
-                      onChange={(e) => setFormAssignedProject(e.target.value)}
-                      placeholder="TODOS o código de proyecto"
-                      list="project-codes-list"
-                      className="w-full pl-9 pr-3.5 py-2 border border-slate-300 rounded-xl text-sm disabled:bg-slate-100 focus:outline-none focus:border-indigo-500"
-                    />
-                    <datalist id="project-codes-list">
-                      <option value="TODOS" />
-                      {availableProjects.map((code) => (
-                        <option key={code} value={code} />
-                      ))}
-                    </datalist>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
                     Estado de la Cuenta
                   </label>
                   <div className="flex items-center gap-3 pt-1.5">
@@ -937,76 +1039,6 @@ export const UserAdminModal: React.FC<UserAdminModalProps> = ({
                 <span className="font-bold text-slate-800">{formRole}:</span>{' '}
                 {ROLE_DESCRIPTIONS[formRole]}
               </div>
-
-              {/* Asignación de Sectores y Galpones */}
-              {formRole !== 'Administrador' && (
-                <div className="space-y-4 pt-2 border-t border-slate-200">
-                  <div>
-                    <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5 mb-1">
-                      <Layers className="w-4 h-4 text-indigo-600" />
-                      <span>Alcance Operativo: Sectores y Galpones Asignados</span>
-                    </h4>
-                    <p className="text-[11px] text-slate-500 mb-3">
-                      Seleccione los sectores y galpones a los que este usuario tendrá acceso. Si no selecciona ninguno y el proyecto es "TODOS", el usuario tendrá visibilidad general según su rol.
-                    </p>
-
-                    {availableSectors.length === 0 ? (
-                      <div className="text-xs text-slate-400 italic">
-                        No hay sectores configurados actualmente.
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        {availableSectors.map((sector) => {
-                          const sectorSelected = formSectorIds.includes(sector.id);
-                          return (
-                            <div
-                              key={sector.id}
-                              className={`p-3 rounded-xl border transition ${
-                                sectorSelected
-                                  ? 'bg-indigo-50/50 border-indigo-300'
-                                  : 'bg-slate-50 border-slate-200'
-                              }`}
-                            >
-                              <label className="flex items-center gap-2 text-xs font-bold text-slate-800 cursor-pointer">
-                                <input
-                                  type="checkbox"
-                                  checked={sectorSelected}
-                                  onChange={() => toggleSector(sector.id)}
-                                  className="rounded border-slate-300 text-indigo-600 w-4 h-4"
-                                />
-                                <span>{sector.name}</span>
-                              </label>
-
-                              {sector.sheds.length > 0 && (
-                                <div className="mt-2 pl-6 flex flex-wrap gap-1.5">
-                                  {sector.sheds.map((g) => {
-                                    const galponSelected = formGalponIds.includes(g.id);
-                                    return (
-                                      <button
-                                        key={g.id}
-                                        type="button"
-                                        onClick={() => toggleGalpon(g.id)}
-                                        className={`px-2 py-0.5 rounded text-[11px] font-medium border transition cursor-pointer ${
-                                          galponSelected
-                                            ? 'bg-indigo-600 text-white border-indigo-600'
-                                            : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
-                                        }`}
-                                      >
-                                        <Building2 className="w-2.5 h-2.5 inline mr-1" />
-                                        {g.name}
-                                      </button>
-                                    );
-                                  })}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
 
               <div className="pt-4 border-t border-slate-200 flex items-center justify-end gap-3">
                 <button

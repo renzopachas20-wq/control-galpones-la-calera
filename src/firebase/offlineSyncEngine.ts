@@ -6,6 +6,21 @@
 
 export type ProgressModality = 'quantity' | 'percentage';
 
+export function sameOperationalScope(saved: string | undefined, current: string | undefined): boolean {
+  if (!saved || !current) return false;
+  if (saved === current) return true;
+  const prefix = 'calera_scope_v1:';
+  if (!saved.startsWith(prefix)) return false;
+  try {
+    const legacy = JSON.parse(saved.slice(prefix.length));
+    return Array.isArray(legacy) && typeof legacy[0] === 'string' && !!legacy[0].trim() &&
+      legacy[0] !== 'local_user' && legacy[0] !== 'system' && typeof legacy[1] === 'string' &&
+      current === 'calera_scope_v2:' + JSON.stringify(legacy.slice(0, 2));
+  } catch {
+    return false;
+  }
+}
+
 export type ConnectionIndicatorState =
   | 'online'
   | 'offline'
@@ -23,6 +38,15 @@ export type LocalOperationSyncStatus =
 
 export interface PendingSyncOperation {
   operationId: string;
+  requestId?: string;
+  writeGroupId?: string;
+  ganttWithdrawal?: true;
+  structuralDeletion?: true;
+  sourceRow?: number;
+  expectedRevision?: number;
+  baseExists?: boolean;
+  baseSector?: any;
+  scopeKey?: string;
   deviceId: string;
   userId: string;
   userDisplayName: string;
@@ -42,6 +66,7 @@ export interface PendingSyncOperation {
     | 'movements';
   documentId: string;
   operationType: 'upsert' | 'delete';
+  projectCode?: string;
   sectorId?: string;
   galponId?: string;
   activityId?: string;
@@ -52,11 +77,14 @@ export interface PendingSyncOperation {
   payload?: any;
   status: LocalOperationSyncStatus;
   errorMessage?: string;
+  errorCode?: string;
+  expectedRecords?: Record<string, string | null>;
   retryCount: number;
 }
 
 export interface SyncConflictRecord {
   id: string;
+  scopeKey?: string;
   operationId: string;
   detectedAt: string;
   collectionName: 'advances' | 'sectors';
@@ -201,6 +229,29 @@ export interface EvaluatedProgressResult {
   computedStatus: string;
 }
 
+export function isConfirmedAdvance(log: unknown) {
+  if (!log || typeof log !== 'object') return false;
+  const { conflictStatus, syncState } = log as { conflictStatus?: string; syncState?: string };
+  return conflictStatus !== 'conflict' && !['saved_locally', 'pending_sync', 'syncing', 'sync_error', 'conflict']
+    .includes(syncState ?? '');
+}
+
+export function assertSafeSectorRebase(base: any, remote: any, expectedRevision: number) {
+  if (!remote || (remote._revision ?? 0) === expectedRevision) return;
+  const syncKeys = new Set(['_revision', 'operationId', 'deviceId', 'updatedAt', 'updatedBy', 'syncedAt',
+    'syncedBy', 'syncedByDisplayName', 'syncState', 'userId', 'userDisplayName', 'createdAt', 'baseUpdatedAt']);
+  const metadata = (value: any): any => {
+    if (Array.isArray(value)) return value.map(metadata);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.keys(value).sort().filter(key =>
+      key !== 'activities' && key !== 'ganttExcludedActivityIds' && !syncKeys.has(key))
+      .map(key => [key, metadata(value[key])]));
+  };
+  if (!base || JSON.stringify(metadata(base)) !== JSON.stringify(metadata(remote))) {
+    throw new Error('La estructura o los datos del sector cambiaron en otra sesión. Revise el sector y el cambio pendiente antes de volver a guardarlo.');
+  }
+}
+
 /**
  * Función pura unificada para evaluar el avance físico de una actividad según su modalidad:
  * - 'quantity' (Avance por Cantidades): suma las cantidades ejecutadas (quantityToday) y calcula (acumulado / meta) * 100.
@@ -215,7 +266,7 @@ export function evaluateActivityProgress(
 ): EvaluatedProgressResult {
   const progressMode = normalizeProgressMode(activity?.progressMode);
   const allLogs = Array.isArray(logsForActivity) ? logsForActivity : [];
-  const validLogs = allLogs.filter((l) => l && l.conflictStatus !== 'conflict');
+  const validLogs = allLogs.filter(isConfirmedAdvance);
   const conflictedLogsCount = allLogs.filter(
     (l) => l && l.conflictStatus === 'conflict'
   ).length;
@@ -1095,7 +1146,6 @@ function mergeGalponAreasDeep(params: {
           ...locArea,
           id: remArea.id || locArea.id,
           name: locArea.name || remArea.name,
-          hasSistemas: false,
           structures: mergedStructures
         });
       }
@@ -1183,11 +1233,16 @@ function mergeGalponAreasDeep(params: {
     }
   });
 
+  const ganttExcludedActivityIds = [...new Set<string>([
+    ...(remoteGalpon?.ganttExcludedActivityIds ?? []), ...(localGalpon?.ganttExcludedActivityIds ?? [])
+  ])].sort();
+  const mergedActivityIds = ganttExcludedActivityIds.length ? indexGalponActivitiesById({ areas: mergedAreas }) : null;
   return {
     ...remoteGalpon,
     ...localGalpon,
     id: remoteGalpon?.id || localGalpon?.id,
     areas: mergedAreas,
+    ...(mergedActivityIds ? { ganttExcludedActivityIds: ganttExcludedActivityIds.filter(id => mergedActivityIds.has(id)) } : {}),
     ...(Object.keys(activityTombstones).length > 0
       ? { deletedActivityTombstones: activityTombstones }
       : {})
@@ -1421,12 +1476,14 @@ export function applyActivityConflictResolutionToSector(
  */
 export function mergeAttendanceDayIsolated(
   remoteRecords: Record<string, string> | undefined,
-  localRecords: Record<string, string> | undefined
+  localRecords: Record<string, string | null> | undefined
 ): Record<string, string> {
-  return {
-    ...(remoteRecords || {}),
-    ...(localRecords || {})
-  };
+  const records = { ...remoteRecords };
+  for (const [uid, status] of Object.entries(localRecords ?? {})) {
+    if (status === null) delete records[uid];
+    else records[uid] = status;
+  }
+  return records;
 }
 
 /**
@@ -1475,6 +1532,7 @@ export function reconstructCollectionWithOfflineQueue<T extends { id: string }>(
       (op) =>
         op &&
         op.collectionName === collectionName &&
+        !(collectionName === 'workers' && (op.writeGroupId || op.status === 'sync_error')) &&
         op.status !== 'synced' &&
         op.status !== 'conflict'
     )
@@ -1509,6 +1567,12 @@ export function reconstructCollectionWithOfflineQueue<T extends { id: string }>(
  * todas las operaciones pendientes de la cola offline sobre los sectores remotos usando
  * la fusión profunda por actividad y respetando eliminaciones (tombstones y deletes).
  */
+export function isGanttWithdrawal(op: PendingSyncOperation): boolean {
+  return op.collectionName === 'sectors' && !!op.galponId && !!op.activityId &&
+    (op.ganttWithdrawal === true || (Array.isArray(op.payload?.galpones) && op.payload.galpones.some((barn: any) =>
+      barn.id === op.galponId && Array.isArray(barn.ganttExcludedActivityIds) && barn.ganttExcludedActivityIds.includes(op.activityId))));
+}
+
 export function reconstructSectorsWithOfflineQueue(
   remoteSectors: any[],
   queue: PendingSyncOperation[]
@@ -1528,6 +1592,7 @@ export function reconstructSectorsWithOfflineQueue(
       (op) =>
         op &&
         op.collectionName === 'sectors' &&
+        !op.structuralDeletion && !isGanttWithdrawal(op) && op.status !== 'sync_error' &&
         op.status !== 'synced' &&
         op.status !== 'conflict'
     )
@@ -1546,7 +1611,7 @@ export function reconstructSectorsWithOfflineQueue(
       map.set(op.documentId, {
         ...merged,
         id: op.documentId,
-        syncState: op.status === 'sync_error' ? 'sync_error' : 'pending_sync',
+        syncState: 'pending_sync',
         pendingOperationId: op.operationId
       });
     }
@@ -1573,6 +1638,7 @@ export function reconstructAttendanceWithOfflineQueue(
       (op) =>
         op &&
         op.collectionName === 'attendance' &&
+        op.errorCode !== 'ATTENDANCE_CONFLICT' &&
         op.status !== 'synced' &&
         op.status !== 'conflict'
     )
@@ -1651,11 +1717,17 @@ export function loadPendingSyncQueue(): PendingSyncOperation[] {
 
 export function savePendingSyncQueue(queue: PendingSyncOperation[]): void {
   if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(queue));
-  } catch (err) {
-    console.error('[OfflineQueue] Error guardando cola local:', err);
-  }
+  localStorage.setItem(OFFLINE_QUEUE_STORAGE_KEY, JSON.stringify(queue));
+}
+
+export async function updatePendingSyncQueue(update: (current: PendingSyncOperation[]) => PendingSyncOperation[]) {
+  const persist = () => {
+    const next = update(loadPendingSyncQueue());
+    savePendingSyncQueue(next);
+    return next;
+  };
+  return typeof navigator !== 'undefined' && navigator.locks
+    ? navigator.locks.request(OFFLINE_QUEUE_STORAGE_KEY, persist) : persist();
 }
 
 /**
@@ -1678,6 +1750,8 @@ export function enqueueOfflineOperation(
       item.collectionName === newOp.collectionName &&
       item.documentId === newOp.documentId &&
       item.userId === newOp.userId &&
+      item.scopeKey === newOp.scopeKey &&
+      item.requestId === newOp.requestId &&
       item.status !== 'conflict' &&
       item.status !== 'synced'
   );
@@ -1950,12 +2024,12 @@ export function partitionQueueByUserIdentity(
   const foreignAuthorsSet = new Set<string>();
 
   for (const op of activeOps) {
-    const opAuthorId = String(op.userId || '').trim();
-    if (!opAuthorId || opAuthorId === 'local_user' || opAuthorId === activeUserId) {
+    const opAuthorId = typeof op.userId === 'string' ? op.userId : '';
+    if (opAuthorId && opAuthorId.trim() === opAuthorId && opAuthorId !== 'local_user' && opAuthorId !== 'system' && opAuthorId === activeUserId) {
       ownPendingOps.push(op);
     } else {
       foreignPendingOps.push(op);
-      foreignAuthorsSet.add(op.userDisplayName || opAuthorId);
+      foreignAuthorsSet.add(op.userDisplayName || opAuthorId || 'Sin autor verificado');
     }
   }
 

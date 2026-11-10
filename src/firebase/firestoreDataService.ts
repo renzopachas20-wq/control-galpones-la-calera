@@ -1,5 +1,5 @@
 import type React from 'react';
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
   collection,
   doc,
@@ -8,10 +8,20 @@ import {
   deleteDoc,
   writeBatch,
   getDoc,
-  getDocs
-} from 'firebase/firestore';
-import { db, auth } from './config';
+  getDocs,
+  bindOperationalData,
+  importWorkers,
+  withdrawGanttActivity,
+  operationCommitted,
+  operationalScopeKey
+} from './operationalData';
+import { auth } from './config';
 import type { UserProfile } from './authService';
+import { hasModulePermission } from './permissions';
+import { workerForDisplay } from './workerData';
+import { providerIdFromName } from '../catalog/catalogSelectorEngine';
+export { providerIdFromName } from '../catalog/catalogSelectorEngine';
+import { parseMovementTimestamp } from './movementImport';
 import { getApiUrl } from './apiConfig';
 import {
   type PendingSyncOperation,
@@ -21,22 +31,24 @@ import {
   createOperationId,
   getOrCreateDeviceId,
   loadPendingSyncQueue,
-  savePendingSyncQueue,
+  updatePendingSyncQueue,
   enqueueOfflineOperation,
   loadSyncConflicts,
   saveSyncConflicts,
-  detectMultiUserAdvanceConflict,
   evaluateIdempotentAdvanceSync,
+  isConfirmedAdvance,
   stampOperationSyncMetadata,
   partitionQueueByUserIdentity,
   mergeSectorGalponesIsolated,
   mergeSectorDeepWithConflicts,
+  assertSafeSectorRebase,
   applyActivityConflictResolutionToSector,
   reconstructCollectionWithOfflineQueue,
   reconstructSectorsWithOfflineQueue,
+  isGanttWithdrawal,
+  sameOperationalScope,
   reconstructAttendanceWithOfflineQueue,
   reconstructProvidersWithOfflineQueue,
-  mergeAttendanceDayIsolated,
   normalizeProgressMode,
   countUniquePendingSyncOperations,
   OFFLINE_QUEUE_STORAGE_KEY,
@@ -101,13 +113,22 @@ export function sanitizeForFirestore<T>(obj: T): T {
   return obj;
 }
 
-export function providerIdFromName(name: string): string {
-  const clean = String(name || '')
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '');
-  return `prov_${clean || 'DEFAULT'}`;
+type GroupedAdvanceWrite = Pick<PendingSyncOperation,
+  'documentId' | 'operationType' | 'payload' | 'requestId' | 'expectedRevision'>;
+type QueueInput = Omit<PendingSyncOperation, 'operationId' | 'deviceId' | 'createdAt' | 'retryCount' | 'userId' | 'userDisplayName' | 'userRole'> &
+  Partial<Pick<PendingSyncOperation, 'operationId' | 'createdAt' | 'userId' | 'userDisplayName' | 'userRole'>>;
+
+async function commitAdvanceGroup(session: ReturnType<typeof bindOperationalData>, operations: GroupedAdvanceWrite[]) {
+  if (operations.length > 100) throw new Error('El grupo supera el límite de una transacción.');
+  const batch = writeBatch(session);
+  for (const operation of operations.filter(item => item.operationType === 'delete')) {
+    batch.delete(doc(session, 'advances', operation.documentId), operation);
+  }
+  for (const operation of operations.filter(item => item.operationType === 'upsert')) {
+    batch.set(doc(session, 'advances', operation.documentId),
+      sanitizeForFirestore({ ...operation.payload, syncState: 'synced' }), operation);
+  }
+  await batch.commit();
 }
 
 export function computeCollectionDiff<T extends { id: string }>(
@@ -175,6 +196,7 @@ export function normalizeMovementDocToAuditLog(docData: any) {
   return {
     id: docData.id,
     timestamp: docData.timestamp || docData.createdAt || '',
+    sortTimestamp: parseMovementTimestamp(docData.timestamp) ?? parseMovementTimestamp(docData.createdAt) ?? '',
     user: docData.user || docData.userEmail || 'Usuario',
     userId: docData.userId || '',
     userEmail: docData.userEmail || '',
@@ -186,6 +208,10 @@ export function normalizeMovementDocToAuditLog(docData: any) {
     module: docData.module || 'General',
     description: docData.description || docData.detail || '',
     targetId: docData.targetId,
+    projectCode: docData.projectCode,
+    sectorId: docData.sectorId,
+    galponId: docData.galponId,
+    requestId: docData.requestId,
     previousValue: docData.previousValue,
     newValue: docData.newValue
   };
@@ -270,9 +296,14 @@ export function useFirestoreOperationalSync({
   setAttendanceRecords,
   setAuditLogs
 }: UseFirestoreSyncParams) {
+  const db = useMemo(() => bindOperationalData(profile), [profile]);
+  const scopeKey = operationalScopeKey(profile);
+  const readScopedQueue = useCallback(() => partitionQueueByUserIdentity(loadPendingSyncQueue(), profile?.uid).ownPendingOps
+    .filter(operation => sameOperationalScope(operation.scopeKey, scopeKey)), [profile?.uid, scopeKey]);
   const [syncStatus, setSyncStatus] = useState<'connecting' | 'synced' | 'syncing' | 'error'>(
     'connecting'
   );
+  const [confirmedAdvances, setConfirmedAdvances] = useState(() => dailyAdvances.filter(isConfirmedAdvance));
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [isNetworkOnline, setIsNetworkOnline] = useState<boolean>(() =>
     typeof navigator !== 'undefined' ? navigator.onLine : true
@@ -284,6 +315,7 @@ export function useFirestoreOperationalSync({
     loadSyncConflicts()
   );
   const [lastSyncSummary, setLastSyncSummary] = useState<ManualSyncSummary | null>(null);
+  const [syncStorageError, setSyncStorageError] = useState(false);
   const [isManualSyncing, setIsManualSyncing] = useState<boolean>(false);
 
   const isHydratedRef = useRef<Record<string, boolean>>({
@@ -297,7 +329,7 @@ export function useFirestoreOperationalSync({
     movements: false
   });
 
-  const applyingRemoteRef = useRef<Record<string, boolean>>({});
+  const providerRevisions = useRef(new Map<string, number>());
   const syncInFlightRef = useRef<boolean>(false);
   const pendingInFlightDeletesRef = useRef<Record<string, Set<string>>>({
     masterCatalog: new Set<string>(),
@@ -324,11 +356,6 @@ export function useFirestoreOperationalSync({
     masterWorkforce: [],
     attendanceRecords: {}
   });
-
-  // Mantener copia sincronizada de cola offline y conflictos en localStorage
-  useEffect(() => {
-    savePendingSyncQueue(pendingOperations);
-  }, [pendingOperations]);
 
   useEffect(() => {
     saveSyncConflicts(syncConflicts);
@@ -407,54 +434,46 @@ export function useFirestoreOperationalSync({
   // Helper para encolar una operación cuando estamos sin conexión o ante un fallo de red,
   // preservando siempre el operationId, userId y createdAt originales (C-3 y C-4).
   const queueOperationLocally = useCallback(
-    (
-      op: Omit<
-        PendingSyncOperation,
-        'operationId' | 'deviceId' | 'createdAt' | 'retryCount' | 'userId' | 'userDisplayName' | 'userRole'
-      > & {
-        operationId?: string;
-        createdAt?: string;
-        userId?: string;
-        userDisplayName?: string;
-        userRole?: string;
-      }
-    ) => {
-      const payloadAuthorId =
-        op.userId ||
-        (op.payload?.userId && String(op.payload.userId).trim()) ||
-        profile?.uid ||
-        auth.currentUser?.uid ||
-        'local_user';
-      const payloadDisplayName =
-        op.userDisplayName ||
-        op.payload?.userDisplayName ||
-        op.payload?.supervisor ||
-        profile?.displayName ||
-        auth.currentUser?.email ||
-        'Usuario';
-      const userRole = op.userRole || profile?.role || 'Auxiliar';
-      const stableOpId =
-        op.operationId || op.payload?.operationId || createOperationId('op');
-      const stableCreatedAt =
-        op.createdAt || op.payload?.createdAt || new Date().toISOString();
+    async (input: QueueInput | QueueInput[]) => {
+      if (!profile) return false;
+      const operations = Array.isArray(input) ? input : [input];
+      if (!operations.length) return false;
+      return updatePendingSyncQueue(prev => operations.reduce((queue, op) => {
+        const stableOpId = op.operationId || op.payload?.operationId || createOperationId('op');
+        const stableCreatedAt = op.createdAt || op.payload?.createdAt || new Date().toISOString();
+        const sectorId = op.sectorId ?? op.payload?.sectorId ?? (op.collectionName === 'sectors' ? op.documentId : undefined);
+        const galponId = op.galponId ?? op.payload?.galponId;
+        const sector = lastSyncedStateRef.current.sectors.find(item => sectorId ? item.id === sectorId
+          : galponId && item.galpones?.some((barn: any) => barn.id === galponId)) ?? op.baseSector;
+        const barn = sector?.galpones?.find((item: any) => item.id === galponId);
 
-      setPendingOperations((prev) =>
-        enqueueOfflineOperation(prev, {
+        return enqueueOfflineOperation(queue, {
           ...op,
+          scopeKey,
+          requestId: op.requestId ?? crypto.randomUUID(),
           operationId: stableOpId,
           createdAt: stableCreatedAt,
-          userId: payloadAuthorId,
-          userDisplayName: payloadDisplayName,
-          userRole
-        })
-      );
+          sectorId: sectorId ?? sector?.id,
+          galponId,
+          projectCode: op.projectCode ?? barn?.projectCode ?? sector?.projectName ?? sector?.code ?? sector?.name,
+          userId: profile.uid,
+          userDisplayName: profile.displayName,
+          userRole: profile.role
+        });
+      }, prev)).then(queue => {
+        setPendingOperations(queue);
+        return true;
+      }).catch(() => {
+        setSyncStorageError(true);
+        return false;
+      });
     },
-    [profile]
+    [profile, scopeKey]
   );
 
   // Rehidratación inmediata desde cola offline al iniciar o reabrir el navegador sin conexión (C-2)
   useEffect(() => {
-    const initialQueue = loadPendingSyncQueue().filter((op) => op.status !== 'synced');
+    const initialQueue = readScopedQueue();
     if (initialQueue.length === 0) return;
 
     setTechnologies((prev) => reconstructProvidersWithOfflineQueue(prev || [], initialQueue));
@@ -471,12 +490,13 @@ export function useFirestoreOperationalSync({
       )
     );
     setMasterWorkforce((prev) =>
-      reconstructCollectionWithOfflineQueue(prev || [], initialQueue, 'workers')
+      reconstructCollectionWithOfflineQueue(prev || [], initialQueue, 'workers').map(workerForDisplay)
     );
     setAttendanceRecords((prev) =>
       reconstructAttendanceWithOfflineQueue(prev || {}, initialQueue)
     );
   }, [
+    readScopedQueue,
     setTechnologies,
     setMasterCatalog,
     setSectors,
@@ -488,6 +508,7 @@ export function useFirestoreOperationalSync({
 
   const activeProfileUid = isProfileAuthorizedActive(profile) ? profile?.uid || null : null;
   const activeProfileRole = isProfileAuthorizedActive(profile) ? profile?.role || null : null;
+  const canReadMovements = hasModulePermission(profile, 'movimientos', 'view');
 
   // 1. Suscripciones en tiempo real desde Firestore combinadas con cola local offline (C-2)
   useEffect(() => {
@@ -500,19 +521,16 @@ export function useFirestoreOperationalSync({
       onSnapshot(
         collection(db, 'providers'),
         (snap) => {
-          applyingRemoteRef.current.providers = true;
+          providerRevisions.current = new Map(snap.docs.map(doc => [doc.id, doc.data()._revision ?? 0]));
           const remoteTechs = snap.docs
             .map((d) => String(d.data()?.name || '').trim())
             .filter(Boolean);
-          const currentQueue = loadPendingSyncQueue();
+          const currentQueue = readScopedQueue();
           const mergedTechs = reconstructProvidersWithOfflineQueue(remoteTechs, currentQueue);
           lastSyncedStateRef.current.technologies = mergedTechs;
           setTechnologies(mergedTechs);
           isHydratedRef.current.providers = true;
           markSyncedNow();
-          setTimeout(() => {
-            applyingRemoteRef.current.providers = false;
-          }, 50);
         },
         (err) => {
           handleFirestoreError(err, OperationType.LIST, 'providers');
@@ -525,13 +543,12 @@ export function useFirestoreOperationalSync({
       onSnapshot(
         collection(db, 'masterCatalog'),
         (snap) => {
-          applyingRemoteRef.current.masterCatalog = true;
           const inFlightDeleted =
             pendingInFlightDeletesRef.current.masterCatalog || new Set<string>();
           const remoteItems = snap.docs
             .map((d) => ({ ...d.data(), id: d.id }))
             .filter((item) => !inFlightDeleted.has(item.id));
-          const currentQueue = loadPendingSyncQueue();
+          const currentQueue = readScopedQueue();
           const mergedCatalog = reconstructCollectionWithOfflineQueue(
             remoteItems,
             currentQueue,
@@ -541,9 +558,6 @@ export function useFirestoreOperationalSync({
           setMasterCatalog(mergedCatalog);
           isHydratedRef.current.masterCatalog = true;
           markSyncedNow();
-          setTimeout(() => {
-            applyingRemoteRef.current.masterCatalog = false;
-          }, 50);
         },
         (err) => {
           handleFirestoreError(err, OperationType.LIST, 'masterCatalog');
@@ -556,9 +570,8 @@ export function useFirestoreOperationalSync({
       onSnapshot(
         collection(db, 'sectors'),
         (snap) => {
-          applyingRemoteRef.current.sectors = true;
           const remoteItems = snap.docs.map((d) => ({ ...d.data(), id: d.id }));
-          const currentQueue = loadPendingSyncQueue();
+          const currentQueue = readScopedQueue();
           const reconstructedFromQueue = reconstructSectorsWithOfflineQueue(
             remoteItems,
             currentQueue
@@ -571,6 +584,8 @@ export function useFirestoreOperationalSync({
               const mergedList: any[] = [...reconstructedFromQueue];
               for (const localSec of prevLocal) {
                 if (!localSec || !localSec.id) continue;
+                if (currentQueue.some(op => op.collectionName === 'sectors' && op.documentId === localSec.id &&
+                  (op.status === 'sync_error' || op.structuralDeletion || isGanttWithdrawal(op)))) continue;
                 const remSec = remoteMap.get(localSec.id);
                 if (!remSec) {
                   mergedList.push(localSec);
@@ -590,9 +605,6 @@ export function useFirestoreOperationalSync({
 
           isHydratedRef.current.sectors = true;
           markSyncedNow();
-          setTimeout(() => {
-            applyingRemoteRef.current.sectors = false;
-          }, 50);
         },
         (err) => {
           handleFirestoreError(err, OperationType.LIST, 'sectors');
@@ -605,9 +617,8 @@ export function useFirestoreOperationalSync({
       onSnapshot(
         collection(db, 'materials'),
         (snap) => {
-          applyingRemoteRef.current.materials = true;
           const remoteItems = snap.docs.map((d) => ({ ...d.data(), id: d.id }));
-          const currentQueue = loadPendingSyncQueue();
+          const currentQueue = readScopedQueue();
           const mergedMaterials = reconstructCollectionWithOfflineQueue(
             remoteItems,
             currentQueue,
@@ -617,9 +628,6 @@ export function useFirestoreOperationalSync({
           setMaterials(mergedMaterials);
           isHydratedRef.current.materials = true;
           markSyncedNow();
-          setTimeout(() => {
-            applyingRemoteRef.current.materials = false;
-          }, 50);
         },
         (err) => {
           handleFirestoreError(err, OperationType.LIST, 'materials');
@@ -632,9 +640,9 @@ export function useFirestoreOperationalSync({
       onSnapshot(
         collection(db, 'advances'),
         (snap) => {
-          applyingRemoteRef.current.advances = true;
           const remoteItems = snap.docs.map((d) => ({ ...d.data(), id: d.id }));
-          const currentQueue = loadPendingSyncQueue();
+          setConfirmedAdvances(remoteItems.filter(isConfirmedAdvance));
+          const currentQueue = readScopedQueue();
           const mergedAdvances = reconstructCollectionWithOfflineQueue(
             remoteItems,
             currentQueue,
@@ -647,9 +655,6 @@ export function useFirestoreOperationalSync({
           setDailyAdvances(mergedAdvances);
           isHydratedRef.current.advances = true;
           markSyncedNow();
-          setTimeout(() => {
-            applyingRemoteRef.current.advances = false;
-          }, 50);
         },
         (err) => {
           handleFirestoreError(err, OperationType.LIST, 'advances');
@@ -662,21 +667,17 @@ export function useFirestoreOperationalSync({
       onSnapshot(
         collection(db, 'workers'),
         (snap) => {
-          applyingRemoteRef.current.workers = true;
           const remoteItems = snap.docs.map((d) => ({ ...d.data(), id: d.id }));
-          const currentQueue = loadPendingSyncQueue();
+          const currentQueue = readScopedQueue();
           const mergedWorkers = reconstructCollectionWithOfflineQueue(
             remoteItems,
             currentQueue,
             'workers'
-          );
+          ).map(workerForDisplay);
           lastSyncedStateRef.current.masterWorkforce = mergedWorkers;
           setMasterWorkforce(mergedWorkers);
           isHydratedRef.current.workers = true;
           markSyncedNow();
-          setTimeout(() => {
-            applyingRemoteRef.current.workers = false;
-          }, 50);
         },
         (err) => {
           handleFirestoreError(err, OperationType.LIST, 'workers');
@@ -689,22 +690,18 @@ export function useFirestoreOperationalSync({
       onSnapshot(
         collection(db, 'attendance'),
         (snap) => {
-          applyingRemoteRef.current.attendance = true;
           const map: Record<string, Record<string, string>> = {};
           snap.docs.forEach((d) => {
             const data = d.data();
             const dateKey = data.date || d.id;
             map[dateKey] = data.records || {};
           });
-          const currentQueue = loadPendingSyncQueue();
+          const currentQueue = readScopedQueue();
           const mergedAttendance = reconstructAttendanceWithOfflineQueue(map, currentQueue);
           lastSyncedStateRef.current.attendanceRecords = mergedAttendance;
           setAttendanceRecords(mergedAttendance);
           isHydratedRef.current.attendance = true;
           markSyncedNow();
-          setTimeout(() => {
-            applyingRemoteRef.current.attendance = false;
-          }, 50);
         },
         (err) => {
           handleFirestoreError(err, OperationType.LIST, 'attendance');
@@ -712,30 +709,21 @@ export function useFirestoreOperationalSync({
       )
     );
 
-    // 1.8 Movements (Bitácora de Auditoría — en firestore.rules solo roles distintos de Auxiliar tienen lectura)
-    if (activeProfileRole !== 'Auxiliar') {
+    // 1.8 Bitácora de auditoría
+    if (canReadMovements) {
       unsubs.push(
         onSnapshot(
           collection(db, 'movements'),
           (snap) => {
-            applyingRemoteRef.current.movements = true;
             const remoteLogs = snap.docs.map((d) =>
               normalizeMovementDocToAuditLog({ ...d.data(), id: d.id })
             );
-            const currentQueue = loadPendingSyncQueue();
-            const mergedLogs = reconstructCollectionWithOfflineQueue(
-              remoteLogs,
-              currentQueue,
-              'movements'
-            ).sort((a: any, b: any) =>
-              String(b.timestamp || '').localeCompare(String(a.timestamp || ''))
+            const mergedLogs = remoteLogs.sort((a: any, b: any) =>
+              b.sortTimestamp.localeCompare(a.sortTimestamp)
             );
             setAuditLogs(mergedLogs);
             isHydratedRef.current.movements = true;
             markSyncedNow();
-            setTimeout(() => {
-              applyingRemoteRef.current.movements = false;
-            }, 50);
           },
           (err) => {
             handleFirestoreError(err, OperationType.LIST, 'movements');
@@ -750,8 +738,11 @@ export function useFirestoreOperationalSync({
       unsubs.forEach((u) => u());
     };
   }, [
+    db,
+    readScopedQueue,
     activeProfileUid,
     activeProfileRole,
+    canReadMovements,
     markSyncedNow,
     setTechnologies,
     setMasterCatalog,
@@ -775,11 +766,38 @@ export function useFirestoreOperationalSync({
       prevItems: T[],
       nextItems: T[]
     ) => {
-      const { upserted, deletedIds } = diffById(prevItems, nextItems);
+      const { upserted: changed, deletedIds } = diffById(prevItems, nextItems);
+      const upserted = collectionName === 'materials' ? changed.filter(item => {
+        const previous = prevItems.find(value => value.id === item.id);
+        const withoutUsage = ({ usedQty, ...rest }: T & { usedQty?: number }) => rest;
+        return !previous || JSON.stringify(withoutUsage(item)) !== JSON.stringify(withoutUsage(previous));
+      }) : changed;
       if (upserted.length === 0 && deletedIds.length === 0) return;
+      const requestIds = new Map([...upserted.map(item => item.id), ...deletedIds].map(id => [id, crypto.randomUUID()]));
+      const previousById = new Map(prevItems.map(item => [item.id, item as T & { _revision?: number }]));
+      const revision = (id: string) => previousById.get(id)?._revision ?? 0;
+      const groupedWrites = new Map<string, GroupedAdvanceWrite[]>();
+      const groupByDocument = new Map<string, string>();
+      if (collectionName === 'advances') {
+        const groupIds = new Map<string, string>();
+        const group = (id: string, previous: any, payload?: any) => {
+          const sharedId = payload?.sharedGroupId ?? previous?.sharedGroupId;
+          if (!sharedId) return;
+          const writeGroupId = groupIds.get(sharedId) ?? crypto.randomUUID();
+          groupIds.set(sharedId, writeGroupId);
+          groupByDocument.set(id, writeGroupId);
+          const writes = groupedWrites.get(writeGroupId) ?? [];
+          writes.push({ documentId: id, operationType: payload ? 'upsert' : 'delete', payload,
+            requestId: requestIds.get(id), expectedRevision: revision(id) });
+          groupedWrites.set(writeGroupId, writes);
+        };
+        upserted.forEach(item => group(item.id, previousById.get(item.id), item));
+        deletedIds.forEach(id => group(id, previousById.get(id)));
+      }
 
       // Si el dispositivo está sin conexión a internet, encolamos todas las mutaciones en la cola persistente
       if (!isNetworkOnline || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+        const pending: QueueInput[] = [];
         upserted.forEach((item: any) => {
           const stableOpId = item.operationId || createOperationId(`op_${collectionName}`);
           const stableCreatedAt = item.createdAt || new Date().toISOString();
@@ -791,8 +809,13 @@ export function useFirestoreOperationalSync({
             profile?.displayName ||
             auth.currentUser?.email ||
             'Usuario';
-          queueOperationLocally({
+          pending.push({
             operationId: stableOpId,
+            requestId: requestIds.get(item.id),
+            writeGroupId: groupByDocument.get(item.id),
+            expectedRevision: revision(item.id),
+            baseExists: previousById.has(item.id),
+            ...(collectionName === 'sectors' && previousById.has(item.id) ? { baseSector: previousById.get(item.id) } : {}),
             createdAt: stableCreatedAt,
             userId: authorUserId,
             userDisplayName: authorDisplayName,
@@ -817,13 +840,17 @@ export function useFirestoreOperationalSync({
           });
         });
         deletedIds.forEach((delId) => {
-          queueOperationLocally({
+          pending.push({
             collectionName,
             documentId: delId,
+            requestId: requestIds.get(delId),
+            writeGroupId: groupByDocument.get(delId),
+            expectedRevision: revision(delId),
             operationType: 'delete',
             status: 'pending_sync'
           });
         });
+        queueOperationLocally(pending);
         lastSyncedStateRef.current = {
           ...lastSyncedStateRef.current,
           ...(collectionName === 'masterCatalog' ? { masterCatalog: nextItems } : {}),
@@ -890,6 +917,7 @@ export function useFirestoreOperationalSync({
 
             const remoteSnap = await getDoc(doc(db, 'sectors', secItem.id));
             const remoteSec = remoteSnap.exists() ? remoteSnap.data() : null;
+            assertSafeSectorRebase(prevSec, remoteSec, revision(secItem.id));
             const secOpId = secItem.operationId || createOperationId('op_sec');
             const { mergedSector, conflicts } = mergeSectorDeepWithConflicts(
               secItem,
@@ -915,20 +943,22 @@ export function useFirestoreOperationalSync({
                 syncedByDisplayName: actorDisplayName,
                 syncedAt: nowIso,
                 updatedAt: nowIso
-              })
+              }), { requestId: requestIds.get(secItem.id), expectedRevision: remoteSec?._revision ?? 0 }
             );
           }
           for (const delId of deletedIds) {
-            await deleteDoc(doc(db, 'sectors', delId));
+            await deleteDoc(doc(db, 'sectors', delId), { requestId: requestIds.get(delId), expectedRevision: revision(delId) });
           }
           if (detectedSectorConflicts.length > 0) {
-            setSyncConflicts((prev) => [...detectedSectorConflicts, ...prev]);
+            setSyncConflicts((prev) => [...detectedSectorConflicts.map(conflict => ({ ...conflict, scopeKey })), ...prev]);
           }
         } else if (collectionName === 'advances') {
           // C-3 y C-4: Sincronización idempotente de avances comprobando getDoc antes de crear,
           // evitando sobrescrituras silenciosas y sin requerir permisos update generales para Auxiliar.
           const detectedAdvanceConflicts: SyncConflictRecord[] = [];
+          for (const operations of groupedWrites.values()) await commitAdvanceGroup(db, operations);
           for (const advItem of upserted as any[]) {
+            if (groupByDocument.has(advItem.id)) continue;
             const stableOpId = advItem.operationId || createOperationId('op_adv');
             const stableCreatedAt = advItem.createdAt || nowIso;
             const authorUserId = advItem.userId || actorUid;
@@ -941,9 +971,7 @@ export function useFirestoreOperationalSync({
             // Si es una edición explícita autorizada (Supervisor/Jefe de proyecto/Administrador) sobre un registro existente
             const isExplicitEditByAuthorizedRole =
               Boolean(existingRemoteDoc) &&
-              profile?.role !== 'Auxiliar' &&
-              profile?.role !== 'Almacén' &&
-              profile?.role !== 'Solo lectura' &&
+              hasModulePermission(profile, 'avance_diario', 'edit') &&
               (prevItems as any[]).some((p) => p.id === advItem.id);
 
             if (isExplicitEditByAuthorizedRole) {
@@ -965,7 +993,7 @@ export function useFirestoreOperationalSync({
               );
               await setDoc(
                 doc(db, 'advances', advItem.id),
-                sanitizeForFirestore(updatedPayload)
+                sanitizeForFirestore(updatedPayload), { requestId: requestIds.get(advItem.id), expectedRevision: revision(advItem.id) }
               );
               continue;
             }
@@ -975,8 +1003,7 @@ export function useFirestoreOperationalSync({
                 r &&
                 r.id !== advItem.id &&
                 r.galponId === advItem.galponId &&
-                ((r.activityId && r.activityId === advItem.activityId) ||
-                  r.activityCode === advItem.activityCode)
+                (r.activityId ? r.activityId === advItem.activityId : r.activityCode === advItem.activityCode)
             );
 
             const decision = evaluateIdempotentAdvanceSync({
@@ -1017,7 +1044,7 @@ export function useFirestoreOperationalSync({
               if (decision.canWriteConflictedRecord && !existingRemoteDoc && decision.payloadToWrite) {
                 await setDoc(
                   doc(db, 'advances', advItem.id),
-                  sanitizeForFirestore(decision.payloadToWrite)
+                  sanitizeForFirestore(decision.payloadToWrite), { requestId: requestIds.get(advItem.id) }
                 );
               }
               continue;
@@ -1025,15 +1052,16 @@ export function useFirestoreOperationalSync({
             if (decision.outcome === 'create' && decision.payloadToWrite) {
               await setDoc(
                 doc(db, 'advances', advItem.id),
-                sanitizeForFirestore(decision.payloadToWrite)
+                sanitizeForFirestore(decision.payloadToWrite), { requestId: requestIds.get(advItem.id) }
               );
             }
           }
           for (const delId of deletedIds) {
-            await deleteDoc(doc(db, 'advances', delId));
+            if (groupByDocument.has(delId)) continue;
+            await deleteDoc(doc(db, 'advances', delId), { requestId: requestIds.get(delId), expectedRevision: revision(delId) });
           }
           if (detectedAdvanceConflicts.length > 0) {
-            setSyncConflicts((prev) => [...detectedAdvanceConflicts, ...prev]);
+            setSyncConflicts((prev) => [...detectedAdvanceConflicts.map(conflict => ({ ...conflict, scopeKey })), ...prev]);
           }
         } else {
           const batch = writeBatch(db);
@@ -1054,12 +1082,12 @@ export function useFirestoreOperationalSync({
                 syncedAt: nowIso,
                 syncState: 'synced',
                 updatedAt: nowIso
-              })
+              }), { requestId: requestIds.get(item.id), expectedRevision: revision(item.id) }
             );
           }
           for (const delId of deletedIds) {
             const ref = doc(db, collectionName, delId);
-            batch.delete(ref);
+            batch.delete(ref, { requestId: requestIds.get(delId), expectedRevision: revision(delId) });
           }
           await batch.commit();
         }
@@ -1071,6 +1099,7 @@ export function useFirestoreOperationalSync({
       } catch (err) {
         // Si falla por red (incluso si se cortó después de que Firestore recibió la operación pero antes del ACK),
         // encolamos localmente conservando el MISMO operationId, userId y createdAt para reintento idempotente C-3.
+        const pending: QueueInput[] = [];
         upserted.forEach((item: any) => {
           const stableOpId = item.operationId || createOperationId(`op_${collectionName}`);
           const stableCreatedAt = item.createdAt || new Date().toISOString();
@@ -1082,8 +1111,13 @@ export function useFirestoreOperationalSync({
             profile?.displayName ||
             auth.currentUser?.email ||
             'Usuario';
-          queueOperationLocally({
+          pending.push({
             operationId: stableOpId,
+            requestId: requestIds.get(item.id),
+            writeGroupId: groupByDocument.get(item.id),
+            expectedRevision: revision(item.id),
+            baseExists: previousById.has(item.id),
+            ...(collectionName === 'sectors' && previousById.has(item.id) ? { baseSector: previousById.get(item.id) } : {}),
             createdAt: stableCreatedAt,
             userId: authorUserId,
             userDisplayName: authorDisplayName,
@@ -1104,31 +1138,35 @@ export function useFirestoreOperationalSync({
               userId: authorUserId,
               userDisplayName: authorDisplayName
             }),
-            status: 'sync_error',
+            status: collectionName === 'sectors' && (err as { code?: string })?.code === 'STALE_DATA_VERSION' ? 'pending_sync' : 'sync_error',
             errorMessage: err instanceof Error ? err.message : 'Error de red al sincronizar'
           });
         });
         deletedIds.forEach((delId) => {
-          queueOperationLocally({
+          pending.push({
             collectionName,
             documentId: delId,
+            requestId: requestIds.get(delId),
+            writeGroupId: groupByDocument.get(delId),
+            expectedRevision: revision(delId),
             operationType: 'delete',
             status: 'sync_error',
             errorMessage: err instanceof Error ? err.message : 'Error de red al sincronizar'
           });
           pendingInFlightDeletesRef.current[collectionName]?.delete(delId);
         });
+        queueOperationLocally(pending);
         setSyncStatus('error');
         handleFirestoreError(err, OperationType.WRITE, collectionName);
       }
     },
-    [isNetworkOnline, markSyncedNow, profile, queueOperationLocally]
+    [db, scopeKey, isNetworkOnline, markSyncedNow, profile, queueOperationLocally]
   );
 
   // 2.1 Sincronizar Providers (Plantillas tecnológicas en /providers/{providerId})
   useEffect(() => {
     if (!isProfileAuthorizedActive(profile)) return;
-    if (!isHydratedRef.current.providers || applyingRemoteRef.current.providers) return;
+    if (!isHydratedRef.current.providers) return;
     const prevTechs = lastSyncedStateRef.current.technologies || [];
     const nextTechs = technologies || [];
     if (JSON.stringify(prevTechs) === JSON.stringify(nextTechs)) return;
@@ -1143,39 +1181,41 @@ export function useFirestoreOperationalSync({
     }));
     const { upserted, deletedIds } = diffById(prevDocs, nextDocs);
     if (upserted.length === 0 && deletedIds.length === 0) return;
-
-    if (!isNetworkOnline) {
-      upserted.forEach((docItem) => {
+    const nowIso = new Date().toISOString();
+    const creates = upserted.map(item => ({ item, requestId: crypto.randomUUID() }));
+    const deletes = deletedIds.map(id => ({ id, requestId: crypto.randomUUID(), expectedRevision: providerRevisions.current.get(id) ?? 0 }));
+    const queue = (status: 'pending_sync' | 'sync_error') => {
+      for (const { item, requestId } of creates) {
         queueOperationLocally({
           collectionName: 'settings',
-          documentId: docItem.id,
+          documentId: item.id,
+          requestId,
           operationType: 'upsert',
-          payload: {
-            id: docItem.id,
-            name: docItem.name,
-            updatedAt: new Date().toISOString(),
-            updatedBy: profile?.uid || 'system'
-          },
-          status: 'pending_sync'
+          payload: { ...item, updatedAt: nowIso },
+          status
         });
-      });
+      }
+      for (const { id, requestId, expectedRevision } of deletes) {
+        queueOperationLocally({ collectionName: 'settings', documentId: id, requestId, expectedRevision, operationType: 'delete', status });
+      }
+    };
+    if (!isNetworkOnline) {
+      queue('pending_sync');
       lastSyncedStateRef.current.technologies = nextTechs;
       return;
     }
 
     setSyncStatus('syncing');
     const batch = writeBatch(db);
-    const nowIso = new Date().toISOString();
-    upserted.forEach((docItem) => {
-      batch.set(doc(db, 'providers', docItem.id), {
-        id: docItem.id,
-        name: docItem.name,
+    creates.forEach(({ item, requestId }) => {
+      batch.set(doc(db, 'providers', item.id), {
+        ...item,
         updatedAt: nowIso,
         updatedBy: profile?.uid || 'system'
-      });
+      }, { requestId });
     });
-    deletedIds.forEach((delId) => {
-      batch.delete(doc(db, 'providers', delId));
+    deletes.forEach(({ id, requestId, expectedRevision }) => {
+      batch.delete(doc(db, 'providers', id), { requestId, expectedRevision });
     });
     batch
       .commit()
@@ -1184,16 +1224,17 @@ export function useFirestoreOperationalSync({
         markSyncedNow();
       })
       .catch((err) => {
+        queue('sync_error');
+        lastSyncedStateRef.current.technologies = nextTechs;
         setSyncStatus('error');
         handleFirestoreError(err, OperationType.WRITE, 'providers');
       });
-  }, [technologies, profile, isNetworkOnline, markSyncedNow, queueOperationLocally]);
+  }, [db, technologies, profile, isNetworkOnline, markSyncedNow, queueOperationLocally]);
 
   // 2.2 Sincronizar Master Catalog
   useEffect(() => {
     if (!isProfileAuthorizedActive(profile)) return;
-    if (!isHydratedRef.current.masterCatalog || applyingRemoteRef.current.masterCatalog)
-      return;
+    if (!isHydratedRef.current.masterCatalog) return;
     syncCollectionDiff(
       'masterCatalog',
       lastSyncedStateRef.current.masterCatalog,
@@ -1204,21 +1245,22 @@ export function useFirestoreOperationalSync({
   // 2.3 Sincronizar Sectors y Galpones
   useEffect(() => {
     if (!isProfileAuthorizedActive(profile)) return;
-    if (!isHydratedRef.current.sectors || applyingRemoteRef.current.sectors) return;
+    if (!isHydratedRef.current.sectors) return;
     syncCollectionDiff('sectors', lastSyncedStateRef.current.sectors, sectors);
   }, [sectors, profile, syncCollectionDiff]);
 
   // 2.4 Sincronizar Materials
   useEffect(() => {
     if (!isProfileAuthorizedActive(profile)) return;
-    if (!isHydratedRef.current.materials || applyingRemoteRef.current.materials) return;
+    if (!isHydratedRef.current.materials) return;
     syncCollectionDiff('materials', lastSyncedStateRef.current.materials, materials);
   }, [materials, profile, syncCollectionDiff]);
 
   // 2.5 Sincronizar Daily Advances
   useEffect(() => {
     if (!isProfileAuthorizedActive(profile)) return;
-    if (!isHydratedRef.current.advances || applyingRemoteRef.current.advances) return;
+    if (!isHydratedRef.current.advances) return;
+    // Las lecturas fijan la base antes de publicar el estado. Un cambio local posterior conserva su diff.
     syncCollectionDiff(
       'advances',
       lastSyncedStateRef.current.dailyAdvances,
@@ -1229,7 +1271,7 @@ export function useFirestoreOperationalSync({
   // 2.6 Sincronizar Workforce
   useEffect(() => {
     if (!isProfileAuthorizedActive(profile)) return;
-    if (!isHydratedRef.current.workers || applyingRemoteRef.current.workers) return;
+    if (!isHydratedRef.current.workers) return;
     syncCollectionDiff(
       'workers',
       lastSyncedStateRef.current.masterWorkforce,
@@ -1240,122 +1282,24 @@ export function useFirestoreOperationalSync({
   // 2.7 Sincronizar Attendance (fusión por operario individual para no sobrescribir otros galpones)
   useEffect(() => {
     if (!isProfileAuthorizedActive(profile)) return;
-    if (!isHydratedRef.current.attendance || applyingRemoteRef.current.attendance) return;
+    if (!isHydratedRef.current.attendance) return;
 
     const prevMap = lastSyncedStateRef.current.attendanceRecords || {};
-    const changedDates: string[] = [];
+    const changes = Object.entries(attendanceRecords).flatMap(([date, records]) => {
+      const previous = prevMap[date] ?? {};
+      const changed = Object.entries(records).filter(([id, status]) => previous[id] !== status) as [string, string | null][];
+      for (const id of Object.keys(previous)) if (!Object.prototype.hasOwnProperty.call(records, id)) changed.push([id, null]);
+      return changed.length ? [{ requestId: crypto.randomUUID(), payload: { id: date, date, records: Object.fromEntries(changed) },
+        expectedRecords: Object.fromEntries(changed.map(([id]) => [id, previous[id] ?? null])) }] : [];
+    });
+    if (!changes.length) return;
+    lastSyncedStateRef.current.attendanceRecords = attendanceRecords;
+    queueOperationLocally(changes.map(({ payload, requestId, expectedRecords }) => ({
+      collectionName: 'attendance', documentId: payload.id, requestId, operationType: 'upsert',
+      payload, expectedRecords, status: 'pending_sync'
+    })));
+  }, [attendanceRecords, profile, queueOperationLocally]);
 
-    for (const [dateKey, records] of Object.entries(attendanceRecords || {})) {
-      if (JSON.stringify(prevMap[dateKey] || {}) !== JSON.stringify(records || {})) {
-        changedDates.push(dateKey);
-      }
-    }
-
-    if (changedDates.length === 0) return;
-
-    if (!isNetworkOnline) {
-      changedDates.forEach((dateKey) => {
-        queueOperationLocally({
-          collectionName: 'attendance',
-          documentId: dateKey,
-          operationType: 'upsert',
-          payload: {
-            id: dateKey,
-            date: dateKey,
-            records: sanitizeForFirestore(attendanceRecords[dateKey] || {})
-          },
-          status: 'pending_sync'
-        });
-      });
-      lastSyncedStateRef.current.attendanceRecords = attendanceRecords;
-      return;
-    }
-
-    setSyncStatus('syncing');
-    Promise.all(
-      changedDates.map((dateKey) => {
-        const ref = doc(db, 'attendance', dateKey);
-        return setDoc(
-          ref,
-          {
-            id: dateKey,
-            date: dateKey,
-            records: sanitizeForFirestore(attendanceRecords[dateKey] || {}),
-            updatedAt: new Date().toISOString()
-          },
-          { merge: true }
-        );
-      })
-    )
-      .then(() => {
-        lastSyncedStateRef.current.attendanceRecords = attendanceRecords;
-        markSyncedNow();
-      })
-      .catch((err) => {
-        setSyncStatus('error');
-        handleFirestoreError(err, OperationType.WRITE, 'attendance');
-      });
-  }, [attendanceRecords, profile, isNetworkOnline, markSyncedNow, queueOperationLocally]);
-
-  // 3. Registrar movimiento inmutable en /movements (cumpliendo firestore.rules con type + detail)
-  const recordAuditMovement = useCallback(
-    async (
-      action: 'REGISTRO' | 'MODIFICACIÓN' | 'ELIMINACIÓN',
-      module: string,
-      description: string
-    ) => {
-      if (!profile) return;
-      const now = new Date();
-      const y = now.getFullYear();
-      const m = String(now.getMonth() + 1).padStart(2, '0');
-      const d = String(now.getDate()).padStart(2, '0');
-      const hh = String(now.getHours()).padStart(2, '0');
-      const mm = String(now.getMinutes()).padStart(2, '0');
-      const ss = String(now.getSeconds()).padStart(2, '0');
-      const timestamp = `${y}-${m}-${d} ${hh}:${mm}:${ss}`;
-      const id = `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-      const firestoreEntry = buildMovementDocFromInput({
-        id,
-        timestamp,
-        action,
-        module,
-        description,
-        profile,
-        userOverride: `${profile.displayName} (${profile.role})`
-      });
-
-      const uiEntry = normalizeMovementDocToAuditLog(firestoreEntry);
-      setAuditLogs((prev) => [uiEntry, ...prev]);
-
-      if (!isNetworkOnline || (typeof navigator !== 'undefined' && !navigator.onLine)) {
-        queueOperationLocally({
-          collectionName: 'movements',
-          documentId: id,
-          operationType: 'upsert',
-          payload: sanitizeForFirestore(firestoreEntry),
-          status: 'pending_sync'
-        });
-        return;
-      }
-
-      try {
-        await setDoc(doc(db, 'movements', id), sanitizeForFirestore(firestoreEntry));
-      } catch (err) {
-        queueOperationLocally({
-          collectionName: 'movements',
-          documentId: id,
-          operationType: 'upsert',
-          payload: sanitizeForFirestore(firestoreEntry),
-          status: 'pending_sync'
-        });
-        handleFirestoreError(err, OperationType.CREATE, `movements/${id}`);
-      }
-    },
-    [profile, isNetworkOnline, queueOperationLocally, setAuditLogs]
-  );
-
-  // Función auxiliar para refrescar activamente todas las colecciones desde Firestore preservando operaciones offline pendientes (C-2)
   const pullRemoteCollectionsNow = useCallback(async () => {
     if (!isProfileAuthorizedActive(profile)) return;
 
@@ -1366,7 +1310,8 @@ export function useFirestoreOperationalSync({
       materialsSnap,
       advancesSnap,
       workersSnap,
-      attendanceSnap
+      attendanceSnap,
+      movementsSnap
     ] = await Promise.all([
       getDocs(collection(db, 'providers')),
       getDocs(collection(db, 'masterCatalog')),
@@ -1374,12 +1319,13 @@ export function useFirestoreOperationalSync({
       getDocs(collection(db, 'materials')),
       getDocs(collection(db, 'advances')),
       getDocs(collection(db, 'workers')),
-      getDocs(collection(db, 'attendance'))
+      getDocs(collection(db, 'attendance')),
+      getDocs(collection(db, 'movements'))
     ]);
 
-    const currentQueue = loadPendingSyncQueue();
+    const currentQueue = readScopedQueue();
 
-    applyingRemoteRef.current.providers = true;
+    providerRevisions.current = new Map(providersSnap.docs.map(doc => [doc.id, doc.data()._revision ?? 0]));
     const remoteTechs = providersSnap.docs
       .map((d) => String(d.data()?.name || '').trim())
       .filter(Boolean);
@@ -1388,7 +1334,6 @@ export function useFirestoreOperationalSync({
     setTechnologies(mergedTechs);
     isHydratedRef.current.providers = true;
 
-    applyingRemoteRef.current.masterCatalog = true;
     const remoteCatalog = catalogSnap.docs.map((d) => ({ ...d.data(), id: d.id }));
     const mergedCatalog = reconstructCollectionWithOfflineQueue(
       remoteCatalog,
@@ -1399,14 +1344,12 @@ export function useFirestoreOperationalSync({
     setMasterCatalog(mergedCatalog);
     isHydratedRef.current.masterCatalog = true;
 
-    applyingRemoteRef.current.sectors = true;
     const remoteSectors = sectorsSnap.docs.map((d) => ({ ...d.data(), id: d.id }));
     const mergedSectors = reconstructSectorsWithOfflineQueue(remoteSectors, currentQueue);
     lastSyncedStateRef.current.sectors = mergedSectors;
     setSectors(mergedSectors);
     isHydratedRef.current.sectors = true;
 
-    applyingRemoteRef.current.materials = true;
     const remoteMaterials = materialsSnap.docs.map((d) => ({ ...d.data(), id: d.id }));
     const mergedMaterials = reconstructCollectionWithOfflineQueue(
       remoteMaterials,
@@ -1417,8 +1360,8 @@ export function useFirestoreOperationalSync({
     setMaterials(mergedMaterials);
     isHydratedRef.current.materials = true;
 
-    applyingRemoteRef.current.advances = true;
     const remoteAdvances = advancesSnap.docs.map((d) => ({ ...d.data(), id: d.id }));
+    setConfirmedAdvances(remoteAdvances.filter(isConfirmedAdvance));
     const mergedAdvances = reconstructCollectionWithOfflineQueue(
       remoteAdvances,
       currentQueue,
@@ -1428,18 +1371,16 @@ export function useFirestoreOperationalSync({
     setDailyAdvances(mergedAdvances);
     isHydratedRef.current.advances = true;
 
-    applyingRemoteRef.current.workers = true;
     const remoteWorkers = workersSnap.docs.map((d) => ({ ...d.data(), id: d.id }));
     const mergedWorkers = reconstructCollectionWithOfflineQueue(
       remoteWorkers,
       currentQueue,
       'workers'
-    );
+    ).map(workerForDisplay);
     lastSyncedStateRef.current.masterWorkforce = mergedWorkers;
     setMasterWorkforce(mergedWorkers);
     isHydratedRef.current.workers = true;
 
-    applyingRemoteRef.current.attendance = true;
     const attMap: Record<string, Record<string, string>> = {};
     attendanceSnap.docs.forEach((d) => {
       const data = d.data();
@@ -1451,27 +1392,20 @@ export function useFirestoreOperationalSync({
     setAttendanceRecords(mergedAttMap);
     isHydratedRef.current.attendance = true;
 
-    if (profile?.role !== 'Auxiliar') {
-      const movementsSnap = await getDocs(collection(db, 'movements'));
-      applyingRemoteRef.current.movements = true;
+    if (hasModulePermission(profile, 'movimientos', 'view')) {
       const remoteLogs = movementsSnap.docs.map((d) =>
         normalizeMovementDocToAuditLog({ ...d.data(), id: d.id })
       );
-      const mergedLogs = reconstructCollectionWithOfflineQueue(
-        remoteLogs,
-        currentQueue,
-        'movements'
-      ).sort((a: any, b: any) =>
-        String(b.timestamp || '').localeCompare(String(a.timestamp || ''))
+      const mergedLogs = remoteLogs.sort((a: any, b: any) =>
+        b.sortTimestamp.localeCompare(a.sortTimestamp)
       );
       setAuditLogs(mergedLogs);
       isHydratedRef.current.movements = true;
     }
 
-    setTimeout(() => {
-      applyingRemoteRef.current = {};
-    }, 80);
   }, [
+    db,
+    readScopedQueue,
     profile,
     setTechnologies,
     setMasterCatalog,
@@ -1532,7 +1466,7 @@ export function useFirestoreOperationalSync({
         }
 
         // 4.2 Validar sesión y estado activo del usuario autenticado
-        if (!isProfileAuthorizedActive(profile) || !auth.currentUser) {
+        if (!isProfileAuthorizedActive(profile) || auth.currentUser?.uid !== profile?.uid) {
           const summary: ManualSyncSummary = {
             executedAt,
             triggeredBy,
@@ -1549,17 +1483,18 @@ export function useFirestoreOperationalSync({
           return summary;
         }
 
-        const queueSnapshot = loadPendingSyncQueue().filter(
-          (op) => op.status !== 'synced' && op.status !== 'conflict'
-        );
+        const queueSnapshot = loadPendingSyncQueue();
 
         const activeUid = profile.uid || auth.currentUser.uid;
         const activeDisplayName =
           profile.displayName || profile.email || auth.currentUser.email || 'Usuario';
 
         // C-4: Particionar cola según identidad del usuario autenticado (dispositivos compartidos)
-        const { ownPendingOps, foreignPendingOps, foreignAuthors } =
+        const { ownPendingOps: ownQueue, foreignPendingOps } =
           partitionQueueByUserIdentity(queueSnapshot, activeUid);
+        const ownPendingOps = ownQueue.filter(op => op.errorCode !== 'ATTENDANCE_CONFLICT' &&
+          !(isGanttWithdrawal(op) && op.errorCode === 'STALE_DATA_VERSION'));
+        const retainedConflicts = ownQueue.length - ownPendingOps.length;
 
         if (ownPendingOps.length === 0) {
           await pullRemoteCollectionsNow();
@@ -1570,14 +1505,14 @@ export function useFirestoreOperationalSync({
             totalProcessed: 0,
             syncedCount: 0,
             alreadyProcessedCount: 0,
-            conflictCount: 0,
+            conflictCount: retainedConflicts,
             errorCount: 0,
-            remainingPendingCount: foreignPendingOps.length,
+            remainingPendingCount: foreignPendingOps.length + retainedConflicts,
             foreignBlockedCount: foreignPendingOps.length,
-            foreignAuthors,
             message:
-              foreignPendingOps.length > 0
-                ? `Dispositivo compartido: Existen ${foreignPendingOps.length} operación(es) pendiente(s) registrada(s) por otro usuario (${foreignAuthors.join(', ')}). Se bloqueó su sincronización automática para preservar la autoría original hasta que dicho usuario inicie sesión.`
+              retainedConflicts > 0 ? 'Revise los conflictos pendientes en el Centro de Sincronización.'
+              : foreignPendingOps.length > 0
+                ? `Hay ${foreignPendingOps.length} operación(es) pendientes de otra sesión. Solo su autor podrá enviarlas.`
                 : 'Datos actualizados y sincronizados al 100% con Firestore (Sectores, Galpones, Catálogo, Materiales, Avances y Personal).'
           };
           setLastSyncSummary(summary);
@@ -1589,7 +1524,7 @@ export function useFirestoreOperationalSync({
         let conflictCount = 0;
         let errorCount = 0;
         // C-4: Conservar intactas y protegidas las operaciones pendientes pertenecientes a otros usuarios
-        const remainingQueue: PendingSyncOperation[] = [...foreignPendingOps];
+        const remainingQueue: PendingSyncOperation[] = [];
         const newConflicts: SyncConflictRecord[] = [];
         const nowIso = new Date().toISOString();
 
@@ -1597,13 +1532,60 @@ export function useFirestoreOperationalSync({
         const orderedOps = [...ownPendingOps].sort((a, b) =>
           String(a.createdAt || '').localeCompare(String(b.createdAt || ''))
         );
+        const groupedOps = new Map<string, PendingSyncOperation[]>();
+        for (const op of orderedOps) {
+          if (!op.writeGroupId || (op.collectionName !== 'advances' && op.collectionName !== 'workers')) continue;
+          const key = op.collectionName + ':' + op.writeGroupId;
+          const group = groupedOps.get(key) ?? [];
+          group.push(op);
+          groupedOps.set(key, group);
+        }
 
         for (const op of orderedOps) {
+          const requestId = op.requestId ?? op.operationId;
+          if (op.writeGroupId && (op.collectionName === 'advances' || op.collectionName === 'workers')) {
+            const key = op.collectionName + ':' + op.writeGroupId;
+            const group = groupedOps.get(key);
+            if (!group) continue;
+            groupedOps.delete(key);
+            try {
+              if (op.collectionName === 'workers') {
+                await importWorkers(db, op.writeGroupId, group.map(item => ({
+                  id: item.documentId, requestId: item.requestId ?? item.operationId, data: item.payload,
+                  ...(item.sourceRow !== undefined ? { sourceRow: item.sourceRow } : {})
+                })));
+              } else {
+                const completed = await Promise.all(group.map(item => operationCommitted(db, item.requestId ?? item.operationId)));
+                if (completed.some(Boolean) && !completed.every(Boolean)) {
+                  throw new Error('El grupo tiene confirmaciones parciales. Revise sus partes antes de reenviarlo.');
+                }
+                if (!completed[0]) await commitAdvanceGroup(db, group.map(item => ({ ...item, requestId: item.requestId ?? item.operationId })));
+                else alreadyProcessedCount += group.length;
+              }
+              syncedCount += group.length;
+            } catch (error) {
+              errorCount += group.length;
+              remainingQueue.push(...group.map(item => ({ ...item, status: 'sync_error' as const,
+                retryCount: item.retryCount + 1, errorMessage: error instanceof Error ? error.message : 'No se pudo confirmar el grupo.' })));
+            }
+            continue;
+          }
           try {
+            if (await operationCommitted(db, requestId)) {
+              syncedCount++;
+              alreadyProcessedCount++;
+              continue;
+            }
+            if (isGanttWithdrawal(op)) {
+              await withdrawGanttActivity(db, { sectorId: op.documentId, galponId: op.galponId!, activityId: op.activityId!,
+                requestId, expectedRevision: op.expectedRevision ?? 0 });
+              syncedCount++;
+              continue;
+            }
             if (op.operationType === 'delete') {
               const targetCol =
                 op.collectionName === 'settings' ? 'providers' : op.collectionName;
-              await deleteDoc(doc(db, targetCol, op.documentId));
+              await deleteDoc(doc(db, targetCol, op.documentId), { requestId, expectedRevision: op.expectedRevision });
               syncedCount++;
               continue;
             }
@@ -1616,6 +1598,18 @@ export function useFirestoreOperationalSync({
                 ? remoteAdvSnap.data()
                 : null;
 
+              if (op.baseExists) {
+                if (!existingRemoteAdv || !hasModulePermission(profile, 'avance_diario', 'edit')) {
+                  throw new Error('El avance original ya no está disponible para edición.');
+                }
+                const edited = stampOperationSyncMetadata({ ...advPayload, syncState: 'synced' }, op,
+                  { uid: activeUid, displayName: activeDisplayName }, nowIso);
+                await setDoc(doc(db, 'advances', op.documentId), sanitizeForFirestore(edited), { requestId,
+                  expectedRevision: op.expectedRevision ?? 0 });
+                syncedCount++;
+                continue;
+              }
+
               const remoteAdvancesForAct = (
                 lastSyncedStateRef.current.dailyAdvances || []
               ).filter(
@@ -1623,8 +1617,7 @@ export function useFirestoreOperationalSync({
                   r &&
                   r.id !== op.documentId &&
                   r.galponId === advPayload.galponId &&
-                  ((r.activityId && r.activityId === advPayload.activityId) ||
-                    r.activityCode === advPayload.activityCode)
+                  (r.activityId ? r.activityId === advPayload.activityId : r.activityCode === advPayload.activityCode)
               );
 
               const decision = evaluateIdempotentAdvanceSync({
@@ -1656,33 +1649,30 @@ export function useFirestoreOperationalSync({
                 ) {
                   await setDoc(
                     doc(db, 'advances', op.documentId),
-                    sanitizeForFirestore(decision.payloadToWrite)
+                    sanitizeForFirestore(decision.payloadToWrite), { requestId }
                   );
                 }
 
-                await recordAuditMovement(
-                  'REGISTRO',
-                  'Sincronización Multiusuario',
-                  `Conflicto detectado y protegido en [${advPayload.activityCode || op.documentId}]: valor local (${decision.conflictRecord.localValue}) vs. valor en servidor (${decision.conflictRecord.remoteValue}). Autor original: ${op.userDisplayName} (${op.userId}) | Sincronizado por: ${activeDisplayName} (${activeUid}).`
-                );
                 continue;
               }
 
               if (decision.outcome === 'create' && decision.payloadToWrite) {
                 await setDoc(
                   doc(db, 'advances', op.documentId),
-                  sanitizeForFirestore(decision.payloadToWrite)
+                  sanitizeForFirestore(decision.payloadToWrite), { requestId }
                 );
                 syncedCount++;
               }
             } else if (op.collectionName === 'sectors' && op.payload) {
               const remoteSnap = await getDoc(doc(db, 'sectors', op.documentId));
               const remoteSec = remoteSnap.exists() ? remoteSnap.data() : null;
+              assertSafeSectorRebase(op.baseSector, remoteSec, op.expectedRevision ?? 0);
               const { mergedSector, conflicts } = mergeSectorDeepWithConflicts(
                 op.payload,
                 remoteSec,
                 {
                   modifiedGalponIds: op.galponId ? [op.galponId] : undefined,
+                  baseSector: op.baseSector,
                   localUser: op.userDisplayName || activeDisplayName,
                   operationId: op.operationId
                 }
@@ -1690,13 +1680,6 @@ export function useFirestoreOperationalSync({
               if (conflicts.length > 0) {
                 conflictCount += conflicts.length;
                 newConflicts.push(...conflicts);
-                for (const c of conflicts) {
-                  await recordAuditMovement(
-                    'REGISTRO',
-                    'Sincronización Multiusuario',
-                    `Conflicto de edición concurrente detectado en actividad [${c.activityCode}] (${c.galponCode || c.galponId}): se conservó la versión del servidor (${c.remoteUser}) y se registró el cambio de ${c.localUser} para resolución autorizada.`
-                  );
-                }
               }
               const stampedSector = stampOperationSyncMetadata(
                 mergedSector,
@@ -1706,23 +1689,15 @@ export function useFirestoreOperationalSync({
               );
               await setDoc(
                 doc(db, 'sectors', op.documentId),
-                sanitizeForFirestore(stampedSector)
+                sanitizeForFirestore(stampedSector), { requestId, expectedRevision: remoteSec?._revision ?? 0 }
               );
               syncedCount++;
             } else if (op.collectionName === 'attendance' && op.payload) {
-              const remoteSnap = await getDoc(doc(db, 'attendance', op.documentId));
-              const remoteRecs = remoteSnap.exists()
-                ? remoteSnap.data()?.records
-                : {};
-              const mergedRecs = mergeAttendanceDayIsolated(
-                remoteRecs,
-                op.payload.records
-              );
               const stampedAtt = stampOperationSyncMetadata(
                 {
                   id: op.documentId,
                   date: op.documentId,
-                  records: mergedRecs
+                  records: op.payload.records
                 },
                 op,
                 { uid: activeUid, displayName: activeDisplayName },
@@ -1731,7 +1706,7 @@ export function useFirestoreOperationalSync({
               await setDoc(
                 doc(db, 'attendance', op.documentId),
                 sanitizeForFirestore(stampedAtt),
-                { merge: true }
+                { merge: true, requestId, expectedRecords: op.expectedRecords }
               );
               syncedCount++;
             } else if (op.collectionName === 'settings' && op.payload) {
@@ -1744,23 +1719,11 @@ export function useFirestoreOperationalSync({
               await setDoc(
                 doc(db, 'providers', op.documentId),
                 sanitizeForFirestore(stampedProv),
-                { merge: true }
+                { merge: true, requestId }
               );
               syncedCount++;
-            } else if (op.collectionName === 'movements' && op.payload) {
-              // En /movements/{movementId}, firestore.rules exige request.resource.data.userId == request.auth.uid
-              const movementPayload = sanitizeForFirestore({
-                ...op.payload,
-                userId: activeUid,
-                originalAuthorUserId: op.userId || op.payload.userId || activeUid,
-                operationId: op.operationId,
-                createdAt: op.payload.createdAt || op.createdAt || nowIso,
-                syncedBy: activeUid,
-                syncedByDisplayName: activeDisplayName,
-                syncedAt: nowIso
-              });
-              await setDoc(doc(db, 'movements', op.documentId), movementPayload);
-              syncedCount++;
+            } else if (op.collectionName === 'movements') {
+              throw new Error('Este movimiento histórico requiere importación administrativa.');
             } else if (op.payload) {
               const stampedDoc = stampOperationSyncMetadata(
                 {
@@ -1774,15 +1737,18 @@ export function useFirestoreOperationalSync({
               await setDoc(
                 doc(db, op.collectionName, op.documentId),
                 sanitizeForFirestore(stampedDoc),
-                { merge: true }
+                { merge: true, requestId, expectedRevision: op.expectedRevision }
               );
               syncedCount++;
             }
           } catch (opErr) {
             errorCount++;
+            const errorCode = (opErr as { code?: string } | null)?.code;
+            if (errorCode === 'ATTENDANCE_CONFLICT' || (isGanttWithdrawal(op) && errorCode === 'STALE_DATA_VERSION')) conflictCount++;
             remainingQueue.push({
               ...op,
               status: 'sync_error',
+              errorCode,
               retryCount: (op.retryCount || 0) + 1,
               errorMessage:
                 opErr instanceof Error ? opErr.message : 'Error al escribir en Firestore'
@@ -1791,10 +1757,14 @@ export function useFirestoreOperationalSync({
         }
 
         // Persistir cola restante ANTES de pullRemoteCollectionsNow para que la reconstrucción use la cola actualizada
-        savePendingSyncQueue(remainingQueue);
-        setPendingOperations(remainingQueue);
+        const processedIds = new Set(orderedOps.map(op => op.requestId ?? op.operationId));
+        const queueAfterSync = await updatePendingSyncQueue(current => [
+          ...current.filter(op => op.userId !== activeUid || !processedIds.has(op.requestId ?? op.operationId)),
+          ...remainingQueue
+        ]).catch(error => { setSyncStorageError(true); throw error; });
+        setPendingOperations(queueAfterSync);
         if (newConflicts.length > 0) {
-          setSyncConflicts((prev) => [...newConflicts, ...prev]);
+          setSyncConflicts((prev) => [...newConflicts.map(conflict => ({ ...conflict, scopeKey })), ...prev]);
         }
 
         await pullRemoteCollectionsNow();
@@ -1807,7 +1777,7 @@ export function useFirestoreOperationalSync({
 
         const foreignNotice =
           foreignPendingOps.length > 0
-            ? ` (${foreignPendingOps.length} operación(es) de ${foreignAuthors.join(', ')} permanecen protegidas en espera de su autor).`
+            ? ` (${foreignPendingOps.length} operación(es) esperan que su autor vuelva a iniciar sesión).`
             : '';
 
         const summary: ManualSyncSummary = {
@@ -1818,9 +1788,8 @@ export function useFirestoreOperationalSync({
           alreadyProcessedCount,
           conflictCount,
           errorCount,
-          remainingPendingCount: remainingQueue.length,
+          remainingPendingCount: queueAfterSync.length,
           foreignBlockedCount: foreignPendingOps.length,
-          foreignAuthors,
           message:
             conflictCount > 0
               ? `Sincronización completada: ${syncedCount} operación(es) sincronizada(s) y ${conflictCount} conflicto(s) detectado(s) sin pérdida de datos.${foreignNotice}`
@@ -1832,6 +1801,18 @@ export function useFirestoreOperationalSync({
         };
         setLastSyncSummary(summary);
         return summary;
+      } catch (error) {
+        const status = (error as { status?: number } | null)?.status;
+        const summary: ManualSyncSummary = {
+          executedAt, triggeredBy, totalProcessed: 0, syncedCount: 0, conflictCount: 0, errorCount: 1,
+          remainingPendingCount: loadPendingSyncQueue().length,
+          message: status === 401 ? 'Su sesión expiró. Vuelva a iniciar sesión para sincronizar.'
+            : status === 403 ? 'Su perfil ya no tiene acceso a estos datos.'
+            : 'No se pudo comprobar la sincronización. Consulte la cola y vuelva a intentar.'
+        };
+        setSyncStatus('error');
+        setLastSyncSummary(summary);
+        return summary;
       } finally {
         syncInFlightRef.current = false;
         setIsManualSyncing(false);
@@ -1841,9 +1822,10 @@ export function useFirestoreOperationalSync({
       checkRealConnectivity,
       markSyncedNow,
       pendingOperations,
+      db,
+      scopeKey,
       profile,
-      pullRemoteCollectionsNow,
-      recordAuditMovement
+      pullRemoteCollectionsNow
     ]
   );
 
@@ -1859,6 +1841,27 @@ export function useFirestoreOperationalSync({
     }
   }, [isNetworkOnline, profile, pendingOperations, triggerManualSync]);
 
+  const dismissAttendanceConflict = useCallback(async (requestId: string) => {
+    const queue = await updatePendingSyncQueue(current => current.filter(op =>
+      !(op.userId === profile?.uid && sameOperationalScope(op.scopeKey, scopeKey) && op.errorCode === 'ATTENDANCE_CONFLICT' &&
+        (op.requestId ?? op.operationId) === requestId)));
+    setPendingOperations(queue);
+  }, [profile?.uid, scopeKey]);
+
+  const retryGanttWithdrawal = useCallback(async (requestId: string) => {
+    const matches = (op: PendingSyncOperation) => op.userId === profile?.uid && sameOperationalScope(op.scopeKey, scopeKey) &&
+      (op.requestId ?? op.operationId) === requestId && isGanttWithdrawal(op) && op.errorCode === 'STALE_DATA_VERSION';
+    const op = loadPendingSyncQueue().find(matches);
+    if (!op) return;
+    const latest = (await getDoc(doc(db, 'sectors', op.documentId))).data();
+    if (!latest) throw new Error('El sector ya no está disponible.');
+    const queue = await updatePendingSyncQueue(current => current.map(item => matches(item) ? {
+      ...item, ganttWithdrawal: true, baseSector: undefined, payload: undefined, expectedRevision: latest._revision ?? 0,
+      status: 'pending_sync', errorCode: undefined, errorMessage: undefined
+    } : item));
+    setPendingOperations(queue);
+  }, [db, profile?.uid, scopeKey]);
+
   // 5. Resolución autorizada de conflictos multiusuario (tanto de avances como de edición de actividades en sectores) con auditoría en /movements
   const resolveSyncConflict = useCallback(
     async (params: {
@@ -1870,7 +1873,7 @@ export function useFirestoreOperationalSync({
       const { conflictId, resolutionType, customValue, resolutionNote } = params;
       if (!profile) return;
 
-      const targetConflict = syncConflicts.find((c) => c.id === conflictId);
+      const targetConflict = syncConflicts.find((conflict) => conflict.id === conflictId && sameOperationalScope(conflict.scopeKey, scopeKey));
       if (!targetConflict) return;
 
       const nowIso = new Date().toISOString();
@@ -1980,19 +1983,8 @@ export function useFirestoreOperationalSync({
         )
       );
 
-      await recordAuditMovement(
-        'MODIFICACIÓN',
-        'Resolución de Conflicto Multiusuario',
-        `Resolvió conflicto en [${targetConflict.activityCode}] (${targetConflict.galponCode || targetConflict.galponId}): Decisión = ${
-          resolutionType === 'keep_remote'
-            ? `Conservar versión en servidor (${targetConflict.remoteValue})`
-            : resolutionType === 'apply_local'
-              ? `Aplicar versión offline (${targetConflict.localValue})`
-              : `Establecer valor conciliado (${customValue})`
-        }. Motivo: ${resolutionNote || 'Sin observación adicional'}`
-      );
     },
-    [profile, recordAuditMovement, syncConflicts]
+    [db, profile, scopeKey, syncConflicts]
   );
 
   // Estado consolidado del Indicador Permanente de Conexión y Sincronización (con partición por identidad C-4)
@@ -2006,7 +1998,7 @@ export function useFirestoreOperationalSync({
     pendingOperations,
     syncConflicts
   );
-  const unresolvedConflictCount = syncConflicts.filter((c) => !c.resolved).length;
+  const unresolvedConflictCount = syncConflicts.filter((c) => sameOperationalScope(c.scopeKey, scopeKey) && !c.resolved).length;
   const hasSyncErrors = pendingOperations.some(
     (op) => (op.status || (op as any).syncStatus) === 'sync_error'
   );
@@ -2026,21 +2018,25 @@ export function useFirestoreOperationalSync({
 
   return {
     syncStatus,
+    syncStorageError,
+    confirmedAdvances,
     lastSyncedAt,
     isNetworkOnline,
     connectionIndicatorState,
     pendingOperations,
-    ownPendingOperations,
+    ownPendingOperations: ownPendingOperations.filter(operation => sameOperationalScope(operation.scopeKey, scopeKey)),
     foreignPendingOperations,
     foreignPendingAuthors,
     activePendingCount,
-    syncConflicts,
+    syncConflicts: syncConflicts.filter(conflict => sameOperationalScope(conflict.scopeKey, scopeKey)),
     unresolvedConflictCount,
     lastSyncSummary,
     isManualSyncing,
     triggerManualSync,
+    refreshOperationalData: pullRemoteCollectionsNow,
+    dismissAttendanceConflict,
+    retryGanttWithdrawal,
     resolveSyncConflict,
-    recordAuditMovement,
     queueOperationLocally
   };
 }

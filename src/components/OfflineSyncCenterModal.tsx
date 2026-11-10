@@ -15,6 +15,8 @@ import {
   getOrCreateDeviceId,
   canUserAuthorizePercentageCorrection,
   partitionQueueByUserIdentity,
+  isGanttWithdrawal,
+  sameOperationalScope,
   countUniquePendingSyncOperations,
   APP_BUILD_VERSION
 } from '../firebase/offlineSyncEngine';
@@ -150,7 +152,10 @@ interface OfflineSyncCenterModalProps {
   isManualSyncing: boolean;
   userRole?: string;
   activeUserId?: string;
+  activeScopeKey?: string;
   onTriggerManualSync: () => Promise<ManualSyncSummary>;
+  onDismissAttendanceConflict: (requestId: string) => Promise<void>;
+  onRetryGanttWithdrawal: (requestId: string) => Promise<void>;
   onResolveConflict: (params: {
     conflictId: string;
     resolutionType: 'keep_remote' | 'apply_local' | 'custom_value';
@@ -199,12 +204,16 @@ export const OfflineSyncCenterModal: React.FC<OfflineSyncCenterModalProps> = ({
   isManualSyncing,
   userRole,
   activeUserId,
+  activeScopeKey,
   onTriggerManualSync,
+  onDismissAttendanceConflict,
+  onRetryGanttWithdrawal,
   onResolveConflict
 }) => {
   const [customValuesMap, setCustomValuesMap] = useState<Record<string, string>>({});
   const [notesMap, setNotesMap] = useState<Record<string, string>>({});
   const [resolvingId, setResolvingId] = useState<string | null>(null);
+  const [dismissError, setDismissError] = useState('');
 
   if (!isOpen) return null;
 
@@ -212,11 +221,12 @@ export const OfflineSyncCenterModal: React.FC<OfflineSyncCenterModalProps> = ({
   const unresolvedConflicts = syncConflicts.filter((c) => !c.resolved);
   const resolvedConflicts = syncConflicts.filter((c) => c.resolved);
   const deviceId = getOrCreateDeviceId();
-  const { ownPendingOps, foreignPendingOps, foreignAuthors } =
+  const { ownPendingOps, foreignPendingOps } =
     partitionQueueByUserIdentity(pendingOperations, activeUserId);
+  const visibleOperations = ownPendingOps.filter(operation => sameOperationalScope(operation.scopeKey, activeScopeKey));
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div className="modal-viewport fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex justify-center p-4">
       <div className="bg-white rounded-2xl p-6 w-full max-w-3xl border border-slate-200 shadow-2xl my-8 space-y-4">
         <div className="flex items-start justify-between gap-3 pb-3 border-b border-slate-200">
           <div>
@@ -296,7 +306,7 @@ export const OfflineSyncCenterModal: React.FC<OfflineSyncCenterModalProps> = ({
             <div className="flex items-center gap-1.5 font-extrabold">
               <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
               <span>
-                Dispositivo Compartido: {foreignPendingOps.length} operación(es) pendiente(s) de otro usuario ({foreignAuthors.join(', ')})
+                Dispositivo compartido · {foreignPendingOps.length} operación(es) pendientes de otra sesión
               </span>
             </div>
             <p className="text-[11px] text-amber-900">
@@ -527,30 +537,25 @@ export const OfflineSyncCenterModal: React.FC<OfflineSyncCenterModalProps> = ({
           <h4 className="text-xs font-black uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
             <UploadCloud className="w-4 h-4 text-[#0f6b38]" />
             <span>
-              Cola Local de Operaciones Offline ({pendingOperations.length})
+              Cola Local de Operaciones Offline ({visibleOperations.length})
             </span>
           </h4>
 
-          {pendingOperations.length === 0 ? (
+          {visibleOperations.length === 0 ? (
             <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 text-center text-xs text-slate-500">
-              No hay operaciones pendientes en la cola local. Todos los cambios han sido
-              sincronizados con Firestore.
+              No hay operaciones pendientes visibles para el alcance actual.
             </div>
           ) : (
             <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-xl divide-y divide-slate-200 text-xs">
-              {pendingOperations.map((op) => {
-                const st = STATUS_LABELS[op.status] || STATUS_LABELS.pending_sync;
-                const isForeignOp =
-                  Boolean(activeUserId) &&
-                  Boolean(op.userId) &&
-                  op.userId !== 'local_user' &&
-                  op.userId !== activeUserId;
+              {dismissError && <p role="alert" className="text-xs text-rose-700">{dismissError}</p>}
+              {visibleOperations.map((op) => {
+                const attendanceConflict = op.errorCode === 'ATTENDANCE_CONFLICT';
+                const ganttConflict = op.errorCode === 'STALE_DATA_VERSION' && isGanttWithdrawal(op);
+                const st = attendanceConflict || ganttConflict ? STATUS_LABELS.conflict : STATUS_LABELS[op.status] || STATUS_LABELS.pending_sync;
                 return (
                   <div
-                    key={op.operationId}
-                    className={`p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
-                      isForeignOp ? 'bg-amber-50/60' : 'bg-white'
-                    }`}
+                    key={op.requestId ?? op.operationId}
+                    className="p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white"
                   >
                     <div>
                       <div className="flex items-center gap-2 flex-wrap">
@@ -565,11 +570,6 @@ export const OfflineSyncCenterModal: React.FC<OfflineSyncCenterModalProps> = ({
                         >
                           {st.text}
                         </span>
-                        {isForeignOp && (
-                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-200 text-amber-950 border border-amber-400">
-                            Protegida (Otro usuario en este dispositivo)
-                          </span>
-                        )}
                       </div>
                       <p className="text-[11px] text-slate-500 mt-0.5">
                         Autor original: <strong>{op.userDisplayName}</strong> (
@@ -577,11 +577,29 @@ export const OfflineSyncCenterModal: React.FC<OfflineSyncCenterModalProps> = ({
                         {new Date(op.createdAt).toLocaleString('es-PE')} • OpID:{' '}
                         <span className="font-mono">{op.operationId}</span>
                       </p>
+                      {op.projectCode && <p className="text-[11px] text-slate-500">Proyecto {op.projectCode}</p>}
                       {op.errorMessage && (
                         <p className="text-[11px] text-rose-600 font-semibold mt-0.5">
                           Detalle: {op.errorMessage}
                         </p>
                       )}
+                      {attendanceConflict && <button type="button" className="mt-2 rounded border px-2 py-1 text-xs font-semibold"
+                        onClick={() => {
+                          setDismissError('');
+                          void onDismissAttendanceConflict(op.requestId ?? op.operationId)
+                            .catch(() => setDismissError('No se pudo retirar el intento local. El registro del servidor sigue vigente.'));
+                        }}>
+                        Conservar asistencia del servidor
+                      </button>}
+                      {ganttConflict && <button type="button" className="mt-2 rounded border px-2 py-1 text-xs font-semibold"
+                        disabled={!isNetworkOnline || isManualSyncing}
+                        onClick={() => {
+                          setDismissError('');
+                          void onRetryGanttWithdrawal(op.requestId ?? op.operationId)
+                            .catch(() => setDismissError('No se pudo consultar el plan vigente. El retiro sigue pendiente.'));
+                        }}>
+                        Reenviar retiro sobre el plan vigente
+                      </button>}
                     </div>
                     <div className="flex items-center gap-1 text-[11px] font-mono text-slate-500 shrink-0">
                       <Clock className="w-3.5 h-3.5" />

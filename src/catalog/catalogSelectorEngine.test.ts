@@ -541,15 +541,13 @@ test('Escenarios 8, 9 y 10: Asignar varias actividades a un galpón, asignar a o
   assert.equal(gal1JaulasAfterDup.sistemas[0].structures[0].activities.length, 3);
 });
 
-test('Escenario 11: Permisos por rol para Catálogo Maestro y Gestión de Actividades se mantienen intactos', () => {
+test('Escenario 11: Permisos por rol para Catálogo Maestro y Gestión de Actividades siguen la matriz del encargo', () => {
   const adminProfile: UserProfile = {
     uid: 'u_admin',
     email: 'admin@calera.pe',
     displayName: 'Admin',
     role: 'Administrador',
     active: true,
-    assignedSectorIds: ['ALL'],
-    assignedGalponIds: ['ALL'],
     createdAt: '2026-11-01',
     createdBy: 'system',
     updatedAt: '2026-11-01',
@@ -578,12 +576,12 @@ test('Escenario 11: Permisos por rol para Catálogo Maestro y Gestión de Activi
 
   assert.equal(hasModulePermission(adminProfile, 'catalogo', 'delete'), true);
   assert.equal(hasModulePermission(adminProfile, 'actividades', 'create'), true);
-  assert.equal(hasModulePermission(jefeProfile, 'catalogo', 'create'), true);
-  assert.equal(hasModulePermission(jefeProfile, 'catalogo', 'edit'), true);
+  assert.equal(hasModulePermission(jefeProfile, 'catalogo', 'create'), false);
+  assert.equal(hasModulePermission(jefeProfile, 'catalogo', 'edit'), false);
   assert.equal(hasModulePermission(jefeProfile, 'catalogo', 'delete'), false);
-  assert.equal(hasModulePermission(jefeProfile, 'actividades', 'create'), true);
-  assert.equal(hasModulePermission(jefeProfile, 'actividades', 'delete'), true);
-  assert.equal(hasModulePermission(supervisorProfile, 'actividades', 'create'), true);
+  assert.equal(hasModulePermission(jefeProfile, 'actividades', 'create'), false);
+  assert.equal(hasModulePermission(jefeProfile, 'actividades', 'delete'), false);
+  assert.equal(hasModulePermission(supervisorProfile, 'actividades', 'create'), false);
   assert.equal(hasModulePermission(supervisorProfile, 'catalogo', 'delete'), false);
   assert.equal(hasModulePermission(auxiliarProfile, 'actividades', 'create'), false);
   assert.equal(hasModulePermission(lecturaProfile, 'actividades', 'create'), false);

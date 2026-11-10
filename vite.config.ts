@@ -4,6 +4,7 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createHash } from 'node:crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -99,10 +100,28 @@ function versionMetadataPlugin(): Plugin {
   };
 }
 
+function offlineShellPlugin(): Plugin {
+  return {
+    name: 'calera-offline-shell',
+    apply: 'build',
+    generateBundle(_options, bundle) {
+      const assets = ['/index.html', '/manifest.webmanifest', '/icons/calera-192.png', '/icons/calera-512.png',
+        ...Object.keys(bundle).filter(name => name.startsWith('assets/')).sort().map(name => '/' + name)];
+      const worker = fs.readFileSync(path.resolve(__dirname, 'src/pwa/sw.js'), 'utf-8');
+      const version = createHash('sha256').update(worker).update(JSON.stringify(assets)).digest('hex').slice(0, 20);
+      this.emitFile({ type: 'asset', fileName: 'sw.js', source: worker
+        .replace('__CALERA_CACHE__', 'calera-shell-' + version).replace('__CALERA_ASSETS__', JSON.stringify(assets)) });
+    }
+  };
+}
+
 export default defineConfig({
-  plugins: [versionMetadataPlugin(), react()],
+  plugins: [versionMetadataPlugin(), react(), offlineShellPlugin()],
   server: {
     hmr: false,
+    fs: {
+      deny: ['.env', '.env.*', '*.{crt,pem}', '**/.git/**', '**/.server-auth-vault.json'],
+    },
   },
 });
 
